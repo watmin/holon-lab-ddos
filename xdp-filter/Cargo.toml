@@ -8,7 +8,16 @@ anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+aya = "0.13"
+aya-log = "0.2"
+log = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
 
-# TODO: Re-enable once eBPF toolchain is fixed
-# aya = { workspace = true }
-# aya-log = { workspace = true }
+[[bin]]
+name = "test_xdp"
+path = "src/bin/test_xdp.rs"
+
+[[bin]]
+name = "pcap_capture"
+path = "src/bin/pcap_capture.rs"

@@ -1,6 +1,21 @@
 # DDoS Lab
 
-XDP/eBPF-based DDoS traffic generator and scrubber for testing VSA/HDC packet classification.
+XDP/eBPF-based DDoS traffic generator and filter for testing packet classification.
+
+## Status
+
+**Proven working (Feb 2026):**
+- XDP/eBPF filter in Rust using aya-ebpf
+- High-speed packet filtering (~45k pps in SKB mode)
+- Full packet sampling to userspace via perf buffer
+- Pcap capture for traffic analysis
+- Detect mode (log but pass) and Enforce mode (drop attacks)
+- Attack traffic identification (10.0.0.0/8 spoofed sources)
+
+**Limitations (current setup):**
+- Macvlan interfaces don't support AF_XDP (need physical NIC for zero-copy)
+- SKB mode (not native XDP) due to macvlan
+- 256-byte packet samples (BPF stack limit)
 
 ## Architecture
 
@@ -9,121 +24,125 @@ XDP/eBPF-based DDoS traffic generator and scrubber for testing VSA/HDC packet cl
 │  Host                                                           │
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐   │
-│  │ control-plane (HTTP API :8080)                          │   │
-│  │ curl localhost:8080/stats                               │   │
-│  │ curl -X POST localhost:8080/attack/start                │   │
+│  │ Packet Generator (test_sendmmsg)                        │   │
+│  │ AF_PACKET + sendmmsg() batching                         │   │
+│  │ ~45k pps, 100x fewer syscalls than sendto()             │   │
 │  └─────────────────────────────────────────────────────────┘   │
-│                    │                       │                    │
-│  ┌─────────────────┴───────┐   ┌───────────┴─────────────────┐ │
-│  │ xdp-filter              │   │ xdp-generator               │ │
-│  │ Inspect & drop bad pkts │   │ AF_XDP SYN/UDP flood        │ │
-│  │ Stats via eBPF maps     │   │ Spoofed src: 10.0.0.0/8     │ │
-│  └─────────────────────────┘   └─────────────────────────────┘ │
-│             │                              │                    │
-│             ▼                              ▼                    │
-│      eth0/veth (container)            eno1 (host NIC)          │
+│                    │                                            │
+│                    ▼                                            │
+│              macv1 (host macvlan)                               │
+│                    │                                            │
+│                    ▼ (hairpin via macvlan driver)               │
+│              eth1 (container macvlan)                           │
+│                    │                                            │
+│  ┌─────────────────┴───────────────────────────────────────┐   │
+│  │ XDP Filter (xdp-filter-ebpf)                            │   │
+│  │ - Classifies packets by source IP                       │   │
+│  │ - 10.0.0.0/8 = attack traffic                           │   │
+│  │ - Samples packets to perf buffer (256 bytes each)       │   │
+│  │ - Detect mode: count & pass | Enforce mode: drop        │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                    │                                            │
+│                    ▼                                            │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ Userspace (pcap_capture / test_xdp)                     │   │
+│  │ - Reads samples from perf buffer                        │   │
+│  │ - Writes pcap files for analysis                        │   │
+│  │ - Future: VSA/HDC classification pipeline               │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                    │                                            │
+│                    ▼                                            │
+│              Nginx container (192.168.1.200)                    │
 └─────────────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-                   ┌───────────────┐
-                   │  LAN / Switch │
-                   └───────┬───────┘
-                           │
-                           ▼
-                ┌─────────────────────┐
-                │ Nginx container     │
-                │ 192.168.1.200       │
-                │ (WordPress target)  │
-                └─────────────────────┘
-```
-
-## Components
-
-### xdp-filter
-- eBPF/XDP program that inspects incoming packets
-- Drops traffic from 10.0.0.0/8 (DDoS simulation range)
-- Passes legitimate traffic (192.168.1.x)
-- Future: VSA/HDC integration for learned classification
-
-### xdp-generator  
-- AF_XDP-based packet generator
-- Crafts SYN floods, UDP floods with spoofed source IPs
-- Configurable burst patterns (30s-300s bursts)
-- High PPS capability via kernel bypass
-
-### control-plane
-- Axum HTTP server for management
-- Start/stop attacks, view stats, configure parameters
-- Coordinates filter and generator
-
-## API Endpoints
-
-```bash
-# Stats
-curl localhost:8080/stats
-curl localhost:8080/filter/stats
-curl localhost:8080/attack/status
-
-# Control
-curl -X POST localhost:8080/attack/start
-curl -X POST localhost:8080/attack/stop
-curl -X POST localhost:8080/attack/config -d '{"type":"syn","pps":100000}'
-curl -X POST localhost:8080/filter/mode -d '{"mode":"enforce"}'
-```
-
-## Prerequisites
-
-```bash
-# Rust + cargo
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# bpf-linker (for compiling eBPF)
-cargo install bpf-linker
-
-# Linux headers and tools
-sudo apt install linux-headers-$(uname -r) clang llvm libelf-dev
 ```
 
 ## Build
 
 ```bash
-cargo xtask build-ebpf    # Build eBPF programs
-cargo build --release      # Build userspace
+# Build eBPF program (requires nightly Rust)
+CARGO_CFG_BPF_TARGET_ARCH=x86_64 cargo build -p xdp-filter-ebpf \
+  --target bpfel-unknown-none -Z build-std=core --release
+
+# Build userspace tools
+cargo build --release -p xdp-filter -p xdp-generator
 ```
 
-## Run
+## Usage
+
+### Packet Capture (for analysis)
 
 ```bash
-# Start the control plane (generator only for now, XDP filter pending)
-# IMPORTANT: Use a macvlan interface (-i macv1) for proper hairpin to work
-sudo ./target/release/ddos-lab --no-filter --target 192.168.1.200 -i macv1
+# Get nginx container PID
+NGINX_PID=$(docker inspect -f '{{.State.Pid}}' wordpress_nginx)
 
-# In another terminal, start an attack
-curl -X POST localhost:8080/attack/start
+# Run pcap capture inside container's network namespace
+# Sample rate: 1 = every packet, 100 = 1 in 100
+sudo nsenter -t $NGINX_PID -n ./target/release/pcap_capture eth1 /tmp/capture.pcap 1
 
-# Watch stats
-watch -n1 'curl -s localhost:8080/attack/status | jq'
-
-# Stop attack
-curl -X POST localhost:8080/attack/stop
+# View captured packets
+tcpdump -r /tmp/capture.pcap -n | head -20
 ```
 
-### Why macv1 instead of eno1?
+### Attack Simulation
 
-The attack traffic needs to hairpin back to the Nginx container (192.168.1.200) which 
-is on a Docker macvlan network. When sending from a host macvlan interface (macv1), 
-the kernel's macvlan driver handles the internal routing between macvlan peers on 
-the same parent interface. Sending from eno1 directly doesn't work because the 
-physical switch won't hairpin traffic back to the same port.
-
-## Testing with WordPress traffic generator
-
-Run the legitimate traffic generator alongside:
 ```bash
-cd ../
-python3 wordpress_traffic_generator.py
+# Generate SYN flood with spoofed 10.x.x.x sources
+# Args: interface, target_ip, packets_per_second
+sudo ./target/release/test_sendmmsg macv1 192.168.1.200 50000
 ```
 
-The filter should:
-- DROP packets from 10.0.0.0/8 (attack traffic)
-- PASS packets from 192.168.1.x (legitimate via macvlan)
+### XDP Filter Stats
+
+```bash
+# Monitor filter statistics (detect or enforce mode)
+sudo nsenter -t $NGINX_PID -n ./target/release/test_xdp eth1 detect
+
+# Switch to enforce mode (actually drop attack packets)
+sudo nsenter -t $NGINX_PID -n ./target/release/test_xdp eth1 enforce
+```
+
+## Test Results
+
+**Attack Traffic (10s test):**
+- 456k packets generated at ~45k pps
+- 380k+ packets captured and classified as attack
+- XDP filter correctly identified 10.x.x.x sources
+
+**Legitimate Traffic:**
+- WordPress traffic generator requests captured
+- Full TCP handshakes and HTTP/TLS flows visible
+- 0% false positive attack classification
+
+## Components
+
+| Crate | Description |
+|-------|-------------|
+| `xdp-filter-ebpf` | eBPF/XDP program (runs in kernel) |
+| `xdp-filter` | Userspace loader, stats, pcap capture |
+| `xdp-generator` | Packet generator (sendmmsg + AF_XDP stub) |
+| `control-plane` | HTTP API for management (WIP) |
+
+## Future Improvements
+
+1. **Second NIC** - Enable AF_XDP zero-copy for 10x+ throughput
+2. **VSA/HDC Integration** - Replace simple IP classification with learned embeddings
+3. **Ring buffer** - Use BPF ring buffer instead of perf buffer (newer kernels)
+4. **Native XDP mode** - Requires physical NIC, not macvlan
+
+## Dependencies
+
+```bash
+# Rust nightly + BPF linker
+rustup install nightly
+cargo install bpf-linker
+
+# Linux headers
+sudo apt install linux-headers-$(uname -r) clang llvm libelf-dev
+```
+
+## Pinned Versions
+
+Due to aya-ebpf toolchain issues, specific versions are pinned in `xdp-filter-ebpf/Cargo.toml`:
+- `aya-ebpf = "=0.1.0"`
+- `aya-ebpf-bindings = "=0.1.0"`  
+- `aya-ebpf-cty = "=0.2.1"`

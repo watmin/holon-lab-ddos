@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-aya-ebpf = "0.1"
-aya-log-ebpf = "0.1"
+# Pin specific versions to avoid build issues
+aya-ebpf = "=0.1.0"
+aya-ebpf-bindings = "=0.1.0"
+aya-ebpf-cty = "=0.2.1"
 
 [[bin]]
 name = "xdp-filter"

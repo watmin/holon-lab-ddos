@@ -10,3 +10,12 @@ tracing = { workspace = true }
 serde = { workspace = true }
 rand = "0.8"
 libc = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "test_af_xdp"
+path = "src/bin/test_af_xdp.rs"
+
+[[bin]]
+name = "test_sendmmsg"
+path = "src/bin/test_sendmmsg.rs"

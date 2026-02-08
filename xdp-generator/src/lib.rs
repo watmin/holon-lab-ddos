@@ -1,6 +1,12 @@
 //! XDP Traffic Generator
 //! 
-//! Generates DDoS attack traffic using packet sockets with spoofed source IPs.
+//! Generates DDoS attack traffic using AF_PACKET or AF_XDP with spoofed source IPs.
+//!
+//! Two modes available:
+//! - AF_PACKET: One syscall per packet (or batch with sendmmsg)
+//! - AF_XDP: Zero-copy via shared memory rings (much higher PPS)
+
+pub mod af_xdp;
 
 use anyhow::Result;
 use std::net::Ipv4Addr;
@@ -292,15 +298,61 @@ async fn run_attack(
     }
 
     let mut rng = rand::rngs::StdRng::from_entropy();
-    let interval_ns = if config.pps > 0 {
-        1_000_000_000u64 / config.pps as u64
+    
+    // Calculate batch size and sleep interval for target PPS
+    // tokio::time::sleep has ~1ms minimum practical resolution
+    // So we batch packets and sleep less frequently
+    let batch_size = if config.pps >= 10000 {
+        (config.pps / 1000) as usize  // ~1000 batches/sec
+    } else if config.pps >= 1000 {
+        (config.pps / 100) as usize   // ~100 batches/sec
     } else {
-        1_000_000
+        1
+    };
+    let sleep_us = if batch_size > 1 {
+        1000  // 1ms between batches
+    } else {
+        1_000_000 / config.pps.max(1) as u64
     };
     
-    info!("Attack loop started, interval: {}ns per packet", interval_ns);
+    info!("Attack loop started, target PPS: {}, batch size: {}, sleep: {}μs", 
+          config.pps, batch_size, sleep_us);
+
+    // Stats tracking for periodic logging
+    let start_time = std::time::Instant::now();
+    let mut last_log_time = start_time;
+    let mut last_packet_count = 0u64;
+    let log_interval = std::time::Duration::from_secs(5);
 
     while running.load(Ordering::Relaxed) {
+        // Periodic stats logging
+        let now = std::time::Instant::now();
+        if now.duration_since(last_log_time) >= log_interval {
+            let current_packets = packets_sent.load(Ordering::Relaxed);
+            let current_bytes = bytes_sent.load(Ordering::Relaxed);
+            let current_errors = errors.load(Ordering::Relaxed);
+            let elapsed = now.duration_since(start_time).as_secs_f64();
+            let interval_packets = current_packets - last_packet_count;
+            let current_pps = interval_packets as f64 / log_interval.as_secs_f64();
+            
+            info!(
+                "📊 Attack stats: {:.1}s elapsed | {} pkts ({:.0} pps) | {:.1} MB | {} errors",
+                elapsed,
+                current_packets,
+                current_pps,
+                current_bytes as f64 / 1_000_000.0,
+                current_errors
+            );
+            
+            last_log_time = now;
+            last_packet_count = current_packets;
+        }
+        
+        // Send a batch of packets
+        for _ in 0..batch_size {
+            if !running.load(Ordering::Relaxed) {
+                break;
+            }
         // Generate random source IP in 10.x.x.x range
         let src_ip = Ipv4Addr::new(
             config.source_network,
@@ -355,9 +407,11 @@ async fn run_attack(
         } else {
             errors.fetch_add(1, Ordering::Relaxed);
         }
+        } // end batch loop
 
-        if interval_ns > 1000 {
-            tokio::time::sleep(std::time::Duration::from_nanos(interval_ns)).await;
+        // Sleep between batches
+        if sleep_us > 0 {
+            tokio::time::sleep(std::time::Duration::from_micros(sleep_us)).await;
         }
     }
 
