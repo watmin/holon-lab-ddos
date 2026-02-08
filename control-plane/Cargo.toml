@@ -1,0 +1,22 @@
+[package]
+name = "control-plane"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ddos-lab"
+path = "src/main.rs"
+
+[dependencies]
+xdp-filter = { path = "../xdp-filter" }
+xdp-generator = { path = "../xdp-generator" }
+aya = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+tower-http = { version = "0.5", features = ["cors"] }
