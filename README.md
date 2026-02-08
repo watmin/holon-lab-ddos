@@ -1,6 +1,8 @@
-# DDoS Lab
+# Holon Lab - DDoS
 
-XDP/eBPF-based DDoS traffic generator and filter for testing packet classification.
+XDP/eBPF-based DDoS traffic generator and filter for proving [Holon](https://github.com/YOUR_ORG/holon) VSA/HDC packet classification.
+
+This lab demonstrates using Holon's vector symbolic architecture for real-time DDoS detection and mitigation at kernel level.
 
 ## Status
 
@@ -146,3 +148,28 @@ Due to aya-ebpf toolchain issues, specific versions are pinned in `xdp-filter-eb
 - `aya-ebpf = "=0.1.0"`
 - `aya-ebpf-bindings = "=0.1.0"`  
 - `aya-ebpf-cty = "=0.2.1"`
+
+## Holon Integration (Planned)
+
+This lab will integrate with [holon-rs](https://github.com/YOUR_ORG/holon-rs) to demonstrate VSA/HDC-based packet classification:
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  XDP Filter     │────▶│  Perf Buffer    │────▶│  Holon-rs       │
+│  (kernel)       │     │  (256b samples) │     │  (VSA encoding) │
+└─────────────────┘     └─────────────────┘     └────────┬────────┘
+        ▲                                                │
+        │                                                ▼
+        │                                       ┌─────────────────┐
+        └───────────────────────────────────────│  HDC Classifier │
+                   Update filter rules          │  (similarity)   │
+                                                └─────────────────┘
+```
+
+**Key concept:** Instead of hard-coded rules (10.0.0.0/8 = attack), Holon learns traffic patterns:
+- Encode packet headers as hypervectors
+- Build prototype vectors for "normal" and "attack" traffic
+- Classify new packets by similarity to prototypes
+- Adapt to new attack patterns without rule updates
+
+See [holon](https://github.com/YOUR_ORG/holon) for the Python reference implementation.
