@@ -4,17 +4,14 @@
 //! - Reading statistics from eBPF maps
 //! - Configuring filter mode (detect vs enforce)
 //! - Per-IP packet counts
+//!
+//! NOTE: XDP filter is currently disabled until eBPF toolchain issues are resolved.
+//! The generator works standalone using raw sockets.
 
-use anyhow::{Context, Result};
-use aya::{
-    include_bytes_aligned,
-    maps::{HashMap, PerCpuArray, PerCpuValues},
-    programs::{Xdp, XdpFlags},
-    Ebpf,
-};
+use anyhow::{Result, bail};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Filter operating mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +23,7 @@ pub enum FilterMode {
 }
 
 /// Statistics from the XDP filter
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct FilterStats {
     pub total_packets: u64,
     pub passed_packets: u64,
@@ -34,115 +31,54 @@ pub struct FilterStats {
     pub detected_attacks: u64,
 }
 
-/// XDP Filter manager
+/// XDP Filter manager (stub - XDP not yet implemented)
 pub struct XdpFilter {
-    bpf: Arc<RwLock<Ebpf>>,
     interface: String,
+    mode: Arc<RwLock<FilterMode>>,
+    // Will hold eBPF handle once toolchain is fixed
 }
 
 impl XdpFilter {
     /// Load and attach the XDP filter to an interface
+    /// Currently returns an error - XDP support pending toolchain fix
     pub fn new(interface: &str) -> Result<Self> {
-        // Load the eBPF bytecode
-        #[cfg(debug_assertions)]
-        let data = include_bytes_aligned!(
-            "../../target/bpfel-unknown-none/debug/xdp-filter"
+        // TODO: Load actual eBPF program once toolchain issues are resolved
+        // For now, return a stub that tracks mode but doesn't filter
+        bail!(
+            "XDP filter not yet available - eBPF toolchain compatibility issue. \
+             Use --no-filter to run generator-only mode."
         );
-        #[cfg(not(debug_assertions))]
-        let data = include_bytes_aligned!(
-            "../../target/bpfel-unknown-none/release/xdp-filter"
-        );
-
-        let mut bpf = Ebpf::load(data).context("Failed to load eBPF program")?;
-
-        // Attach to interface
-        let program: &mut Xdp = bpf
-            .program_mut("xdp_filter")
-            .context("Failed to find xdp_filter program")?
-            .try_into()?;
         
-        program.load().context("Failed to load XDP program")?;
-        
-        // Use SKB mode for compatibility (works with macvlan, veth, etc.)
-        program
-            .attach(interface, XdpFlags::SKB_MODE)
-            .context(format!("Failed to attach to {}", interface))?;
-
-        info!("XDP filter attached to {}", interface);
-
-        Ok(Self {
-            bpf: Arc::new(RwLock::new(bpf)),
-            interface: interface.to_string(),
-        })
+        // When eBPF works, this will load the program:
+        // let data = include_bytes_aligned!("../../target/bpfel-unknown-none/release/xdp-filter");
+        // let mut bpf = Ebpf::load(data)?;
+        // ...
     }
 
-    /// Get current statistics
+    /// Create a stub filter for testing (no actual XDP)
+    pub fn stub(interface: &str) -> Self {
+        info!("Creating stub XDP filter for {} (no actual filtering)", interface);
+        Self {
+            interface: interface.to_string(),
+            mode: Arc::new(RwLock::new(FilterMode::Detect)),
+        }
+    }
+
+    /// Get current statistics (stub returns zeros)
     pub async fn stats(&self) -> Result<FilterStats> {
-        let bpf = self.bpf.read().await;
-        
-        let stats: PerCpuArray<_, u64> = bpf
-            .map("STATS")
-            .context("STATS map not found")?
-            .try_into()?;
-
-        let mut result = FilterStats::default();
-
-        // Sum across all CPUs
-        if let Ok(values) = stats.get(&0, 0) {
-            result.total_packets = values.iter().sum();
-        }
-        if let Ok(values) = stats.get(&1, 0) {
-            result.passed_packets = values.iter().sum();
-        }
-        if let Ok(values) = stats.get(&2, 0) {
-            result.dropped_packets = values.iter().sum();
-        }
-        if let Ok(values) = stats.get(&3, 0) {
-            result.detected_attacks = values.iter().sum();
-        }
-
-        Ok(result)
+        Ok(FilterStats::default())
     }
 
     /// Set the filter mode
     pub async fn set_mode(&self, mode: FilterMode) -> Result<()> {
-        let mut bpf = self.bpf.write().await;
-        
-        let mut config: PerCpuArray<_, u32> = bpf
-            .map_mut("CONFIG")
-            .context("CONFIG map not found")?
-            .try_into()?;
-
-        let num_cpus = aya::util::nr_cpus()?;
-        let values = PerCpuValues::try_from(vec![mode as u32; num_cpus])?;
-        config.set(0, values, 0)?;
-
-        info!("Filter mode set to {:?}", mode);
+        *self.mode.write().await = mode;
+        info!("Filter mode set to {:?} (stub - no actual filtering)", mode);
         Ok(())
     }
 
-    /// Get top source IPs by packet count
-    pub async fn top_ips(&self, limit: usize) -> Result<Vec<(std::net::Ipv4Addr, u64)>> {
-        let bpf = self.bpf.read().await;
-        
-        let ip_counts: HashMap<_, u32, u64> = bpf
-            .map("IP_COUNTS")
-            .context("IP_COUNTS map not found")?
-            .try_into()?;
-
-        let mut entries: Vec<_> = ip_counts
-            .iter()
-            .filter_map(|r| r.ok())
-            .map(|(ip, count)| {
-                let addr = std::net::Ipv4Addr::from(u32::from_be(ip));
-                (addr, count)
-            })
-            .collect();
-
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
-        entries.truncate(limit);
-
-        Ok(entries)
+    /// Get top source IPs by packet count (stub returns empty)
+    pub async fn top_ips(&self, _limit: usize) -> Result<Vec<(std::net::Ipv4Addr, u64)>> {
+        Ok(vec![])
     }
 
     /// Get the interface name
@@ -153,7 +89,6 @@ impl XdpFilter {
 
 impl Drop for XdpFilter {
     fn drop(&mut self) {
-        info!("Detaching XDP filter from {}", self.interface);
-        // aya automatically detaches on drop
+        info!("Dropping XDP filter stub for {}", self.interface);
     }
 }

@@ -87,6 +87,7 @@ async fn main() -> Result<()> {
         pps: 10_000,
         attack_type: AttackType::SynFlood,
         interface: args.interface.clone(),
+        gateway_mac: None,
     };
 
     let generator = TrafficGenerator::new(attack_config.clone());
@@ -286,6 +287,7 @@ async fn set_attack_config(
         pps: dto.pps,
         attack_type,
         interface: state.config.read().await.interface.clone(),
+        gateway_mac: None,
     };
 
     state.generator.set_config(config.clone()).await;

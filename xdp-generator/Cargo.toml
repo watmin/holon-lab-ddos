@@ -7,6 +7,6 @@ edition = "2021"
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
 rand = "0.8"
-socket2 = "0.5"
 libc = "0.2"

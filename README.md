@@ -94,12 +94,27 @@ cargo build --release      # Build userspace
 ## Run
 
 ```bash
-# Start the control plane (loads both XDP programs)
-sudo ./target/release/control-plane --interface eno1
+# Start the control plane (generator only for now, XDP filter pending)
+# IMPORTANT: Use a macvlan interface (-i macv1) for proper hairpin to work
+sudo ./target/release/ddos-lab --no-filter --target 192.168.1.200 -i macv1
 
 # In another terminal, start an attack
 curl -X POST localhost:8080/attack/start
+
+# Watch stats
+watch -n1 'curl -s localhost:8080/attack/status | jq'
+
+# Stop attack
+curl -X POST localhost:8080/attack/stop
 ```
+
+### Why macv1 instead of eno1?
+
+The attack traffic needs to hairpin back to the Nginx container (192.168.1.200) which 
+is on a Docker macvlan network. When sending from a host macvlan interface (macv1), 
+the kernel's macvlan driver handles the internal routing between macvlan peers on 
+the same parent interface. Sending from eno1 directly doesn't work because the 
+physical switch won't hairpin traffic back to the same port.
 
 ## Testing with WordPress traffic generator
 
