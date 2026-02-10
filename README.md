@@ -1,23 +1,33 @@
 # Holon Lab - DDoS
 
-XDP/eBPF-based DDoS traffic generator and filter for proving [Holon](https://github.com/YOUR_ORG/holon) VSA/HDC packet classification.
+[![Powered by Holon-rs](https://img.shields.io/badge/Powered%20by-Holon--rs-blue)](https://github.com/watmin/holon-rs)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-This lab demonstrates using Holon's vector symbolic architecture for real-time DDoS detection and mitigation at kernel level.
+XDP/eBPF-based DDoS detection and mitigation powered by [Holon-rs](https://github.com/watmin/holon-rs) — a Rust implementation of Vector Symbolic Architecture (VSA/HDC).
+
+This lab demonstrates real-time anomaly detection at kernel level: **1.3M PPS handled with 99.5% drop rate and 52ms detection latency**.
 
 ## Status
 
-**Proven working (Feb 2026):**
-- XDP/eBPF filter in Rust using aya-ebpf
-- High-speed packet filtering (~45k pps in SKB mode)
-- Full packet sampling to userspace via perf buffer
-- Pcap capture for traffic analysis
-- Detect mode (log but pass) and Enforce mode (drop attacks)
-- Attack traffic identification (10.0.0.0/8 spoofed sources)
+**Stress-tested (Feb 2026):**
+- ✅ **1.3M PPS** attack traffic handled without degradation
+- ✅ **52ms** detection latency (attack start → rule insertion)
+- ✅ **99.5%** drop rate during attacks
+- ✅ **Zero false positives** after attack ends (baseline freezing)
+- ✅ **100% rate accuracy** for traffic generation (1k-200k PPS)
 
-**Limitations (current setup):**
-- Macvlan interfaces don't support AF_XDP (need physical NIC for zero-copy)
-- SKB mode (not native XDP) due to macvlan
-- 256-byte packet samples (BPF stack limit)
+**Components:**
+- XDP/eBPF filter in Rust using [aya](https://aya-rs.dev/)
+- [Holon-rs](https://github.com/watmin/holon-rs) for VSA-based anomaly detection
+- Configurable packet sampling (1:N)
+- Dynamic rule injection from userspace
+- Scenario-based traffic generation with per-phase PPS control
+
+**Veth Lab** (`veth-lab/`): Reproducible local testing using network namespaces - no special hardware required.
+
+**Limitations:**
+- Macvlan interfaces don't support AF_XDP (veth lab uses veth pairs instead)
+- Currently DROP-only rules (rate limiting planned)
 
 ## Architecture
 
@@ -149,27 +159,34 @@ Due to aya-ebpf toolchain issues, specific versions are pinned in `xdp-filter-eb
 - `aya-ebpf-bindings = "=0.1.0"`  
 - `aya-ebpf-cty = "=0.2.1"`
 
-## Holon Integration (Planned)
+## Holon Integration
 
-This lab will integrate with [holon-rs](https://github.com/YOUR_ORG/holon-rs) to demonstrate VSA/HDC-based packet classification:
+This lab integrates [holon-rs](https://github.com/watmin/holon-rs) for VSA/HDC-based packet classification:
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
 │  XDP Filter     │────▶│  Perf Buffer    │────▶│  Holon-rs       │
-│  (kernel)       │     │  (256b samples) │     │  (VSA encoding) │
+│  (kernel)       │     │  (sampled pkts) │     │  (VSA encoding) │
 └─────────────────┘     └─────────────────┘     └────────┬────────┘
         ▲                                                │
         │                                                ▼
         │                                       ┌─────────────────┐
-        └───────────────────────────────────────│  HDC Classifier │
-                   Update filter rules          │  (similarity)   │
+        └───────────────────────────────────────│  Anomaly Detect │
+                   Dynamic rule injection       │  (drift + conc) │
                                                 └─────────────────┘
 ```
 
-**Key concept:** Instead of hard-coded rules (10.0.0.0/8 = attack), Holon learns traffic patterns:
-- Encode packet headers as hypervectors
-- Build prototype vectors for "normal" and "attack" traffic
-- Classify new packets by similarity to prototypes
-- Adapt to new attack patterns without rule updates
+**Key concept:** Instead of hard-coded rules, Holon learns traffic patterns:
+- Encode packet headers as hypervectors (src_ip, dst_port, protocol, etc.)
+- Build baseline accumulator during warmup, then freeze
+- Detect anomalies via accumulator drift (current vs baseline similarity)
+- Identify attack vectors via field concentration analysis
+- Inject DROP rules dynamically into XDP
 
-See [holon](https://github.com/YOUR_ORG/holon) for the Python reference implementation.
+**Results:** 100% attack recall with zero domain knowledge hardcoded.
+
+## See Also
+
+- [holon-rs](https://github.com/watmin/holon-rs) — Rust VSA library (12x faster than Python)
+- [holon](https://github.com/watmin/holon) — Python reference implementation with extensive documentation
+- [veth-lab/docs/PROGRESS.md](veth-lab/docs/PROGRESS.md) — Detailed stress test results and architecture
