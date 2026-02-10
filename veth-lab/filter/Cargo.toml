@@ -1,0 +1,22 @@
+[package]
+name = "veth-filter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya = { workspace = true }
+aya-log = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# For ring buffer polling
+bytes = "1"
+
+[[bin]]
+name = "veth-loader"
+path = "src/bin/loader.rs"

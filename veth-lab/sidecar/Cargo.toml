@@ -1,0 +1,26 @@
+[package]
+name = "veth-sidecar"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Local veth-filter for XDP management
+veth-filter = { path = "../filter" }
+
+# Holon for VSA-based detection (relative path to holon-rs)
+holon = { path = "../../../holon-rs" }
+
+# Async runtime
+tokio = { workspace = true }
+anyhow = { workspace = true }
+bytes = "1"
+aya = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "veth-sidecar"
+path = "src/main.rs"

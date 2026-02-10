@@ -1,0 +1,28 @@
+[package]
+name = "veth-filter-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace - this package is built with BPF target separately
+[workspace]
+
+[dependencies]
+# Pin specific versions to avoid build issues (same as xdp-filter-ebpf)
+aya-ebpf = "=0.1.0"
+aya-ebpf-bindings = "=0.1.0"
+aya-ebpf-cty = "=0.2.1"
+
+[[bin]]
+name = "veth-filter"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 3
+debug = false
+overflow-checks = false
+lto = true
+panic = "abort"
+
+[profile.release]
+lto = true
+panic = "abort"

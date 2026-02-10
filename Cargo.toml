@@ -6,7 +6,12 @@ members = [
     "xdp-filter-ebpf",
     "xdp-generator",
     "xtask",
+    # Veth lab components
+    "veth-lab/filter",
+    "veth-lab/generator",
+    "veth-lab/sidecar",
 ]
+# Note: veth-lab/filter-ebpf is built separately with BPF target
 
 [workspace.dependencies]
 aya = "0.13"
