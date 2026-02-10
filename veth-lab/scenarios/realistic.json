@@ -1,0 +1,15 @@
+{
+  "name": "Realistic DDoS Scenario",
+  "description": "Long baseline learning, varied attack patterns with realistic timing",
+  "baseline_pps": 2000,
+  "attack_pps": 50000,
+  "phases": [
+    {"name": "learning",   "duration_secs": 300, "type": "normal", "description": "5 min baseline learning"},
+    {"name": "probe",      "duration_secs": 30,  "type": "attack", "description": "30s initial attack probe"},
+    {"name": "calm1",      "duration_secs": 240, "type": "normal", "description": "4 min calm - attacker recon"},
+    {"name": "sustained",  "duration_secs": 180, "type": "attack", "description": "3 min sustained attack"},
+    {"name": "pause",      "duration_secs": 40,  "type": "normal", "description": "40s brief pause"},
+    {"name": "wave2",      "duration_secs": 60,  "type": "attack", "description": "60s second wave"},
+    {"name": "recovery",   "duration_secs": 180, "type": "normal", "description": "3 min final calm"}
+  ]
+}

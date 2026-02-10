@@ -11,15 +11,19 @@
 //! - Attack bursts (high rate from specific sources)
 //! - Mixed traffic for detection testing
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use chrono::Local;
 use clap::{Parser, ValueEnum};
 use rand::{Rng, SeedableRng};
+use serde::Deserialize;
+use std::fs;
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::info;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
 #[command(name = "veth-generator")]
@@ -56,6 +60,30 @@ struct Args {
     /// Destination port for attack traffic  
     #[arg(long, default_value = "9999")]
     attack_port: u16,
+
+    /// Attack PPS for scenario mode (separate from baseline --pps)
+    #[arg(long, default_value = "10000")]
+    attack_pps: u32,
+
+    /// Warmup duration in seconds (scenario mode - ignored if --scenario-file used)
+    #[arg(long, default_value = "5")]
+    warmup_secs: u64,
+
+    /// Attack phase duration in seconds (scenario mode - ignored if --scenario-file used)
+    #[arg(long, default_value = "5")]
+    attack_secs: u64,
+
+    /// Calm/recovery phase duration in seconds (scenario mode - ignored if --scenario-file used)
+    #[arg(long, default_value = "3")]
+    calm_secs: u64,
+
+    /// Path to scenario JSON file (overrides pattern and timing args)
+    #[arg(long)]
+    scenario_file: Option<PathBuf>,
+
+    /// Directory for log files (also writes to stdout)
+    #[arg(long, default_value = "logs")]
+    log_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -68,24 +96,97 @@ enum TrafficPattern {
     Mixed,
     /// Ramp: gradually increase attack ratio
     Ramp,
+    /// Scenario: warmup -> attack -> calm -> attack (like Batch 013)
+    Scenario,
+}
+
+/// Scenario configuration loaded from JSON
+#[derive(Debug, Deserialize)]
+struct ScenarioConfig {
+    name: String,
+    #[serde(default)]
+    description: String,
+    baseline_pps: u32,
+    attack_pps: u32,
+    phases: Vec<Phase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Phase {
+    name: String,
+    duration_secs: u64,
+    #[serde(rename = "type")]
+    phase_type: PhaseType,
+    #[serde(default)]
+    description: String,
+    /// Optional per-phase PPS override (if not set, uses baseline_pps or attack_pps)
+    #[serde(default)]
+    pps: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum PhaseType {
+    Normal,
+    Attack,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
-
     let args = Args::parse();
+
+    // Create log directory
+    fs::create_dir_all(&args.log_dir)
+        .with_context(|| format!("Failed to create log dir: {:?}", args.log_dir))?;
+
+    // Generate timestamped log filename
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+    let log_filename = format!("generator_{}.log", timestamp);
+    let log_path = args.log_dir.join(&log_filename);
+
+    // Set up file appender
+    let file_appender = tracing_appender::rolling::never(&args.log_dir, &log_filename);
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // Initialize tracing with both stdout and file
+    tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_ansi(true)
+                .with_target(false)
+        )
+        .with(
+            fmt::layer()
+                .with_ansi(false)
+                .with_target(false)
+                .with_writer(non_blocking)
+        )
+        .with(tracing_subscriber::filter::LevelFilter::INFO)
+        .init();
+    
+    // Check if using scenario file
+    let scenario_config = if let Some(ref path) = args.scenario_file {
+        let json = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read scenario file: {:?}", path))?;
+        Some(serde_json::from_str::<ScenarioConfig>(&json)
+            .with_context(|| format!("Failed to parse scenario file: {:?}", path))?)
+    } else {
+        None
+    };
     
     info!("Veth Lab Traffic Generator");
     info!("  Interface: {}", args.interface);
     info!("  Target: {}", args.target);
-    info!("  Pattern: {:?}", args.pattern);
-    info!("  PPS: {}", if args.pps == 0 { "max".to_string() } else { args.pps.to_string() });
-    info!("  Duration: {}s", if args.duration == 0 { "infinite".to_string() } else { args.duration.to_string() });
+    info!("  Log file: {:?}", log_path);
+    
+    if let Some(ref config) = scenario_config {
+        info!("  Mode: Scenario file");
+        info!("  Scenario: {}", config.name);
+    } else {
+        info!("  Pattern: {:?}", args.pattern);
+        info!("  PPS: {}", if args.pps == 0 { "max".to_string() } else { args.pps.to_string() });
+        info!("  Duration: {}s", if args.duration == 0 { "infinite".to_string() } else { args.duration.to_string() });
+    }
     
     let target_ip: Ipv4Addr = args.target.parse()?;
     let attack_src: Ipv4Addr = args.attack_src.parse()?;
@@ -109,7 +210,220 @@ async fn main() -> Result<()> {
     info!("Socket ready, starting traffic generation...");
     info!("");
 
-    // Traffic generation loop
+    // If scenario file provided, run scenario-file loop
+    if let Some(config) = scenario_config {
+        run_scenario_file(
+            &config,
+            &args,
+            socket,
+            &src_mac,
+            &dst_mac,
+            target_ip,
+            attack_src,
+            running.clone(),
+            packets_sent.clone(),
+            bytes_sent.clone(),
+        )?;
+    } else {
+        run_pattern_mode(
+            &args,
+            socket,
+            &src_mac,
+            &dst_mac,
+            target_ip,
+            attack_src,
+            running.clone(),
+            packets_sent.clone(),
+            bytes_sent.clone(),
+        )?;
+    }
+
+    // Final stats
+    let _start = Instant::now();  // Duration tracked by scenario/pattern loops
+    let total = packets_sent.load(Ordering::Relaxed);
+    let total_bytes = bytes_sent.load(Ordering::Relaxed);
+    
+    info!("");
+    info!("=== Final Stats ===");
+    info!("  Total packets: {}", total);
+    info!("  Total bytes: {:.2} MB", total_bytes as f64 / 1024.0 / 1024.0);
+
+    // Close socket
+    unsafe { libc::close(socket); }
+
+    Ok(())
+}
+
+fn run_scenario_file(
+    config: &ScenarioConfig,
+    args: &Args,
+    socket: i32,
+    src_mac: &[u8; 6],
+    dst_mac: &[u8; 6],
+    target_ip: Ipv4Addr,
+    attack_src: Ipv4Addr,
+    running: Arc<AtomicBool>,
+    packets_sent: Arc<AtomicU64>,
+    bytes_sent: Arc<AtomicU64>,
+) -> Result<()> {
+    let mut rng = rand::rngs::StdRng::from_entropy();
+    
+    // Log scenario timeline
+    info!("=== SCENARIO: {} ===", config.name);
+    if !config.description.is_empty() {
+        info!("  {}", config.description);
+    }
+    info!("  Baseline PPS: {}", config.baseline_pps);
+    info!("  Attack PPS: {}", config.attack_pps);
+    info!("");
+    info!("Timeline:");
+    let mut total_secs = 0u64;
+    for (i, phase) in config.phases.iter().enumerate() {
+        // Use per-phase PPS if specified, otherwise use global baseline/attack
+        let pps = phase.pps.unwrap_or(match phase.phase_type {
+            PhaseType::Normal => config.baseline_pps,
+            PhaseType::Attack => config.attack_pps,
+        });
+        let end_time = total_secs + phase.duration_secs;
+        info!(
+            "  {:2}. {:12} {:>4}s @ {:>5} pps ({}:{:02} - {}:{:02}) {}",
+            i + 1,
+            phase.name,
+            phase.duration_secs,
+            pps,
+            total_secs / 60,
+            total_secs % 60,
+            end_time / 60,
+            end_time % 60,
+            if phase.description.is_empty() { "" } else { &phase.description }
+        );
+        total_secs = end_time;
+    }
+    info!("");
+    info!("Total duration: {}m {:02}s", total_secs / 60, total_secs % 60);
+    info!("");
+    
+    // Run each phase
+    let scenario_start = Instant::now();
+    let mut last_report = Instant::now();
+    let mut last_count = 0u64;
+    
+    for (phase_idx, phase) in config.phases.iter().enumerate() {
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+        
+        // Use per-phase PPS if specified, otherwise use global baseline/attack
+        let pps = phase.pps.unwrap_or(match phase.phase_type {
+            PhaseType::Normal => config.baseline_pps,
+            PhaseType::Attack => config.attack_pps,
+        });
+        let is_attack = phase.phase_type == PhaseType::Attack;
+        
+        info!(
+            ">>> [{:>3}s] PHASE {}: {} ({:?}, {} pps, {}s)",
+            scenario_start.elapsed().as_secs(),
+            phase_idx + 1,
+            phase.name,
+            phase.phase_type,
+            pps,
+            phase.duration_secs
+        );
+        
+        let phase_start = Instant::now();
+        let phase_duration = Duration::from_secs(phase.duration_secs);
+        let phase_start_packets = packets_sent.load(Ordering::Relaxed);
+        
+        while running.load(Ordering::Relaxed) && phase_start.elapsed() < phase_duration {
+            // Generate packet
+            let (src_ip, dst_port) = if is_attack {
+                (attack_src, args.attack_port)
+            } else {
+                // Normal traffic: random source in 192.168.x.x range
+                let src = Ipv4Addr::new(192, 168, rng.gen_range(1..255), rng.gen_range(1..255));
+                (src, args.normal_port)
+            };
+
+            let src_port: u16 = rng.gen_range(10000..60000);
+            
+            // Build and send UDP packet
+            let packet = craft_udp_packet(
+                src_mac,
+                dst_mac,
+                src_ip,
+                target_ip,
+                src_port,
+                dst_port,
+                b"VETH-LAB-TEST",
+            );
+
+            match send_packet(socket, &packet) {
+                Ok(n) => {
+                    packets_sent.fetch_add(1, Ordering::Relaxed);
+                    bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    if running.load(Ordering::Relaxed) {
+                        tracing::warn!("Send error: {}", e);
+                    }
+                }
+            }
+
+            // Time-based rate limiting: calculate where we SHOULD be vs where we ARE
+            // This naturally accounts for send time and other overhead
+            if pps > 0 {
+                let packets_this_phase = packets_sent.load(Ordering::Relaxed) - phase_start_packets;
+                let elapsed_ns = phase_start.elapsed().as_nanos() as u64;
+                let target_ns = packets_this_phase * 1_000_000_000 / pps as u64;
+                
+                if target_ns > elapsed_ns {
+                    let sleep_ns = target_ns - elapsed_ns;
+                    // Only sleep if we're ahead of schedule by more than 1μs
+                    if sleep_ns > 1000 {
+                        std::thread::sleep(Duration::from_nanos(sleep_ns));
+                    }
+                }
+                // If we're behind schedule, just keep sending (no sleep)
+            }
+
+            // Periodic stats report
+            if last_report.elapsed() >= Duration::from_secs(5) {
+                let current = packets_sent.load(Ordering::Relaxed);
+                let elapsed_secs = 5u64;
+                let pps_actual = (current - last_count) / elapsed_secs;
+                let total_bytes_val = bytes_sent.load(Ordering::Relaxed);
+                let scenario_elapsed = scenario_start.elapsed().as_secs();
+                
+                info!(
+                    "    [{:>3}s] {} packets ({} pps), {:.2} MB | phase: {}s remaining",
+                    scenario_elapsed,
+                    current,
+                    pps_actual,
+                    total_bytes_val as f64 / 1024.0 / 1024.0,
+                    phase.duration_secs.saturating_sub(phase_start.elapsed().as_secs())
+                );
+                
+                last_count = current;
+                last_report = Instant::now();
+            }
+        }
+    }
+    
+    info!(">>> Scenario complete");
+    Ok(())
+}
+
+fn run_pattern_mode(
+    args: &Args,
+    socket: i32,
+    src_mac: &[u8; 6],
+    dst_mac: &[u8; 6],
+    target_ip: Ipv4Addr,
+    attack_src: Ipv4Addr,
+    running: Arc<AtomicBool>,
+    packets_sent: Arc<AtomicU64>,
+    bytes_sent: Arc<AtomicU64>,
+) -> Result<()> {
     let start = Instant::now();
     let mut rng = rand::rngs::StdRng::from_entropy();
     let mut last_report = Instant::now();
@@ -120,17 +434,115 @@ async fn main() -> Result<()> {
     let mut phase_start = Instant::now();
     let mut in_attack_phase = false;
 
+    // For scenario pattern: phase state machine
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum ScenarioPhase {
+        Warmup,
+        Normal1,
+        Attack1,
+        Calm1,
+        Attack2,
+        Calm2,
+        Attack3,
+        Done,
+    }
+    let mut scenario_phase = ScenarioPhase::Warmup;
+    let mut scenario_phase_start = Instant::now();
+    
+    // Log scenario timeline
+    if matches!(args.pattern, TrafficPattern::Scenario) {
+        info!("=== SCENARIO MODE ===");
+        info!("  Warmup:  {}s @ {} pps (baseline)", args.warmup_secs, args.pps);
+        info!("  Normal:  {}s @ {} pps", args.calm_secs, args.pps);
+        info!("  Attack:  {}s @ {} pps", args.attack_secs, args.attack_pps);
+        info!("  Calm:    {}s @ {} pps", args.calm_secs, args.pps);
+        info!("  Attack:  {}s @ {} pps", args.attack_secs, args.attack_pps);
+        info!("  Calm:    {}s @ {} pps", args.calm_secs, args.pps);
+        info!("  Attack:  {}s @ {} pps", args.attack_secs, args.attack_pps);
+        info!("");
+    }
+
     while running.load(Ordering::Relaxed) {
-        // Check duration
-        if args.duration > 0 && start.elapsed().as_secs() >= args.duration {
+        // Check duration (for non-scenario patterns)
+        if args.duration > 0 && !matches!(args.pattern, TrafficPattern::Scenario) 
+            && start.elapsed().as_secs() >= args.duration {
             info!("Duration reached, stopping");
             break;
         }
+
+        // Calculate current PPS for rate limiting
+        let current_pps = match args.pattern {
+            TrafficPattern::Scenario => {
+                // Update scenario phase state machine
+                let elapsed = scenario_phase_start.elapsed().as_secs();
+                let (phase_done, _phase_duration) = match scenario_phase {
+                    ScenarioPhase::Warmup => (elapsed >= args.warmup_secs, args.warmup_secs),
+                    ScenarioPhase::Normal1 => (elapsed >= args.calm_secs, args.calm_secs),
+                    ScenarioPhase::Attack1 => (elapsed >= args.attack_secs, args.attack_secs),
+                    ScenarioPhase::Calm1 => (elapsed >= args.calm_secs, args.calm_secs),
+                    ScenarioPhase::Attack2 => (elapsed >= args.attack_secs, args.attack_secs),
+                    ScenarioPhase::Calm2 => (elapsed >= args.calm_secs, args.calm_secs),
+                    ScenarioPhase::Attack3 => (elapsed >= args.attack_secs, args.attack_secs),
+                    ScenarioPhase::Done => (false, 0),
+                };
+                
+                if phase_done && scenario_phase != ScenarioPhase::Done {
+                    scenario_phase = match scenario_phase {
+                        ScenarioPhase::Warmup => {
+                            info!(">>> PHASE: Normal (baseline learned)");
+                            ScenarioPhase::Normal1
+                        }
+                        ScenarioPhase::Normal1 => {
+                            info!(">>> PHASE: Attack 1 @ {} pps", args.attack_pps);
+                            ScenarioPhase::Attack1
+                        }
+                        ScenarioPhase::Attack1 => {
+                            info!(">>> PHASE: Calm 1 (recovery)");
+                            ScenarioPhase::Calm1
+                        }
+                        ScenarioPhase::Calm1 => {
+                            info!(">>> PHASE: Attack 2 @ {} pps", args.attack_pps);
+                            ScenarioPhase::Attack2
+                        }
+                        ScenarioPhase::Attack2 => {
+                            info!(">>> PHASE: Calm 2 (recovery)");
+                            ScenarioPhase::Calm2
+                        }
+                        ScenarioPhase::Calm2 => {
+                            info!(">>> PHASE: Attack 3 @ {} pps", args.attack_pps);
+                            ScenarioPhase::Attack3
+                        }
+                        ScenarioPhase::Attack3 => {
+                            info!(">>> PHASE: Done");
+                            ScenarioPhase::Done
+                        }
+                        ScenarioPhase::Done => ScenarioPhase::Done,
+                    };
+                    scenario_phase_start = Instant::now();
+                }
+                
+                if scenario_phase == ScenarioPhase::Done {
+                    break;
+                }
+                
+                // Return appropriate PPS for this phase
+                match scenario_phase {
+                    ScenarioPhase::Attack1 | ScenarioPhase::Attack2 | ScenarioPhase::Attack3 => {
+                        args.attack_pps
+                    }
+                    _ => args.pps
+                }
+            }
+            _ => args.pps
+        };
 
         // Determine if this packet is attack or normal based on pattern
         let is_attack = match args.pattern {
             TrafficPattern::Normal => false,
             TrafficPattern::Attack => true,
+            TrafficPattern::Scenario => {
+                matches!(scenario_phase, ScenarioPhase::Attack1 | ScenarioPhase::Attack2 | ScenarioPhase::Attack3)
+            }
             TrafficPattern::Mixed => {
                 // 5 seconds normal, 5 seconds attack
                 if phase_start.elapsed() >= phase_duration {
@@ -168,8 +580,8 @@ async fn main() -> Result<()> {
         
         // Build and send UDP packet
         let packet = craft_udp_packet(
-            &src_mac,
-            &dst_mac,
+            src_mac,
+            dst_mac,
             src_ip,
             target_ip,
             src_port,
@@ -189,12 +601,19 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Rate limiting
-        if args.pps > 0 {
-            let target_interval = Duration::from_nanos(1_000_000_000 / args.pps as u64);
-            // Simple busy-wait for accurate timing at high PPS
-            // In production, we'd batch packets
-            std::thread::sleep(target_interval.saturating_sub(Duration::from_micros(50)));
+        // Time-based rate limiting (simple version for pattern mode)
+        // For accurate high-PPS, use scenario files which have per-phase tracking
+        if current_pps > 0 {
+            let target_interval_ns = 1_000_000_000u64 / current_pps as u64;
+            if target_interval_ns >= 50_000 {
+                // Low-medium PPS (< 20k): sleep per packet works
+                std::thread::sleep(Duration::from_nanos(target_interval_ns));
+            } else {
+                // High PPS: simple batching - sleep every 5 packets
+                if packets_sent.load(Ordering::Relaxed) % 5 == 0 {
+                    std::thread::sleep(Duration::from_nanos(target_interval_ns * 5));
+                }
+            }
         }
 
         // Periodic stats report
@@ -214,22 +633,7 @@ async fn main() -> Result<()> {
             last_report = Instant::now();
         }
     }
-
-    // Final stats
-    let total = packets_sent.load(Ordering::Relaxed);
-    let total_bytes = bytes_sent.load(Ordering::Relaxed);
-    let elapsed = start.elapsed().as_secs_f64();
     
-    info!("");
-    info!("=== Final Stats ===");
-    info!("  Total packets: {}", total);
-    info!("  Total bytes: {:.2} KB", total_bytes as f64 / 1024.0);
-    info!("  Duration: {:.2}s", elapsed);
-    info!("  Average PPS: {:.0}", total as f64 / elapsed);
-
-    // Close socket
-    unsafe { libc::close(socket); }
-
     Ok(())
 }
 

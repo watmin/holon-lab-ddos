@@ -6,15 +6,18 @@
 //! This is a simplified version of Batch 013 detection, adapted for real-time use.
 
 use anyhow::{Context, Result};
+use chrono::Local;
 use clap::Parser;
 use holon::Holon;
 use std::collections::HashMap;
+use std::fs;
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{info, warn};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use veth_filter::{PacketSample, Rule, RuleAction, RuleType, VethFilter};
 
 #[derive(Parser, Debug)]
@@ -50,6 +53,29 @@ struct Args {
     /// Vector dimensions for Holon encoding
     #[arg(long, default_value = "4096")]
     dimensions: usize,
+
+    /// Warmup windows before detection starts
+    /// During warmup, baseline is learned but no anomalies are flagged
+    #[arg(long, default_value = "5")]
+    warmup_windows: u64,
+
+    /// Minimum packets required during warmup to establish baseline
+    #[arg(long, default_value = "500")]
+    warmup_packets: usize,
+
+    /// Directory for log files (also writes to stdout)
+    #[arg(long, default_value = "logs")]
+    log_dir: PathBuf,
+
+    /// Sample rate: 1 in N packets sampled (100 = 1%, 1000 = 0.1%)
+    /// Higher = less userspace load, but less granular detection
+    #[arg(long, default_value = "100")]
+    sample_rate: u32,
+
+    /// Perf buffer pages per CPU (smaller = less buffering, samples dropped when full)
+    /// Default 4 pages = 16KB per CPU, fills/drops fast under load
+    #[arg(long, default_value = "4")]
+    perf_pages: usize,
 }
 
 /// Tracked statistics for a field value
@@ -70,7 +96,7 @@ impl Default for ValueStats {
 /// Field tracker using Holon accumulators
 struct FieldTracker {
     holon: Arc<Holon>,
-    /// Baseline accumulator (stable reference)
+    /// Baseline accumulator (stable reference - frozen after warmup)
     baseline_acc: Vec<f64>,
     /// Recent accumulator (current window)
     recent_acc: Vec<f64>,
@@ -80,6 +106,8 @@ struct FieldTracker {
     window_count: usize,
     /// Last window reset time
     last_reset: Instant,
+    /// Whether baseline is frozen (after warmup)
+    baseline_frozen: bool,
 }
 
 impl FieldTracker {
@@ -92,7 +120,13 @@ impl FieldTracker {
             value_counts: HashMap::new(),
             window_count: 0,
             last_reset: Instant::now(),
+            baseline_frozen: false,
         }
+    }
+
+    /// Freeze the baseline (called after warmup)
+    fn freeze_baseline(&mut self) {
+        self.baseline_frozen = true;
     }
 
     /// Add a packet sample to the tracker
@@ -188,12 +222,15 @@ impl FieldTracker {
 
     /// Reset the window (move recent to baseline, clear recent)
     fn reset_window(&mut self) {
-        // Update baseline with exponential moving average
-        let alpha = 0.3; // Weight for new data
-        for i in 0..self.baseline_acc.len() {
-            if self.window_count > 0 {
-                let recent_normalized = self.recent_acc[i] / self.window_count as f64;
-                self.baseline_acc[i] = (1.0 - alpha) * self.baseline_acc[i] + alpha * recent_normalized;
+        // Only update baseline during warmup (before frozen)
+        // After warmup, baseline is frozen to prevent attack pollution
+        if !self.baseline_frozen {
+            let alpha = 0.3; // Weight for new data
+            for i in 0..self.baseline_acc.len() {
+                if self.window_count > 0 {
+                    let recent_normalized = self.recent_acc[i] / self.window_count as f64;
+                    self.baseline_acc[i] = (1.0 - alpha) * self.baseline_acc[i] + alpha * recent_normalized;
+                }
             }
         }
 
@@ -206,6 +243,7 @@ impl FieldTracker {
 }
 
 /// Detection result
+#[allow(dead_code)]  // Fields used for debugging/logging context
 struct Detection {
     field: String,
     value: String,
@@ -244,13 +282,36 @@ impl Detection {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
-
     let args = Args::parse();
+
+    // Create log directory
+    fs::create_dir_all(&args.log_dir)
+        .with_context(|| format!("Failed to create log dir: {:?}", args.log_dir))?;
+
+    // Generate timestamped log filename
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+    let log_filename = format!("sidecar_{}.log", timestamp);
+    let log_path = args.log_dir.join(&log_filename);
+
+    // Set up file appender
+    let file_appender = tracing_appender::rolling::never(&args.log_dir, &log_filename);
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // Initialize tracing with both stdout and file
+    tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_ansi(true)
+                .with_target(false)
+        )
+        .with(
+            fmt::layer()
+                .with_ansi(false)
+                .with_target(false)
+                .with_writer(non_blocking)
+        )
+        .with(tracing_subscriber::filter::LevelFilter::INFO)
+        .init();
 
     info!("Veth Lab Sidecar - Holon Anomaly Detection");
     info!("  Interface: {}", args.interface);
@@ -259,6 +320,10 @@ async fn main() -> Result<()> {
     info!("  Concentration threshold: {}", args.concentration);
     info!("  Enforce mode: {}", args.enforce);
     info!("  Dimensions: {}", args.dimensions);
+    info!("  Warmup: {} windows / {} packets", args.warmup_windows, args.warmup_packets);
+    info!("  Sample rate: 1 in {} packets", args.sample_rate);
+    info!("  Perf buffer: {} pages/CPU ({}KB)", args.perf_pages, args.perf_pages * 4);
+    info!("  Log file: {:?}", log_path);
     info!("");
 
     // Load XDP filter
@@ -266,7 +331,7 @@ async fn main() -> Result<()> {
     let filter = Arc::new(filter);
 
     // Configure filter
-    filter.set_sample_rate(1).await?;  // Sample all packets
+    filter.set_sample_rate(args.sample_rate).await?;  // 1 in N packets sampled
     filter.set_enforce_mode(args.enforce).await?;
 
     // Initialize Holon
@@ -279,16 +344,16 @@ async fn main() -> Result<()> {
     // Take perf array for sample reading
     let mut perf_array = filter.take_perf_array().await?;
 
-    // Channel for samples from all CPUs
-    let (sample_tx, mut sample_rx) = tokio::sync::mpsc::channel::<PacketSample>(10000);
+    // Channel for samples from all CPUs (small capacity - drop if backed up)
+    let (sample_tx, mut sample_rx) = tokio::sync::mpsc::channel::<PacketSample>(1000);
 
     // Spawn a task for each CPU to read from perf buffer
     let cpus = aya::util::online_cpus().map_err(|(msg, e)| anyhow::anyhow!("{}: {}", msg, e))?;
-    info!("Starting perf readers on {} CPUs", cpus.len());
+    info!("Starting perf readers on {} CPUs ({} pages/CPU)", cpus.len(), args.perf_pages);
 
     for cpu_id in cpus {
         let mut buf = perf_array
-            .open(cpu_id, None)
+            .open(cpu_id, Some(args.perf_pages))
             .context(format!("Failed to open perf buffer for CPU {}", cpu_id))?;
         let tx = sample_tx.clone();
 
@@ -310,8 +375,13 @@ async fn main() -> Result<()> {
                         let sample = unsafe {
                             std::ptr::read_unaligned(event_buf.as_ptr() as *const PacketSample)
                         };
-                        if tx.send(sample).await.is_err() {
-                            return;
+                        // Use try_send to drop samples if channel is full (non-blocking)
+                        match tx.try_send(sample) {
+                            Ok(_) => {},
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                // Channel full - drop sample (expected under load)
+                            }
                         }
                     }
                 }
@@ -324,44 +394,79 @@ async fn main() -> Result<()> {
     let active_rules: Arc<RwLock<HashMap<String, Instant>>> = Arc::new(RwLock::new(HashMap::new()));
 
     info!("Starting detection loop...");
+    info!("  Warmup: {} windows or {} packets", args.warmup_windows, args.warmup_packets);
     info!("");
 
     let window_duration = Duration::from_secs(args.window);
     let mut _samples_processed = 0u64;
     let mut windows_processed = 0u64;
+    let mut total_warmup_packets = 0usize;
+    let mut warmup_complete = false;
 
     // Track when we last checked the window
     let mut last_window_check = Instant::now();
     let check_interval = Duration::from_millis(100);
 
+    // Max samples to process before checking window timer
+    const MAX_SAMPLES_PER_CHECK: usize = 200;
+    let mut samples_since_window_check = 0usize;
+
     loop {
-        // Drain available samples (non-blocking after first)
-        let mut samples_this_batch = 0;
-        loop {
-            match sample_rx.try_recv() {
-                Ok(sample) => {
-                    let mut tracker = tracker.write().await;
-                    tracker.add_sample(&sample);
-                    _samples_processed += 1;
-                    samples_this_batch += 1;
+        // Process a limited batch of samples
+        let mut got_sample = false;
+        let mut matched_rule_keys: Vec<String> = Vec::new();
+        
+        {
+            let mut tracker = tracker.write().await;
+            for _ in 0..MAX_SAMPLES_PER_CHECK {
+                match sample_rx.try_recv() {
+                    Ok(sample) => {
+                        tracker.add_sample(&sample);
+                        _samples_processed += 1;
+                        samples_since_window_check += 1;
+                        got_sample = true;
+                        
+                        // Collect matched samples to refresh rule TTLs later
+                        if sample.matched_rule != 0 {
+                            matched_rule_keys.push(format!("{:?}:{}", RuleType::SrcIp, sample.src_ip_addr()));
+                            matched_rule_keys.push(format!("{:?}:{}", RuleType::DstPort, sample.dst_port));
+                        }
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        info!("Sample channel closed");
+                        return Ok(());
+                    }
                 }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    info!("Sample channel closed");
-                    return Ok(());
+            }
+        }
+        
+        // Refresh TTL for rules that matched dropped packets (batch update)
+        if !matched_rule_keys.is_empty() {
+            let mut rules = active_rules.write().await;
+            let now = Instant::now();
+            for key in matched_rule_keys {
+                if rules.contains_key(&key) {
+                    rules.insert(key, now);
                 }
             }
         }
 
-        // Only check window periodically
-        if last_window_check.elapsed() < check_interval {
-            // Small yield to avoid busy-waiting when no samples
-            if samples_this_batch == 0 {
+        // Check window timer after each batch OR when idle
+        let should_check_window = last_window_check.elapsed() >= check_interval 
+            || samples_since_window_check >= 1000;  // Force check every 1000 samples
+        
+        if !should_check_window {
+            if !got_sample {
                 tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                tokio::task::yield_now().await;
             }
             continue;
         }
+        
         last_window_check = Instant::now();
+        samples_since_window_check = 0;
 
         // Check if window has elapsed
         let tracker_read = tracker.read().await;
@@ -380,17 +485,48 @@ async fn main() -> Result<()> {
                 let window_count = tracker_read.window_count;
                 drop(tracker_read);
 
+                // Track warmup progress
+                total_warmup_packets += window_count;
+
                 // Get stats from XDP
                 let stats = filter.stats().await.ok();
                 let drops = stats.as_ref().map(|s| s.dropped_packets).unwrap_or(0);
                 let total = stats.as_ref().map(|s| s.total_packets).unwrap_or(0);
+
+                // Check if warmup should complete
+                if !warmup_complete {
+                    let warmup_by_windows = windows_processed >= args.warmup_windows;
+                    let warmup_by_packets = total_warmup_packets >= args.warmup_packets;
+                    
+                    if warmup_by_windows || warmup_by_packets {
+                        warmup_complete = true;
+                        // Freeze baseline to prevent attack pollution
+                        tracker.write().await.freeze_baseline();
+                        info!("========================================");
+                        info!("WARMUP COMPLETE - baseline FROZEN");
+                        info!("  Windows: {}, Packets: {}", windows_processed, total_warmup_packets);
+                        info!("  Detection now active!");
+                        info!("========================================");
+                    } else {
+                        info!(
+                            "Window {} [WARMUP]: {} packets, drift={:.3} | XDP total: {}, dropped: {} | warmup {}/{} windows, {}/{} packets",
+                            windows_processed, window_count, drift, total, drops,
+                            windows_processed, args.warmup_windows,
+                            total_warmup_packets, args.warmup_packets
+                        );
+                        // Reset window but don't do anomaly detection during warmup
+                        let mut tracker_write = tracker.write().await;
+                        tracker_write.reset_window();
+                        continue;
+                    }
+                }
                 
                 info!(
                     "Window {}: {} packets, drift={:.3} | XDP total: {}, dropped: {}",
                     windows_processed, window_count, drift, total, drops
                 );
 
-                // Check for anomaly
+                // Check for anomaly (only after warmup)
                 if drift < args.threshold && !concentrated.is_empty() {
                     warn!(">>> ANOMALY DETECTED: drift={:.3} (threshold={})", drift, args.threshold);
 
@@ -412,7 +548,11 @@ async fn main() -> Result<()> {
                             let rule_key = format!("{:?}:{}", rule.rule_type, rule.value);
                             
                             let mut rules = active_rules.write().await;
-                            if !rules.contains_key(&rule_key) {
+                            if rules.contains_key(&rule_key) {
+                                // Rule exists - refresh TTL
+                                rules.insert(rule_key, Instant::now());
+                            } else {
+                                // New rule - add it
                                 if args.enforce {
                                     match filter.add_rule(&rule).await {
                                         Ok(_) => {
@@ -444,8 +584,10 @@ async fn main() -> Result<()> {
             // Reset window
             tracker.write().await.reset_window();
 
-            // Expire old rules (after 30 seconds of no re-detection)
-            let rule_ttl = Duration::from_secs(30);
+            // Expire old rules (after 5 minutes of no re-detection)
+            // Note: Rules will naturally not be refreshed when attack is being blocked,
+            // so TTL needs to be long enough to cover attack duration + margin
+            let rule_ttl = Duration::from_secs(300);  // 5 minutes
             let mut rules = active_rules.write().await;
             let expired: Vec<String> = rules
                 .iter()

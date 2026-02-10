@@ -1,0 +1,13 @@
+{
+  "name": "Quick Iteration Test",
+  "description": "Fast test for rate limiting iteration - 2 min total",
+  "baseline_pps": 2000,
+  "attack_pps": 50000,
+  "phases": [
+    {"name": "warmup",  "duration_secs": 30, "type": "normal", "description": "30s baseline"},
+    {"name": "attack1", "duration_secs": 15, "type": "attack", "description": "15s attack"},
+    {"name": "calm",    "duration_secs": 20, "type": "normal", "description": "20s verify recovery"},
+    {"name": "attack2", "duration_secs": 15, "type": "attack", "description": "15s second attack"},
+    {"name": "done",    "duration_secs": 10, "type": "normal", "description": "10s final calm"}
+  ]
+}

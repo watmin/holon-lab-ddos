@@ -1,0 +1,101 @@
+2026-02-10T03:42:56.152476Z  INFO Veth Lab Traffic Generator
+2026-02-10T03:42:56.152484Z  INFO   Interface: veth-gen
+2026-02-10T03:42:56.152486Z  INFO   Target: 10.100.0.2
+2026-02-10T03:42:56.152490Z  INFO   Log file: "logs/generator_20260209_194256.log"
+2026-02-10T03:42:56.152493Z  INFO   Mode: Scenario file
+2026-02-10T03:42:56.152495Z  INFO   Scenario: Realistic DDoS Scenario
+2026-02-10T03:42:56.161795Z  INFO Socket ready, starting traffic generation...
+2026-02-10T03:42:56.161806Z  INFO 
+2026-02-10T03:42:56.161815Z  INFO === SCENARIO: Realistic DDoS Scenario ===
+2026-02-10T03:42:56.161820Z  INFO   Long baseline learning, varied attack patterns with realistic timing
+2026-02-10T03:42:56.161824Z  INFO   Baseline PPS: 2000
+2026-02-10T03:42:56.161827Z  INFO   Attack PPS: 50000
+2026-02-10T03:42:56.161830Z  INFO 
+2026-02-10T03:42:56.161832Z  INFO Timeline:
+2026-02-10T03:42:56.161837Z  INFO    1. learning      300s @  2000 pps (0:00 - 5:00) 5 min baseline learning
+2026-02-10T03:42:56.161842Z  INFO    2. probe          30s @ 50000 pps (5:00 - 5:30) 30s initial attack probe
+2026-02-10T03:42:56.161847Z  INFO    3. calm1         240s @  2000 pps (5:30 - 9:30) 4 min calm - attacker recon
+2026-02-10T03:42:56.161850Z  INFO    4. sustained     180s @ 50000 pps (9:30 - 12:30) 3 min sustained attack
+2026-02-10T03:42:56.161854Z  INFO    5. pause          40s @  2000 pps (12:30 - 13:10) 40s brief pause
+2026-02-10T03:42:56.161859Z  INFO    6. wave2          60s @ 50000 pps (13:10 - 14:10) 60s second wave
+2026-02-10T03:42:56.161862Z  INFO    7. recovery      180s @  2000 pps (14:10 - 17:10) 3 min final calm
+2026-02-10T03:42:56.161865Z  INFO 
+2026-02-10T03:42:56.161868Z  INFO Total duration: 17m 10s
+2026-02-10T03:42:56.161871Z  INFO 
+2026-02-10T03:42:56.161874Z  INFO >>> [  0s] PHASE 1: learning (Normal, 2000 pps, 300s)
+2026-02-10T03:43:01.162209Z  INFO     [  5s] 9748 packets (1949 pps), 0.51 MB | phase: 295s remaining
+2026-02-10T03:43:06.162530Z  INFO     [ 10s] 19611 packets (1972 pps), 1.03 MB | phase: 290s remaining
+2026-02-10T03:43:11.163026Z  INFO     [ 15s] 29515 packets (1980 pps), 1.55 MB | phase: 285s remaining
+2026-02-10T03:43:16.163438Z  INFO     [ 20s] 39382 packets (1973 pps), 2.07 MB | phase: 280s remaining
+2026-02-10T03:43:21.163706Z  INFO     [ 25s] 49249 packets (1973 pps), 2.58 MB | phase: 275s remaining
+2026-02-10T03:43:26.164208Z  INFO     [ 30s] 59145 packets (1979 pps), 3.10 MB | phase: 270s remaining
+2026-02-10T03:43:31.164704Z  INFO     [ 35s] 69050 packets (1981 pps), 3.62 MB | phase: 265s remaining
+2026-02-10T03:43:36.165216Z  INFO     [ 40s] 78933 packets (1976 pps), 4.14 MB | phase: 260s remaining
+2026-02-10T03:43:41.165371Z  INFO     [ 45s] 88811 packets (1975 pps), 4.66 MB | phase: 255s remaining
+2026-02-10T03:43:46.165705Z  INFO     [ 50s] 98694 packets (1976 pps), 5.18 MB | phase: 250s remaining
+2026-02-10T03:43:51.165915Z  INFO     [ 55s] 108584 packets (1978 pps), 5.70 MB | phase: 245s remaining
+2026-02-10T03:43:56.166305Z  INFO     [ 60s] 118478 packets (1978 pps), 6.21 MB | phase: 240s remaining
+2026-02-10T03:44:01.166520Z  INFO     [ 65s] 128340 packets (1972 pps), 6.73 MB | phase: 235s remaining
+2026-02-10T03:44:06.166765Z  INFO     [ 70s] 138220 packets (1976 pps), 7.25 MB | phase: 230s remaining
+2026-02-10T03:44:11.167216Z  INFO     [ 75s] 148126 packets (1981 pps), 7.77 MB | phase: 225s remaining
+2026-02-10T03:44:16.167515Z  INFO     [ 80s] 158032 packets (1981 pps), 8.29 MB | phase: 220s remaining
+2026-02-10T03:44:21.167681Z  INFO     [ 85s] 167927 packets (1979 pps), 8.81 MB | phase: 215s remaining
+2026-02-10T03:44:26.168217Z  INFO     [ 90s] 177792 packets (1973 pps), 9.33 MB | phase: 210s remaining
+2026-02-10T03:44:31.168701Z  INFO     [ 95s] 187668 packets (1975 pps), 9.84 MB | phase: 205s remaining
+2026-02-10T03:44:36.169022Z  INFO     [100s] 197557 packets (1977 pps), 10.36 MB | phase: 200s remaining
+2026-02-10T03:44:41.169210Z  INFO     [105s] 207433 packets (1975 pps), 10.88 MB | phase: 195s remaining
+2026-02-10T03:44:46.169711Z  INFO     [110s] 217328 packets (1979 pps), 11.40 MB | phase: 190s remaining
+2026-02-10T03:44:51.170024Z  INFO     [115s] 227208 packets (1976 pps), 11.92 MB | phase: 185s remaining
+2026-02-10T03:44:56.170217Z  INFO     [120s] 237115 packets (1981 pps), 12.44 MB | phase: 180s remaining
+2026-02-10T03:45:01.170467Z  INFO     [125s] 246993 packets (1975 pps), 12.96 MB | phase: 175s remaining
+2026-02-10T03:45:06.171008Z  INFO     [130s] 256900 packets (1981 pps), 13.47 MB | phase: 170s remaining
+2026-02-10T03:45:11.171220Z  INFO     [135s] 266791 packets (1978 pps), 13.99 MB | phase: 165s remaining
+2026-02-10T03:45:16.171713Z  INFO     [140s] 276671 packets (1976 pps), 14.51 MB | phase: 160s remaining
+2026-02-10T03:45:21.172198Z  INFO     [145s] 286518 packets (1969 pps), 15.03 MB | phase: 155s remaining
+2026-02-10T03:45:26.172703Z  INFO     [150s] 296413 packets (1979 pps), 15.55 MB | phase: 150s remaining
+2026-02-10T03:45:31.173206Z  INFO     [155s] 306307 packets (1978 pps), 16.07 MB | phase: 145s remaining
+2026-02-10T03:45:36.173697Z  INFO     [160s] 316190 packets (1976 pps), 16.58 MB | phase: 140s remaining
+2026-02-10T03:45:41.174054Z  INFO     [165s] 326076 packets (1977 pps), 17.10 MB | phase: 135s remaining
+2026-02-10T03:45:46.174207Z  INFO     [170s] 335981 packets (1981 pps), 17.62 MB | phase: 130s remaining
+2026-02-10T03:45:51.174352Z  INFO     [175s] 345867 packets (1977 pps), 18.14 MB | phase: 125s remaining
+2026-02-10T03:45:56.174468Z  INFO     [180s] 355747 packets (1976 pps), 18.66 MB | phase: 120s remaining
+2026-02-10T03:46:01.174705Z  INFO     [185s] 365637 packets (1978 pps), 19.18 MB | phase: 115s remaining
+2026-02-10T03:46:06.175222Z  INFO     [190s] 375538 packets (1980 pps), 19.70 MB | phase: 110s remaining
+2026-02-10T03:46:11.175696Z  INFO     [195s] 385450 packets (1982 pps), 20.22 MB | phase: 105s remaining
+2026-02-10T03:46:16.176237Z  INFO     [200s] 395364 packets (1982 pps), 20.74 MB | phase: 100s remaining
+2026-02-10T03:46:21.176629Z  INFO     [205s] 405253 packets (1977 pps), 21.26 MB | phase: 95s remaining
+2026-02-10T03:46:26.176706Z  INFO     [210s] 415155 packets (1980 pps), 21.78 MB | phase: 90s remaining
+2026-02-10T03:46:31.177120Z  INFO     [215s] 425052 packets (1979 pps), 22.29 MB | phase: 85s remaining
+2026-02-10T03:46:36.177576Z  INFO     [220s] 434931 packets (1975 pps), 22.81 MB | phase: 80s remaining
+2026-02-10T03:46:41.177705Z  INFO     [225s] 444824 packets (1978 pps), 23.33 MB | phase: 75s remaining
+2026-02-10T03:46:46.178177Z  INFO     [230s] 454734 packets (1982 pps), 23.85 MB | phase: 70s remaining
+2026-02-10T03:46:51.178700Z  INFO     [235s] 464625 packets (1978 pps), 24.37 MB | phase: 65s remaining
+2026-02-10T03:46:56.178780Z  INFO     [240s] 474524 packets (1979 pps), 24.89 MB | phase: 60s remaining
+2026-02-10T03:47:01.179138Z  INFO     [245s] 484441 packets (1983 pps), 25.41 MB | phase: 55s remaining
+2026-02-10T03:47:06.179305Z  INFO     [250s] 494327 packets (1977 pps), 25.93 MB | phase: 50s remaining
+2026-02-10T03:47:11.179706Z  INFO     [255s] 504218 packets (1978 pps), 26.45 MB | phase: 45s remaining
+2026-02-10T03:47:16.180075Z  INFO     [260s] 514132 packets (1982 pps), 26.97 MB | phase: 40s remaining
+2026-02-10T03:47:21.180217Z  INFO     [265s] 524020 packets (1977 pps), 27.49 MB | phase: 35s remaining
+2026-02-10T03:47:26.180704Z  INFO     [270s] 533908 packets (1977 pps), 28.00 MB | phase: 30s remaining
+2026-02-10T03:47:31.181214Z  INFO     [275s] 543799 packets (1978 pps), 28.52 MB | phase: 25s remaining
+2026-02-10T03:47:36.181702Z  INFO     [280s] 553677 packets (1975 pps), 29.04 MB | phase: 20s remaining
+2026-02-10T03:47:41.182213Z  INFO     [285s] 563550 packets (1974 pps), 29.56 MB | phase: 15s remaining
+2026-02-10T03:47:46.182698Z  INFO     [290s] 573444 packets (1978 pps), 30.08 MB | phase: 10s remaining
+2026-02-10T03:47:51.183195Z  INFO     [295s] 583326 packets (1976 pps), 30.60 MB | phase: 5s remaining
+2026-02-10T03:47:56.162043Z  INFO >>> [300s] PHASE 2: probe (Attack, 50000 pps, 30s)
+2026-02-10T03:47:56.183221Z  INFO     [300s] 614047 packets (6144 pps), 32.21 MB | phase: 30s remaining
+2026-02-10T03:48:01.183257Z  INFO     [305s] 4903969 packets (857984 pps), 257.22 MB | phase: 25s remaining
+2026-02-10T03:48:06.183289Z  INFO     [310s] 8960847 packets (811375 pps), 470.02 MB | phase: 20s remaining
+2026-02-10T03:48:11.183324Z  INFO     [315s] 13665287 packets (940888 pps), 716.77 MB | phase: 15s remaining
+2026-02-10T03:48:16.183360Z  INFO     [320s] 18841036 packets (1035149 pps), 988.25 MB | phase: 10s remaining
+2026-02-10T03:48:21.183396Z  INFO     [325s] 23692802 packets (970353 pps), 1242.74 MB | phase: 5s remaining
+2026-02-10T03:48:26.162077Z  INFO >>> [330s] PHASE 3: calm1 (Normal, 2000 pps, 240s)
+2026-02-10T03:48:26.183525Z  INFO     [330s] 27207210 packets (702881 pps), 1427.07 MB | phase: 240s remaining
+2026-02-10T03:48:31.183705Z  INFO     [335s] 27217065 packets (1971 pps), 1427.59 MB | phase: 235s remaining
+2026-02-10T03:48:34.724930Z  INFO 
+Received Ctrl+C, stopping...
+2026-02-10T03:48:34.725267Z  INFO >>> Scenario complete
+2026-02-10T03:48:34.725281Z  INFO 
+2026-02-10T03:48:34.725286Z  INFO === Final Stats ===
+2026-02-10T03:48:34.725292Z  INFO   Total packets: 27224073
+2026-02-10T03:48:34.725300Z  INFO   Total bytes: 1427.96 MB

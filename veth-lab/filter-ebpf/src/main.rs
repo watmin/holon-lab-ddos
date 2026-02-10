@@ -175,12 +175,12 @@ fn try_veth_filter(ctx: XdpContext) -> Result<u32, ()> {
         }
     }
 
-    // Sample the packet
+    // Sample the packet (at configured rate regardless of match status)
+    // Matched packets are still sampled so we can track ongoing attacks
     let sample_rate = CONFIG.get(0).copied().unwrap_or(0);
     let total_count = STATS.get(0).copied().unwrap_or(0);
     
-    let should_sample = sample_rate > 0 && 
-        (matched || total_count % sample_rate as u64 == 0);
+    let should_sample = sample_rate > 0 && (total_count % sample_rate as u64 == 0);
     
     if should_sample {
         sample_packet(&ctx, pkt_len, src_ip, dst_ip, src_port, dst_port, 

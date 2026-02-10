@@ -1,0 +1,49 @@
+2026-02-10T04:58:22.181239Z  INFO Veth Lab Traffic Generator
+2026-02-10T04:58:22.181248Z  INFO   Interface: veth-gen
+2026-02-10T04:58:22.181253Z  INFO   Target: 10.100.0.2
+2026-02-10T04:58:22.181257Z  INFO   Log file: "logs/generator_20260209_205822.log"
+2026-02-10T04:58:22.181263Z  INFO   Mode: Scenario file
+2026-02-10T04:58:22.181267Z  INFO   Scenario: Quick Iteration Test
+2026-02-10T04:58:22.186802Z  INFO Socket ready, starting traffic generation...
+2026-02-10T04:58:22.186813Z  INFO 
+2026-02-10T04:58:22.186823Z  INFO === SCENARIO: Quick Iteration Test ===
+2026-02-10T04:58:22.186827Z  INFO   Fast test for rate limiting iteration - 2 min total
+2026-02-10T04:58:22.186830Z  INFO   Baseline PPS: 2000
+2026-02-10T04:58:22.186834Z  INFO   Attack PPS: 50000
+2026-02-10T04:58:22.186837Z  INFO 
+2026-02-10T04:58:22.186840Z  INFO Timeline:
+2026-02-10T04:58:22.186846Z  INFO    1. warmup         30s @  2000 pps (0:00 - 0:30) 30s baseline
+2026-02-10T04:58:22.186851Z  INFO    2. attack1        15s @ 50000 pps (0:30 - 0:45) 15s attack
+2026-02-10T04:58:22.186855Z  INFO    3. calm           20s @  2000 pps (0:45 - 1:05) 20s verify recovery
+2026-02-10T04:58:22.186859Z  INFO    4. attack2        15s @ 50000 pps (1:05 - 1:20) 15s second attack
+2026-02-10T04:58:22.186863Z  INFO    5. done           10s @  2000 pps (1:20 - 1:30) 10s final calm
+2026-02-10T04:58:22.186866Z  INFO 
+2026-02-10T04:58:22.186870Z  INFO Total duration: 1m 30s
+2026-02-10T04:58:22.186873Z  INFO 
+2026-02-10T04:58:22.186878Z  INFO >>> [  0s] PHASE 1: warmup (Normal, 2000 pps, 30s)
+2026-02-10T04:58:27.186964Z  INFO     [  5s] 10000 packets (2000 pps), 0.52 MB | phase: 25s remaining
+2026-02-10T04:58:32.187471Z  INFO     [ 10s] 20001 packets (2000 pps), 1.05 MB | phase: 20s remaining
+2026-02-10T04:58:37.187960Z  INFO     [ 15s] 30002 packets (2000 pps), 1.57 MB | phase: 15s remaining
+2026-02-10T04:58:42.188474Z  INFO     [ 20s] 40003 packets (2000 pps), 2.10 MB | phase: 10s remaining
+2026-02-10T04:58:47.188981Z  INFO     [ 25s] 50004 packets (2000 pps), 2.62 MB | phase: 5s remaining
+2026-02-10T04:58:52.186962Z  INFO >>> [ 30s] PHASE 2: attack1 (Attack, 50000 pps, 15s)
+2026-02-10T04:58:52.189034Z  INFO     [ 30s] 60100 packets (2019 pps), 3.15 MB | phase: 15s remaining
+2026-02-10T04:58:57.189110Z  INFO     [ 35s] 310103 packets (50000 pps), 16.27 MB | phase: 10s remaining
+2026-02-10T04:59:02.189171Z  INFO     [ 40s] 560106 packets (50000 pps), 29.38 MB | phase: 5s remaining
+2026-02-10T04:59:07.187049Z  INFO >>> [ 45s] PHASE 3: calm (Normal, 2000 pps, 20s)
+2026-02-10T04:59:07.189643Z  INFO     [ 45s] 810005 packets (49979 pps), 42.49 MB | phase: 20s remaining
+2026-02-10T04:59:12.190158Z  INFO     [ 50s] 820006 packets (2000 pps), 43.01 MB | phase: 15s remaining
+2026-02-10T04:59:17.190663Z  INFO     [ 55s] 830007 packets (2000 pps), 43.54 MB | phase: 10s remaining
+2026-02-10T04:59:22.191157Z  INFO     [ 60s] 840008 packets (2000 pps), 44.06 MB | phase: 5s remaining
+2026-02-10T04:59:27.187139Z  INFO >>> [ 65s] PHASE 4: attack2 (Attack, 50000 pps, 15s)
+2026-02-10T04:59:27.191235Z  INFO     [ 65s] 850201 packets (2038 pps), 44.59 MB | phase: 15s remaining
+2026-02-10T04:59:32.191286Z  INFO     [ 70s] 1100203 packets (50000 pps), 57.71 MB | phase: 10s remaining
+2026-02-10T04:59:37.191341Z  INFO     [ 75s] 1350205 packets (50000 pps), 70.82 MB | phase: 5s remaining
+2026-02-10T04:59:42.187192Z  INFO >>> [ 80s] PHASE 5: done (Normal, 2000 pps, 10s)
+2026-02-10T04:59:42.191780Z  INFO     [ 80s] 1600007 packets (49960 pps), 83.92 MB | phase: 10s remaining
+2026-02-10T04:59:47.192301Z  INFO     [ 85s] 1610008 packets (2000 pps), 84.45 MB | phase: 5s remaining
+2026-02-10T04:59:52.187295Z  INFO >>> Scenario complete
+2026-02-10T04:59:52.187316Z  INFO 
+2026-02-10T04:59:52.187320Z  INFO === Final Stats ===
+2026-02-10T04:59:52.187326Z  INFO   Total packets: 1619998
+2026-02-10T04:59:52.187331Z  INFO   Total bytes: 84.97 MB

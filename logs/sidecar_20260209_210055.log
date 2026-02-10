@@ -1,0 +1,175 @@
+2026-02-10T05:00:55.158396Z  INFO Veth Lab Sidecar - Holon Anomaly Detection
+2026-02-10T05:00:55.158402Z  INFO   Interface: veth-filter
+2026-02-10T05:00:55.158408Z  INFO   Window: 2s
+2026-02-10T05:00:55.158413Z  INFO   Drift threshold: 0.7
+2026-02-10T05:00:55.158415Z  INFO   Concentration threshold: 0.5
+2026-02-10T05:00:55.158420Z  INFO   Enforce mode: true
+2026-02-10T05:00:55.158424Z  INFO   Dimensions: 4096
+2026-02-10T05:00:55.158427Z  INFO   Warmup: 15 windows / 1500 packets
+2026-02-10T05:00:55.158430Z  INFO   Sample rate: 1 in 100 packets
+2026-02-10T05:00:55.158435Z  INFO   Perf buffer: 4 pages/CPU (16KB)
+2026-02-10T05:00:55.158440Z  INFO   Log file: "logs/sidecar_20260209_210055.log"
+2026-02-10T05:00:55.158443Z  INFO 
+2026-02-10T05:00:55.158453Z  INFO Loading veth-filter XDP program for veth-filter
+2026-02-10T05:00:55.209989Z  INFO XDP program loaded
+2026-02-10T05:00:55.215730Z  INFO XDP program attached to veth-filter in default mode
+2026-02-10T05:00:55.215761Z  INFO Sample rate set to 100
+2026-02-10T05:00:55.215774Z  INFO Enforce mode set to true
+2026-02-10T05:00:55.215861Z  INFO Holon initialized with 4096 dimensions
+2026-02-10T05:00:55.215924Z  INFO Starting perf readers on 14 CPUs (4 pages/CPU)
+2026-02-10T05:00:55.216809Z  INFO Starting detection loop...
+2026-02-10T05:00:55.216814Z  INFO   Warmup: 15 windows or 1500 packets
+2026-02-10T05:00:55.216834Z  INFO 
+2026-02-10T05:00:57.275902Z  INFO Window 1: 0 packets (below minimum 50, skipping analysis)
+2026-02-10T05:00:59.336048Z  INFO Window 2: 6 packets (below minimum 50, skipping analysis)
+2026-02-10T05:01:01.386517Z  INFO Window 3: 20 packets (below minimum 50, skipping analysis)
+2026-02-10T05:01:03.442655Z  INFO Window 4: 19 packets (below minimum 50, skipping analysis)
+2026-02-10T05:01:05.510294Z  INFO Window 5: 19 packets (below minimum 50, skipping analysis)
+2026-02-10T05:01:07.567743Z  INFO Window 6: 21 packets (below minimum 50, skipping analysis)
+2026-02-10T05:01:09.631710Z  INFO Window 7: 21 packets (below minimum 50, skipping analysis)
+2026-02-10T05:01:11.691494Z  INFO Window 8: 23 packets (below minimum 50, skipping analysis)
+2026-02-10T05:01:13.742167Z  INFO Window 9: 37 packets (below minimum 50, skipping analysis)
+2026-02-10T05:01:15.796399Z  INFO Window 10 [WARMUP]: 101 packets, drift=0.990 | XDP total: 27257, dropped: 0 | warmup 10/15 windows, 101/1500 packets
+2026-02-10T05:01:17.857281Z  INFO Window 11 [WARMUP]: 102 packets, drift=0.991 | XDP total: 37561, dropped: 0 | warmup 11/15 windows, 203/1500 packets
+2026-02-10T05:01:19.917584Z  INFO Window 12 [WARMUP]: 104 packets, drift=0.992 | XDP total: 47863, dropped: 0 | warmup 12/15 windows, 307/1500 packets
+2026-02-10T05:01:21.976284Z  INFO Window 13 [WARMUP]: 103 packets, drift=0.992 | XDP total: 58156, dropped: 0 | warmup 13/15 windows, 410/1500 packets
+2026-02-10T05:01:24.035081Z  INFO Window 14 [WARMUP]: 102 packets, drift=0.993 | XDP total: 68450, dropped: 0 | warmup 14/15 windows, 512/1500 packets
+2026-02-10T05:01:26.103719Z  INFO ========================================
+2026-02-10T05:01:26.103734Z  INFO WARMUP COMPLETE - baseline FROZEN
+2026-02-10T05:01:26.103742Z  INFO   Windows: 15, Packets: 615
+2026-02-10T05:01:26.103748Z  INFO   Detection now active!
+2026-02-10T05:01:26.103753Z  INFO ========================================
+2026-02-10T05:01:26.103764Z  INFO Window 15: 103 packets, drift=0.993 | XDP total: 78793, dropped: 0
+2026-02-10T05:01:26.103767Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:01:28.166508Z  INFO Window 16: 103 packets, drift=0.993 | XDP total: 89107, dropped: 0
+2026-02-10T05:01:28.166518Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:01:30.214324Z  INFO Window 17: 197 packets, drift=0.996 | XDP total: 108691, dropped: 0
+2026-02-10T05:01:30.214340Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:01:32.283417Z  INFO Window 18: 206 packets, drift=0.996 | XDP total: 129382, dropped: 0
+2026-02-10T05:01:32.283435Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:01:34.337979Z  INFO Window 19: 205 packets, drift=0.996 | XDP total: 149928, dropped: 0
+2026-02-10T05:01:34.337989Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:01:36.389179Z  INFO Window 20: 205 packets, drift=0.996 | XDP total: 170440, dropped: 0
+2026-02-10T05:01:36.389190Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:01:38.436502Z  INFO Window 21: 205 packets, drift=0.996 | XDP total: 190913, dropped: 0
+2026-02-10T05:01:38.436512Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:01:40.495010Z  INFO Window 22: 206 packets, drift=0.996 | XDP total: 211498, dropped: 0
+2026-02-10T05:01:40.495022Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:01:42.562895Z  INFO Window 23: 206 packets, drift=0.996 | XDP total: 232177, dropped: 0
+2026-02-10T05:01:42.562907Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:01:44.608197Z  INFO Window 24: 394 packets, drift=0.997 | XDP total: 271573, dropped: 0
+2026-02-10T05:01:44.608206Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:01:46.679641Z  INFO Window 25: 517 packets, drift=0.998 | XDP total: 323358, dropped: 0
+2026-02-10T05:01:46.679652Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:01:48.725426Z  INFO Window 26: 514 packets, drift=0.998 | XDP total: 374504, dropped: 0
+2026-02-10T05:01:48.725436Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:01:50.790624Z  INFO Window 27: 515 packets, drift=0.998 | XDP total: 426133, dropped: 0
+2026-02-10T05:01:50.790645Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:01:52.852614Z  INFO Window 28: 517 packets, drift=0.998 | XDP total: 477683, dropped: 0
+2026-02-10T05:01:52.852634Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:01:54.892624Z  INFO Window 29: 508 packets, drift=0.997 | XDP total: 528683, dropped: 0
+2026-02-10T05:01:54.892635Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:01:56.944053Z  INFO Window 30: 513 packets, drift=0.997 | XDP total: 579969, dropped: 0
+2026-02-10T05:01:56.944065Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:01:59.000083Z  INFO Window 31: 678 packets, drift=0.998 | XDP total: 647734, dropped: 0
+2026-02-10T05:01:59.000093Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:01.052650Z  INFO Window 32: 1028 packets, drift=0.998 | XDP total: 750363, dropped: 0
+2026-02-10T05:02:01.052679Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:03.117117Z  INFO Window 33: 1032 packets, drift=0.998 | XDP total: 853586, dropped: 0
+2026-02-10T05:02:03.117126Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:05.178894Z  INFO Window 34: 1029 packets, drift=0.998 | XDP total: 956674, dropped: 0
+2026-02-10T05:02:05.178911Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:07.235317Z  INFO Window 35: 1028 packets, drift=0.998 | XDP total: 1059495, dropped: 0
+2026-02-10T05:02:07.235328Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:09.299126Z  INFO Window 36: 1034 packets, drift=0.998 | XDP total: 1162673, dropped: 0
+2026-02-10T05:02:09.299140Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:11.361182Z  INFO Window 37: 1031 packets, drift=0.998 | XDP total: 1265790, dropped: 0
+2026-02-10T05:02:11.361192Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:13.431256Z  INFO Window 38: 1055 packets, drift=0.998 | XDP total: 1371433, dropped: 0
+2026-02-10T05:02:13.431266Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:15.507071Z  INFO Window 39: 1559 packets, drift=0.998 | XDP total: 1527119, dropped: 0
+2026-02-10T05:02:15.507085Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:17.573124Z  INFO Window 40: 1548 packets, drift=0.998 | XDP total: 1682071, dropped: 0
+2026-02-10T05:02:17.573138Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:19.636136Z  INFO Window 41: 1548 packets, drift=0.998 | XDP total: 1836799, dropped: 0
+2026-02-10T05:02:19.636147Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:21.691098Z  INFO Window 42: 1540 packets, drift=0.998 | XDP total: 1990919, dropped: 0
+2026-02-10T05:02:21.691108Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:23.768449Z  INFO Window 43: 1559 packets, drift=0.998 | XDP total: 2146723, dropped: 0
+2026-02-10T05:02:23.768462Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:25.853506Z  INFO Window 44: 1563 packets, drift=0.998 | XDP total: 2303102, dropped: 0
+2026-02-10T05:02:25.853520Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:27.921649Z  INFO Window 45: 1550 packets, drift=0.998 | XDP total: 2458214, dropped: 0
+2026-02-10T05:02:27.921667Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:29.982017Z  INFO Window 46: 1956 packets, drift=0.998 | XDP total: 2653647, dropped: 0
+2026-02-10T05:02:29.982031Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:32.039940Z  INFO Window 47: 2056 packets, drift=0.998 | XDP total: 2859438, dropped: 0
+2026-02-10T05:02:32.039952Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:34.108911Z  INFO Window 48: 2070 packets, drift=0.999 | XDP total: 3066335, dropped: 0
+2026-02-10T05:02:34.108923Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:36.174177Z  INFO Window 49: 2068 packets, drift=0.998 | XDP total: 3272859, dropped: 0
+2026-02-10T05:02:36.174190Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:38.230578Z  INFO Window 50: 2056 packets, drift=0.998 | XDP total: 3478501, dropped: 0
+2026-02-10T05:02:38.230591Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:40.304988Z  INFO Window 51: 2073 packets, drift=0.999 | XDP total: 3685945, dropped: 0
+2026-02-10T05:02:40.304999Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:42.356543Z  INFO Window 52: 2051 packets, drift=0.998 | XDP total: 3891097, dropped: 0
+2026-02-10T05:02:42.356554Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:44.408482Z  INFO Window 53: 2582 packets, drift=0.999 | XDP total: 4149427, dropped: 0
+2026-02-10T05:02:44.408494Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:46.461915Z  INFO Window 54: 3081 packets, drift=0.999 | XDP total: 4457445, dropped: 0
+2026-02-10T05:02:46.461928Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:48.531500Z  INFO Window 55: 3103 packets, drift=0.999 | XDP total: 4767881, dropped: 0
+2026-02-10T05:02:48.531511Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:50.603375Z  INFO Window 56: 3109 packets, drift=0.999 | XDP total: 5078662, dropped: 0
+2026-02-10T05:02:50.603391Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:52.649019Z  INFO Window 57: 3069 packets, drift=0.999 | XDP total: 5385509, dropped: 0
+2026-02-10T05:02:52.649031Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:54.701497Z  INFO Window 58: 3078 packets, drift=0.999 | XDP total: 5693377, dropped: 0
+2026-02-10T05:02:54.701516Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:56.772704Z  INFO Window 59: 3107 packets, drift=0.999 | XDP total: 6004065, dropped: 0
+2026-02-10T05:02:56.772716Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:02:58.822829Z  INFO Window 60: 3312 packets, drift=0.999 | XDP total: 6335428, dropped: 0
+2026-02-10T05:02:58.822840Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:03:00.884480Z  INFO Window 61: 4123 packets, drift=0.999 | XDP total: 6747754, dropped: 0
+2026-02-10T05:03:00.884491Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:03:02.953402Z  INFO Window 62: 4137 packets, drift=0.999 | XDP total: 7161535, dropped: 0
+2026-02-10T05:03:02.953419Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:03:05.018229Z  INFO Window 63: 4132 packets, drift=0.999 | XDP total: 7574509, dropped: 0
+2026-02-10T05:03:05.018237Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:03:07.066576Z  INFO Window 64: 4098 packets, drift=0.999 | XDP total: 7984173, dropped: 0
+2026-02-10T05:03:07.066584Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:03:09.144052Z  INFO Window 65: 4151 packets, drift=0.999 | XDP total: 8399667, dropped: 0
+2026-02-10T05:03:09.144067Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:03:11.206716Z  INFO Window 66: 4126 packets, drift=0.999 | XDP total: 8812203, dropped: 0
+2026-02-10T05:03:11.206727Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:03:13.253288Z  INFO Window 67: 4092 packets, drift=0.999 | XDP total: 9221518, dropped: 0
+2026-02-10T05:03:13.253301Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:03:15.285602Z  INFO Window 68: 22219 packets, drift=0.999 | XDP total: 11446391, dropped: 0
+2026-02-10T05:03:15.285608Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:03:17.338279Z  INFO Window 69: 21773 packets, drift=0.999 | XDP total: 13629566, dropped: 0
+2026-02-10T05:03:17.338289Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:03:19.411423Z  INFO Window 70: 24064 packets, drift=0.999 | XDP total: 16036178, dropped: 0
+2026-02-10T05:03:19.411437Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:03:21.437309Z  INFO Window 71: 24004 packets, drift=0.999 | XDP total: 18431978, dropped: 0
+2026-02-10T05:03:21.437317Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:03:23.480933Z  INFO Window 72: 23979 packets, drift=0.999 | XDP total: 20836028, dropped: 0
+2026-02-10T05:03:23.480945Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:03:25.511356Z  INFO Window 73: 24008 packets, drift=0.999 | XDP total: 23232253, dropped: 0
+2026-02-10T05:03:25.511364Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:03:27.545207Z  INFO Window 74: 23829 packets, drift=0.999 | XDP total: 25614839, dropped: 0
+2026-02-10T05:03:27.545217Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:03:29.618073Z  INFO Window 75: 8994 packets, drift=0.999 | XDP total: 26508074, dropped: 0
+2026-02-10T05:03:29.618087Z  INFO     Status: NORMAL (drift above threshold)
+2026-02-10T05:03:31.676590Z  INFO Window 76: 0 packets (below minimum 50, skipping analysis)
+2026-02-10T05:03:33.740899Z  INFO Window 77: 0 packets (below minimum 50, skipping analysis)
+2026-02-10T05:03:35.798747Z  INFO Window 78: 0 packets (below minimum 50, skipping analysis)
+2026-02-10T05:03:37.868857Z  INFO Window 79: 0 packets (below minimum 50, skipping analysis)
+2026-02-10T05:03:39.938184Z  INFO Window 80: 0 packets (below minimum 50, skipping analysis)
+2026-02-10T05:03:42.003570Z  INFO Window 81: 0 packets (below minimum 50, skipping analysis)
+2026-02-10T05:03:44.073111Z  INFO Window 82: 0 packets (below minimum 50, skipping analysis)
+2026-02-10T05:03:46.140212Z  INFO Window 83: 0 packets (below minimum 50, skipping analysis)
+2026-02-10T05:03:48.206372Z  INFO Window 84: 0 packets (below minimum 50, skipping analysis)
+2026-02-10T05:03:50.268524Z  INFO Window 85: 0 packets (below minimum 50, skipping analysis)
+2026-02-10T05:03:52.334163Z  INFO Window 86: 0 packets (below minimum 50, skipping analysis)
+2026-02-10T05:03:54.398317Z  INFO Window 87: 0 packets (below minimum 50, skipping analysis)
