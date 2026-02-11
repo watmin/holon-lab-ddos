@@ -9,3 +9,6 @@ Cargo.lock
 
 # Keep the compiled eBPF binary (needed for userspace to compile)
 !veth-lab/filter-ebpf/target/bpfel-unknown-none/release/veth-filter
+
+# Ignore log files
+logs/*.log
