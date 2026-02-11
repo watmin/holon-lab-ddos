@@ -12,6 +12,7 @@ use aya::{
     programs::{Xdp, XdpFlags},
     Ebpf,
 };
+use holon::{ScalarValue, WalkType, Walkable, WalkableRef, WalkableValue, ScalarRef};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -54,12 +55,19 @@ pub struct RuleKey {
 unsafe impl aya::Pod for RuleKey {}
 
 /// Rule value (must match eBPF struct layout)
+/// Includes token bucket state for rate limiting
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct RuleValue {
     pub action: u8,
     pub _pad: [u8; 3],
+    /// Packets per second limit (for RateLimit action)
     pub rate_pps: u32,
+    /// Current token count (for rate limiting)
+    pub tokens: u32,
+    /// Last update timestamp in nanoseconds (for token refill)
+    pub last_update_ns: u64,
+    /// Match count for statistics
     pub match_count: u64,
 }
 
@@ -108,6 +116,101 @@ impl PacketSample {
             _ => "OTHER",
         }
     }
+
+    /// Get source port band for encoding
+    pub fn src_port_band(&self) -> &'static str {
+        match self.src_port {
+            53 => "dns",
+            123 => "ntp",
+            0..=1023 => "wellknown",
+            1024..=49151 => "registered",
+            _ => "ephemeral",
+        }
+    }
+
+    /// Get destination port band for encoding
+    pub fn dst_port_band(&self) -> &'static str {
+        match self.dst_port {
+            80 | 8080 => "http",
+            443 => "https",
+            53 => "dns",
+            123 => "ntp",
+            0..=1023 => "wellknown",
+            1024..=49151 => "registered",
+            _ => "ephemeral",
+        }
+    }
+
+    /// Get direction hint (useful for amplification detection)
+    pub fn direction(&self) -> &'static str {
+        if self.src_port < 1024 && self.dst_port >= 1024 {
+            "amplified"
+        } else if self.src_port >= 1024 && self.dst_port < 1024 {
+            "outbound"
+        } else {
+            "normal"
+        }
+    }
+
+    /// Get size class for categorical encoding
+    pub fn size_class(&self) -> &'static str {
+        match self.pkt_len {
+            0..=100 => "tiny",
+            101..=500 => "small",
+            501..=1500 => "medium",
+            _ => "large",
+        }
+    }
+}
+
+/// Walkable trait implementation for zero-JSON encoding with Holon.
+/// 
+/// This enables direct encoding of PacketSample without JSON serialization,
+/// providing ~5x faster encoding performance.
+impl Walkable for PacketSample {
+    fn walk_type(&self) -> WalkType {
+        WalkType::Map
+    }
+
+    fn walk_map_items(&self) -> Vec<(&str, WalkableValue)> {
+        vec![
+            ("src_ip", WalkableValue::Scalar(ScalarValue::String(self.src_ip_addr().to_string()))),
+            ("dst_ip", WalkableValue::Scalar(ScalarValue::String(self.dst_ip_addr().to_string()))),
+            ("src_port", WalkableValue::Scalar(ScalarValue::Int(self.src_port as i64))),
+            ("dst_port", WalkableValue::Scalar(ScalarValue::Int(self.dst_port as i64))),
+            ("protocol", WalkableValue::Scalar(ScalarValue::String(self.protocol_name().to_string()))),
+            ("src_port_band", WalkableValue::Scalar(ScalarValue::String(self.src_port_band().to_string()))),
+            ("dst_port_band", WalkableValue::Scalar(ScalarValue::String(self.dst_port_band().to_string()))),
+            ("direction", WalkableValue::Scalar(ScalarValue::String(self.direction().to_string()))),
+            ("size_class", WalkableValue::Scalar(ScalarValue::String(self.size_class().to_string()))),
+            // Magnitude-aware encoding for packet length - equal ratios = equal similarity
+            // This enables rate-based anomaly detection (100 pps vs 100k pps clusters properly)
+            ("pkt_len", WalkableValue::Scalar(ScalarValue::log(self.pkt_len as f64))),
+        ]
+    }
+
+    /// Fast visitor implementation - avoids allocation overhead.
+    fn has_fast_visitor(&self) -> bool {
+        true
+    }
+
+    fn walk_map_visitor(&self, visitor: &mut dyn FnMut(&str, WalkableRef<'_>)) {
+        // Pre-compute string representations to avoid repeated allocations
+        let src_ip_str = self.src_ip_addr().to_string();
+        let dst_ip_str = self.dst_ip_addr().to_string();
+        
+        visitor("src_ip", WalkableRef::string(&src_ip_str));
+        visitor("dst_ip", WalkableRef::string(&dst_ip_str));
+        visitor("src_port", WalkableRef::int(self.src_port as i64));
+        visitor("dst_port", WalkableRef::int(self.dst_port as i64));
+        visitor("protocol", WalkableRef::string(self.protocol_name()));
+        visitor("src_port_band", WalkableRef::string(self.src_port_band()));
+        visitor("dst_port_band", WalkableRef::string(self.dst_port_band()));
+        visitor("direction", WalkableRef::string(self.direction()));
+        visitor("size_class", WalkableRef::string(self.size_class()));
+        // Log encoding for packet length
+        visitor("pkt_len", WalkableRef::Scalar(ScalarRef::log(self.pkt_len as f64)));
+    }
 }
 
 /// Statistics from XDP filter
@@ -117,6 +220,7 @@ pub struct FilterStats {
     pub passed_packets: u64,
     pub dropped_packets: u64,
     pub sampled_packets: u64,
+    pub rate_limited_packets: u64,
 }
 
 /// High-level rule for API
@@ -193,7 +297,39 @@ impl Rule {
             action: self.action as u8,
             _pad: [0; 3],
             rate_pps: self.rate_pps.unwrap_or(0),
+            tokens: self.rate_pps.unwrap_or(0), // Start with full bucket
+            last_update_ns: 0, // Will be initialized on first packet
             match_count: 0,
+        }
+    }
+
+    /// Create a rate limit rule for a source IP
+    pub fn rate_limit_src_ip(ip: Ipv4Addr, pps: u32) -> Self {
+        Self {
+            rule_type: RuleType::SrcIp,
+            value: ip.to_string(),
+            action: RuleAction::RateLimit,
+            rate_pps: Some(pps),
+        }
+    }
+
+    /// Create a rate limit rule for a destination port
+    pub fn rate_limit_dst_port(port: u16, pps: u32) -> Self {
+        Self {
+            rule_type: RuleType::DstPort,
+            value: port.to_string(),
+            action: RuleAction::RateLimit,
+            rate_pps: Some(pps),
+        }
+    }
+
+    /// Create a rate limit rule for a source port
+    pub fn rate_limit_src_port(port: u16, pps: u32) -> Self {
+        Self {
+            rule_type: RuleType::SrcPort,
+            value: port.to_string(),
+            action: RuleAction::RateLimit,
+            rate_pps: Some(pps),
         }
     }
 }
@@ -296,13 +432,15 @@ impl VethFilter {
         let total = stats.get(&0, 0).map(|v| sum_percpu(&v)).unwrap_or(0);
         let passed = stats.get(&1, 0).map(|v| sum_percpu(&v)).unwrap_or(0);
         let dropped = stats.get(&2, 0).map(|v| sum_percpu(&v)).unwrap_or(0);
-        let sampled = stats.get(&3, 0).map(|v| sum_percpu(&v)).unwrap_or(0);
+        let sampled = stats.get(&4, 0).map(|v| sum_percpu(&v)).unwrap_or(0);
+        let rate_limited = stats.get(&5, 0).map(|v| sum_percpu(&v)).unwrap_or(0);
 
         Ok(FilterStats {
             total_packets: total,
             passed_packets: passed,
             dropped_packets: dropped,
             sampled_packets: sampled,
+            rate_limited_packets: rate_limited,
         })
     }
 

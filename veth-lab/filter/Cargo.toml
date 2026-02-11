@@ -17,6 +17,9 @@ serde_json = { workspace = true }
 # For ring buffer polling
 bytes = "1"
 
+# Holon for Walkable trait implementation
+holon = { path = "../../../holon-rs" }
+
 [[bin]]
 name = "veth-loader"
 path = "src/bin/loader.rs"

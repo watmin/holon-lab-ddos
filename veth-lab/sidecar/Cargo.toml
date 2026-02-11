@@ -18,7 +18,7 @@ aya = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
