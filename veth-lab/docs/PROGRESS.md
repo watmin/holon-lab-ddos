@@ -2,9 +2,9 @@
 
 **Status:** Proof-of-Concept Complete  
 **Date:** February 2026  
-**Latest Update:** February 9, 2026  
-**Result:** 1.3M PPS attack handled with 99.5% drop rate, sub-100ms detection  
-**Generator Accuracy:** 100% rate limiting accuracy from 1k-200k PPS
+**Latest Update:** February 11, 2026  
+**Result:** Vector-derived XDP rate limiting with zero hardcoded values  
+**Key Achievement:** Rate limits calculated purely from accumulator magnitude ratios
 
 ## Overview
 
@@ -159,6 +159,76 @@ fn encode_packet(holon: &Holon, sample: &PacketSample) -> Vec<f64> {
 
 ## Results
 
+### Vector-Derived Rate Limiting (February 11, 2026)
+
+A major breakthrough: **rate limiting where the allowed PPS is derived purely from vector operations**, with zero hardcoded thresholds.
+
+#### Key Innovations
+
+1. **Walkable Trait Integration**: `PacketSample` implements holon-rs `Walkable` trait for zero-serialization encoding
+2. **Magnitude-Aware Encoding**: Packet sizes use `$log` (logarithmic) encoding where ratios matter
+3. **Extended Primitives**: Full integration of Batch 014 primitives:
+   - `similarity_profile()` - Per-dimension agreement/disagreement analysis
+   - `segment()` - Phase change detection in traffic patterns
+   - `invert()` - Pattern attribution to codebook entries
+   - `analogy()` - Zero-shot attack variant detection
+4. **Token Bucket in eBPF**: Rate limiting action (not just DROP) with 64-bit safe arithmetic
+5. **Baseline Concentration Tracking**: Avoids blocking expected patterns (e.g., dst_port=8888)
+6. **Magnitude-Based Rate Derivation**: From Batch 013 experiments
+
+#### The Rate Derivation Algorithm
+
+```
+rate_factor = 1 / magnitude_ratio
+magnitude_ratio = ||recent_window_accumulator|| / ||baseline_per_window_accumulator||
+
+If attack has 25x traffic volume → magnitude_ratio ≈ 25 → rate_factor ≈ 0.04
+allowed_pps = estimated_current_pps × rate_factor ≈ baseline_pps
+```
+
+This means:
+- **No hardcoded "normal" rate** - derived from baseline vector magnitude
+- **No hardcoded "attack" threshold** - derived from magnitude ratio
+- **Automatic scaling** - works regardless of actual traffic volume
+
+#### Test Results
+
+| Metric | Value |
+|--------|-------|
+| **Baseline PPS** | ~2000 (from scenario) |
+| **Attack PPS** | ~50,000 |
+| **Derived Rate Limit** | 2042 pps (vector-derived!) |
+| **Total Packets** | 1.6M |
+| **Dropped (rate limited)** | 1.4M (87%) |
+| **Normal Traffic Blocked** | ZERO |
+
+#### Detection Output
+
+```
+Baseline magnitude: total=26770.29, per_window=2059.25 (13 windows)
+Baseline concentrated values: {"dst_port:8888", "protocol:UDP", ...}
+
+Window 17: 420 packets, drift=0.736, anom_ratio=4.7%
+>>> ANOMALY DETECTED
+    Concentrated: src_ip=10.0.0.100 (93.8%)
+    ADDED RATE_LIMIT RULE: SrcIp=10.0.0.100 (rate: Some(2042))
+    Concentrated: dst_port=9999 (93.8%)
+    ADDED RATE_LIMIT RULE: DstPort=9999 (rate: Some(2042))
+
+Window 18: 1028 packets | XDP total: 202412, dropped: 96932
+Window 25: 43 packets, drift=0.962 | Status: NORMAL (attack ended)
+```
+
+#### Key Findings
+
+1. **Zero Hardcoded Values**: Rate limit derived entirely from vector magnitude comparison
+2. **Baseline Preserved**: Normal traffic (dst_port=8888) correctly identified as "expected concentration"
+3. **Token Bucket Works**: XDP rate limiting allows baseline-equivalent traffic through
+4. **Phase Detection**: `segment()` correctly identified attack phase transitions
+5. **Calm Periods Clean**: Dropped counter stays flat during normal traffic
+
+---
+
 ### Stress Test: 1.3M PPS (February 9, 2026)
 
 An unintentional stress test occurred when a rate-limiting bug caused the generator to run at maximum speed (~1.3M PPS) instead of the intended 50K PPS. The system handled it flawlessly.
@@ -273,8 +343,8 @@ Packets passed:         123 packets (only before rules)
 ### Limitations of Current Implementation
 
 1. **Single Field Rules**: Only generates rules for individual fields, not combinations
-2. **No Rate Limiting**: Only DROP action, no graduated response
-3. **Manual Thresholds**: Drift and concentration thresholds are static
+2. ~~**No Rate Limiting**: Only DROP action, no graduated response~~ ✓ FIXED Feb 11
+3. **Manual Thresholds**: Drift and concentration thresholds are static (though rate limits are vector-derived)
 4. **Rule TTL Not CLI-configurable**: Currently hardcoded at 5 minutes
 
 ## Scenario Files
@@ -306,20 +376,21 @@ Available scenarios in `veth-lab/scenarios/`:
 
 | Component | Lines of Rust |
 |-----------|--------------|
-| filter-ebpf | ~350 |
-| filter lib | ~500 |
+| filter-ebpf | ~530 |
+| filter lib | ~640 |
 | generator | ~620 |
-| sidecar | ~660 |
-| **Total** | ~2,130 |
+| sidecar | ~900 |
+| **Total** | ~2,690 |
 
 ## Future Work
 
 ### Short Term
-- [ ] Add rate limiting rules (not just DROP)
+- [x] ~~Add rate limiting rules (not just DROP)~~ ✓ Token bucket in XDP + vector-derived rates
 - [x] ~~Implement rule expiry/cleanup~~ ✓ TTL-based expiration with refresh
 - [x] ~~Add baseline training period~~ ✓ Configurable warmup windows/packets + baseline freezing
 - [ ] Support combination rules (e.g., src_ip AND dst_port)
 - [ ] Make rule TTL configurable via CLI
+- [ ] Expose extended primitives via CLI flags
 
 ### Medium Term
 - [ ] Integrate with real network interfaces (not just veth)
@@ -383,11 +454,12 @@ sudo ip netns exec veth-lab-gen ./target/release/veth-generator \
 |--------|---------|-------------|
 | `--interface` | required | Network interface to attach XDP |
 | `--enforce` | false | Actually drop packets (vs dry-run) |
+| `--rate-limit` | false | Use rate limiting instead of DROP (vector-derived rates) |
 | `--window` | 2 | Detection window in seconds |
 | `--warmup-windows` | 10 | Windows before detection activates |
 | `--warmup-packets` | 1000 | Packets before detection activates |
 | `--sample-rate` | 100 | Sample 1 in N packets |
-| `--drift` | 0.7 | Drift threshold for anomaly |
+| `--drift` | 0.85 | Drift threshold for anomaly |
 | `--concentration` | 0.5 | Field concentration threshold |
 | `--log-dir` | logs | Directory for log files |
 
