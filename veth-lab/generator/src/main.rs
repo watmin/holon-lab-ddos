@@ -125,10 +125,12 @@ struct Phase {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 enum PhaseType {
     Normal,
     Attack,
+    /// TCP SYN flood: TCP SYN packets with distinctive p0f fingerprint
+    SynFlood,
 }
 
 #[tokio::main]
@@ -282,7 +284,7 @@ fn run_scenario_file(
         // Use per-phase PPS if specified, otherwise use global baseline/attack
         let pps = phase.pps.unwrap_or(match phase.phase_type {
             PhaseType::Normal => config.baseline_pps,
-            PhaseType::Attack => config.attack_pps,
+            PhaseType::Attack | PhaseType::SynFlood => config.attack_pps,
         });
         let end_time = total_secs + phase.duration_secs;
         info!(
@@ -316,9 +318,9 @@ fn run_scenario_file(
         // Use per-phase PPS if specified, otherwise use global baseline/attack
         let pps = phase.pps.unwrap_or(match phase.phase_type {
             PhaseType::Normal => config.baseline_pps,
-            PhaseType::Attack => config.attack_pps,
+            PhaseType::Attack | PhaseType::SynFlood => config.attack_pps,
         });
-        let is_attack = phase.phase_type == PhaseType::Attack;
+        let is_attack = phase.phase_type != PhaseType::Normal;
         
         info!(
             ">>> [{:>3}s] PHASE {}: {} ({:?}, {} pps, {}s)",
@@ -335,27 +337,32 @@ fn run_scenario_file(
         let phase_start_packets = packets_sent.load(Ordering::Relaxed);
         
         while running.load(Ordering::Relaxed) && phase_start.elapsed() < phase_duration {
-            // Generate packet
+            // Generate packet based on phase type
             let (src_ip, dst_port) = if is_attack {
                 (attack_src, args.attack_port)
             } else {
-                // Normal traffic: random source in 192.168.x.x range
                 let src = Ipv4Addr::new(192, 168, rng.gen_range(1..255), rng.gen_range(1..255));
                 (src, args.normal_port)
             };
 
             let src_port: u16 = rng.gen_range(10000..60000);
-            
-            // Build and send UDP packet
-            let packet = craft_udp_packet(
-                src_mac,
-                dst_mac,
-                src_ip,
-                target_ip,
-                src_port,
-                dst_port,
-                b"VETH-LAB-TEST",
-            );
+
+            let packet = match phase.phase_type {
+                PhaseType::Normal => craft_udp_packet(
+                    src_mac, dst_mac, src_ip, target_ip,
+                    src_port, dst_port, b"VETH-LAB-TEST", 64, true,
+                ),
+                PhaseType::Attack => craft_udp_packet(
+                    // UDP attack: TTL=255, DF=clear (simulates amplification reflector)
+                    src_mac, dst_mac, src_ip, target_ip,
+                    src_port, dst_port, b"VETH-LAB-TEST", 255, false,
+                ),
+                PhaseType::SynFlood => craft_tcp_syn_packet(
+                    // TCP SYN flood: flags=0x02, window=65535, TTL=128 (Windows botnet)
+                    src_mac, dst_mac, src_ip, target_ip,
+                    src_port, dst_port, 128, 65535,
+                ),
+            };
 
             match send_packet(socket, &packet) {
                 Ok(n) => {
@@ -578,7 +585,7 @@ fn run_pattern_mode(
 
         let src_port: u16 = rng.gen_range(10000..60000);
         
-        // Build and send UDP packet
+        // Build and send UDP packet (legacy mode: normal fingerprint for all)
         let packet = craft_udp_packet(
             src_mac,
             dst_mac,
@@ -587,6 +594,7 @@ fn run_pattern_mode(
             src_port,
             dst_port,
             b"VETH-LAB-TEST",
+            64, true,
         );
 
         match send_packet(socket, &packet) {
@@ -735,6 +743,8 @@ fn craft_udp_packet(
     src_port: u16,
     dst_port: u16,
     payload: &[u8],
+    ttl: u8,
+    df: bool,
 ) -> Vec<u8> {
     let udp_len = 8 + payload.len();
     let ip_len = 20 + udp_len;
@@ -753,9 +763,9 @@ fn craft_udp_packet(
     packet[ip_offset + 1] = 0x00;  // DSCP + ECN
     packet[ip_offset + 2..ip_offset + 4].copy_from_slice(&(ip_len as u16).to_be_bytes());
     packet[ip_offset + 4..ip_offset + 6].copy_from_slice(&rand::random::<u16>().to_be_bytes());  // ID
-    packet[ip_offset + 6] = 0x40;  // Flags: DF
+    packet[ip_offset + 6] = if df { 0x40 } else { 0x00 };  // Flags: DF or clear
     packet[ip_offset + 7] = 0x00;  // Fragment offset
-    packet[ip_offset + 8] = 64;  // TTL
+    packet[ip_offset + 8] = ttl;
     packet[ip_offset + 9] = 17;  // Protocol: UDP
     // Checksum at 10-11
     packet[ip_offset + 12..ip_offset + 16].copy_from_slice(&src_ip.octets());
@@ -775,6 +785,61 @@ fn craft_udp_packet(
     // Payload
     packet[udp_offset + 8..].copy_from_slice(payload);
     
+    packet
+}
+
+fn craft_tcp_syn_packet(
+    src_mac: &[u8; 6],
+    dst_mac: &[u8; 6],
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    ttl: u8,
+    window: u16,
+) -> Vec<u8> {
+    let tcp_hdr_len = 20;
+    let ip_len = 20 + tcp_hdr_len;
+    let total_len = 14 + ip_len;
+
+    let mut packet = vec![0u8; total_len];
+
+    // Ethernet header
+    packet[0..6].copy_from_slice(dst_mac);
+    packet[6..12].copy_from_slice(src_mac);
+    packet[12..14].copy_from_slice(&(0x0800u16).to_be_bytes());
+
+    // IP header
+    let ip_offset = 14;
+    packet[ip_offset] = 0x45;  // Version + IHL
+    packet[ip_offset + 1] = 0x00;
+    packet[ip_offset + 2..ip_offset + 4].copy_from_slice(&(ip_len as u16).to_be_bytes());
+    packet[ip_offset + 4..ip_offset + 6].copy_from_slice(&rand::random::<u16>().to_be_bytes());
+    packet[ip_offset + 6] = 0x40;  // DF set (typical for SYN)
+    packet[ip_offset + 7] = 0x00;
+    packet[ip_offset + 8] = ttl;
+    packet[ip_offset + 9] = 6;  // Protocol: TCP
+    packet[ip_offset + 12..ip_offset + 16].copy_from_slice(&src_ip.octets());
+    packet[ip_offset + 16..ip_offset + 20].copy_from_slice(&dst_ip.octets());
+
+    let ip_csum = checksum(&packet[ip_offset..ip_offset + 20]);
+    packet[ip_offset + 10..ip_offset + 12].copy_from_slice(&ip_csum.to_be_bytes());
+
+    // TCP header (20 bytes, no options)
+    let tcp_offset = 34;
+    packet[tcp_offset..tcp_offset + 2].copy_from_slice(&src_port.to_be_bytes());
+    packet[tcp_offset + 2..tcp_offset + 4].copy_from_slice(&dst_port.to_be_bytes());
+    // Seq number (random)
+    packet[tcp_offset + 4..tcp_offset + 8].copy_from_slice(&rand::random::<u32>().to_be_bytes());
+    // Ack number = 0 (SYN, no ACK)
+    // Data offset = 5 (20 bytes / 4), flags = SYN (0x02)
+    packet[tcp_offset + 12] = 0x50;  // Data offset: 5 << 4
+    packet[tcp_offset + 13] = 0x02;  // Flags: SYN
+    // Window size
+    packet[tcp_offset + 14..tcp_offset + 16].copy_from_slice(&window.to_be_bytes());
+    // TCP checksum at 16-17 (leave 0 — XDP doesn't validate TCP checksums for our test)
+    // Urgent pointer = 0
+
     packet
 }
 

@@ -416,17 +416,26 @@ impl FieldTracker {
         }
 
         // Track individual field values for concentration analysis
-        let fields = [
+        // All values are raw numbers — same as wireshark/eBPF sees
+        let mut fields = vec![
             ("src_ip", sample.src_ip_addr().to_string()),
             ("dst_ip", sample.dst_ip_addr().to_string()),
             ("src_port", sample.src_port.to_string()),
             ("dst_port", sample.dst_port.to_string()),
-            ("protocol", sample.protocol_name().to_string()),
+            ("protocol", sample.protocol.to_string()),
             ("src_port_band", sample.src_port_band().to_string()),
             ("dst_port_band", sample.dst_port_band().to_string()),
             ("direction", sample.direction().to_string()),
             ("size_class", sample.size_class().to_string()),
+            // p0f-level fields (raw numeric)
+            ("ttl", sample.ttl.to_string()),
+            ("df_bit", sample.df_bit.to_string()),
         ];
+        // TCP-only p0f fields
+        if sample.protocol == 6 {
+            fields.push(("tcp_flags", sample.tcp_flags.to_string()));
+            fields.push(("tcp_window", sample.tcp_window.to_string()));
+        }
 
         for (field, value) in fields {
             let key = format!("{}:{}", field, value);
@@ -728,6 +737,15 @@ impl Detection {
                 .map(|port| (FieldDim::L4Word0, port as u32)),
             "protocol" => self.value.parse::<u8>().ok()
                 .map(|proto| (FieldDim::Proto, proto as u32)),
+            // p0f-level fields
+            "tcp_flags" => self.value.parse::<u8>().ok()
+                .map(|flags| (FieldDim::TcpFlags, flags as u32)),
+            "ttl" => self.value.parse::<u8>().ok()
+                .map(|ttl| (FieldDim::Ttl, ttl as u32)),
+            "df_bit" => self.value.parse::<u8>().ok()
+                .map(|df| (FieldDim::DfBit, df as u32)),
+            "tcp_window" => self.value.parse::<u16>().ok()
+                .map(|win| (FieldDim::TcpWindow, win as u32)),
             _ => None,
         }
     }

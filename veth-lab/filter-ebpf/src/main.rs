@@ -263,7 +263,10 @@ pub struct PacketSample {
     pub protocol: u8,
     pub matched_rule: u8,
     pub action_taken: u8,
-    pub _pad: u8,
+    pub tcp_flags: u8,
+    pub ttl: u8,
+    pub df_bit: u8,
+    pub tcp_window: u16,
     pub data: [u8; SAMPLE_DATA_SIZE],
 }
 
@@ -370,9 +373,12 @@ fn try_veth_filter(ctx: XdpContext) -> Result<u32, ()> {
     let should_sample = sample_rate > 0 && (total_count % sample_rate as u64 == 0);
 
     if should_sample {
+        // Extract Phase 2 fields only for sampled packets (cheap at 1:N rate)
+        let p2 = extract_phase2(data_end, ip_hdr, ihl, protocol);
         sample_packet(
             &ctx, pkt_len, src_ip, dst_ip, src_port, dst_port,
-            protocol, matched, action, data, data_end
+            protocol, matched, action, data, data_end,
+            p2.tcp_flags, p2.ttl, p2.df_bit, p2.tcp_window,
         );
     }
 
@@ -506,12 +512,14 @@ fn sample_packet(
     ctx: &XdpContext, pkt_len: u32, src_ip: u32, dst_ip: u32,
     src_port: u16, dst_port: u16, protocol: u8,
     matched: bool, action: u8, data: usize, data_end: usize,
+    tcp_flags: u8, ttl: u8, df_bit: u8, tcp_window: u16,
 ) {
     let cap_len = if pkt_len as usize > SAMPLE_DATA_SIZE { SAMPLE_DATA_SIZE } else { pkt_len as usize };
     let mut sample = PacketSample {
         pkt_len, cap_len: cap_len as u32, src_ip, dst_ip, src_port, dst_port,
         protocol, matched_rule: if matched { 1 } else { 0 }, action_taken: action,
-        _pad: 0, data: [0u8; SAMPLE_DATA_SIZE],
+        tcp_flags, ttl, df_bit, tcp_window,
+        data: [0u8; SAMPLE_DATA_SIZE],
     };
     let src = data as *const u8;
     for i in 0..SAMPLE_DATA_SIZE {

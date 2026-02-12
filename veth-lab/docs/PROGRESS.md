@@ -111,42 +111,47 @@ The compiler skips dimensions that no rule constrains, so a typical rule touchin
 
 ### Rule Representation: S-expressions
 
-Rules are represented as s-expressions in Clara-style LHS ⇒ RHS form:
+Rules are represented as s-expressions in Clara-style LHS ⇒ RHS form. All values are raw numbers (same as wireshark), IPs in dotted notation:
 
 ```
-((and (= proto udp)
+((and (= proto 17)
       (= src-port 53))
  =>
  (rate-limit 1234))
 ```
 
-Single-constraint rules:
+A 6-constraint SYN flood rule (live output):
 
 ```
-((= src-addr 10.0.0.100)
+((and (= tcp-flags 2)
+      (= tcp-window 65535)
+      (= proto 6)
+      (= src-addr 10.0.0.100)
+      (= dst-port 9999)
+      (= ttl 128))
  =>
- (drop))
+ (rate-limit 2048))
 ```
 
 The compact one-liner form is also available:
 
 ```
-((and (= src-addr 10.0.0.100) (= dst-port 9999)) => (rate-limit 2007))
+((and (= tcp-flags 2) (= tcp-window 65535) (= proto 6) (= src-addr 10.0.0.100) (= dst-port 9999) (= ttl 128)) => (rate-limit 2048))
 ```
 
 #### Available Field Dimensions
 
-| S-expr Name | Field | Description |
-|-------------|-------|-------------|
-| `proto` | Protocol | IP protocol (`tcp`=6, `udp`=17, numeric otherwise) |
+| S-expr Name | Field | Values |
+|-------------|-------|--------|
+| `proto` | Protocol | 6=TCP, 17=UDP, 1=ICMP |
 | `src-addr` | Source IP | IPv4 dotted notation |
 | `dst-addr` | Destination IP | IPv4 dotted notation |
-| `src-port` | Source Port | L4 source port |
-| `dst-port` | Destination Port | L4 destination port |
-| `tcp-flags` | TCP Flags | Hex value (e.g., `0x02` = SYN) |
-| `ttl` | TTL | IP Time-to-Live |
-| `df-bit` | DF Bit | Don't Fragment flag (0 or 1) |
-| `tcp-window` | TCP Window | TCP window size |
+| `src-port` | Source Port | 0–65535 |
+| `dst-port` | Destination Port | 0–65535 |
+| `tcp-flags` | TCP Flags | 2=SYN, 18=SYN+ACK, 16=ACK, etc. |
+| `ttl` | TTL | 64=Linux, 128=Windows, 255=network gear |
+| `df` | DF Bit | 0=clear, 1=set |
+| `tcp-window` | TCP Window | 0–65535 |
 
 ### Tree Compilation
 
@@ -262,14 +267,13 @@ impl RuleSpec {
 
 ### 3. Traffic Generator (`generator/`)
 
-Generates test traffic using AF_PACKET raw sockets:
+Generates test traffic using AF_PACKET raw sockets with distinct p0f fingerprints per attack type:
 
-| Pattern | Description |
-|---------|-------------|
-| Normal | Random source IPs (192.168.x.x), port 5000 |
-| Attack | Fixed source IP (10.0.0.100), port 9999 |
-| Mixed | Alternates 5s attack / 5s normal |
-| Ramp | Gradually increases attack ratio 0% → 100% |
+| Phase Type | Protocol | TTL | DF | TCP Flags | Window | Description |
+|-----------|----------|-----|-----|-----------|--------|-------------|
+| `normal` | UDP (17) | 64 | 1 | — | — | Baseline: random src IPs, port 5000 |
+| `attack` | UDP (17) | **255** | **0** | — | — | UDP amplification reflector fingerprint |
+| `syn_flood` | **TCP (6)** | **128** | 1 | **2 (SYN)** | **65535** | Windows botnet SYN flood fingerprint |
 
 ### 4. Holon Sidecar (`sidecar/`)
 
@@ -293,30 +297,57 @@ Rule Expired (TTL) → Removed from active set →
 
 ## Results
 
-### Tree Rete + S-expression Output (February 12, 2026)
+### p0f-Level Field Detection (February 12, 2026)
 
-Live detection producing human-readable rules:
+The system autonomously identifies distinct attack fingerprints using p0f-level fields (TCP flags, TTL, DF bit, TCP window) and compiles rich compound rules.
 
-```
-DETECTION_EVENT: {
-  "action_taken": [{
-    "rule_type": "tree",
-    "value": "((and (= src-addr 10.0.0.100) (= dst-port 9999)) => (rate-limit 2007))",
-    "action": "RATE_LIMIT",
-    "rate_pps": 2007
-  }]
-}
-```
+#### UDP Amplification Detection
 
-Pretty-printed in sidecar logs:
+Concentrated fields: `ttl=255` (100%), `df_bit=0` (100%), `src_ip=10.0.0.100` (100%), `dst_port=9999` (100%)
 
 ```
 RULE:
-((and (= src-addr 10.0.0.100)
-      (= dst-port 9999))
+((and (= ttl 255)
+      (= dst-port 9999)
+      (= src-addr 10.0.0.100)
+      (= df 0))
  =>
- (rate-limit 2007))
+ (rate-limit 2091))
 ```
+
+Tree: 5 nodes, 4 edges, 1 rate bucket — the reflector's TTL=255 and DF=0 fingerprint distinguishes it from normal UDP traffic (TTL=64, DF=1).
+
+#### TCP SYN Flood Detection
+
+Concentrated fields: `tcp_flags=2` (100%), `tcp_window=65535` (100%), `protocol=6` (100%), `ttl=128` (100%), `src_ip=10.0.0.100` (100%), `dst_port=9999` (100%)
+
+```
+RULE:
+((and (= tcp-flags 2)
+      (= tcp-window 65535)
+      (= proto 6)
+      (= src-addr 10.0.0.100)
+      (= dst-port 9999)
+      (= ttl 128))
+ =>
+ (rate-limit 2048))
+```
+
+Tree: 17 nodes, 14 edges, 2 rate buckets — both the UDP amplification rule and the SYN flood rule coexist in the same tree, with distinct rate-limiting buckets.
+
+#### Multi-Phase Timeline (Quick Test Scenario)
+
+```
+[  0s] warmup    — normal UDP, TTL=64, DF=1 (baseline)
+[ 30s] udp_amp   — ANOMALY: ttl=255, df_bit=0 → 4-constraint rule compiled
+[ 45s] calm1     — NORMAL (drift=0.97)
+[ 65s] syn_flood — ANOMALY: tcp_flags=2, tcp_window=65535, proto=6, ttl=128 → 6-constraint rule compiled
+[ 80s] calm2     — NORMAL (drift=0.97)
+[100s] udp_amp2  — ANOMALY: same reflector fingerprint → existing rule refreshed
+[115s] final     — NORMAL
+```
+
+Key: the system distinguished two fundamentally different attack types without any signatures or training data — purely from vector space concentration analysis.
 
 ### Vector-Derived Rate Limiting (February 11, 2026)
 
@@ -384,6 +415,7 @@ An unintentional stress test occurred when a rate-limiting bug caused the genera
 | Feb 10 | Bitmask Rete engine (eval_mode=1), 64-rule discrimination network |
 | Feb 11 | Vector-derived rate limiting, token bucket in eBPF, Walkable trait |
 | Feb 12 | **Tree Rete engine** — decision tree, blue/green flip, s-expressions |
+| Feb 12 | **p0f-level fields** — TCP flags, TTL, DF bit, TCP window in sampling, encoding, and rule compilation. Multi-attack-type detection (UDP amplification + TCP SYN flood) with 6-constraint compound rules |
 
 ## Future Work
 
@@ -394,11 +426,12 @@ An unintentional stress test occurred when a rate-limiting bug caused the genera
 - [x] Combination rules (e.g., src_ip AND dst_port) — Tree Rete handles arbitrary conjunctions
 - [x] Scalable rule engine (100k+ rules) — Tree Rete replaces 64-rule bitmask
 - [x] Zero-downtime rule updates — Blue/green atomic flip
-- [x] Human-readable rule format — S-expression (Clara-style LHS ⇒ RHS)
+- [x] Human-readable rule format — S-expression (Clara-style LHS ⇒ RHS), all-numeric values
+- [x] **p0f field integration** — TCP flags, TTL, DF bit, TCP window in PacketSample, Walkable encoding, concentration analysis, and rule compilation
+- [x] **Multi-attack-type detection** — Distinct fingerprints for UDP amplification (TTL=255, DF=0) and TCP SYN flood (flags=2, window=65535, TTL=128)
+- [x] **TCP SYN packet generation** — `craft_tcp_syn_packet` + `syn_flood` phase type in scenarios
 
 ### Short Term
-- [ ] **p0f field integration** — TCP window, TTL, DF-bit as rule dimensions for OS fingerprint anomalies
-- [ ] Richer sidecar attribution — TCP flags for SYN floods, TTL patterns for amplification
 - [ ] Make rule TTL configurable via CLI
 - [ ] Expose extended primitives via CLI flags
 

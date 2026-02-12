@@ -166,21 +166,14 @@ impl FieldDim {
         }
     }
 
-    /// Format a value as an s-expression atom (lower-case symbols where appropriate)
+    /// Format a value as an s-expression atom — raw numbers everywhere,
+    /// IPs as dotted notation (the only non-numeric field).
     pub fn sexpr_value(&self, value: u32) -> String {
         match self {
             FieldDim::SrcIp | FieldDim::DstIp => {
                 let bytes = value.to_ne_bytes();
                 format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3])
             }
-            FieldDim::Proto => match value {
-                1 => "icmp".to_string(),
-                6 => "tcp".to_string(),
-                17 => "udp".to_string(),
-                v => format!("{}", v),
-            },
-            FieldDim::TcpFlags => format!("0x{:02x}", value),
-            FieldDim::DfBit => if value == 1 { "true".to_string() } else { "false".to_string() },
             _ => format!("{}", value),
         }
     }
@@ -340,7 +333,7 @@ impl RuleSpec {
     /// Emit rule as an s-expression in Clara-style LHS => RHS form.
     ///
     /// Single constraint:  `((= src-addr 10.0.0.100) => (drop))`
-    /// Compound:           `((and (= proto udp) (= src-port 53)) => (rate-limit 1906))`
+    /// Compound:           `((and (= proto 17) (= src-port 53)) => (rate-limit 1906))`
     /// With priority != 100: appends `:priority N`
     pub fn to_sexpr(&self) -> String {
         let (lhs, rhs, prio) = self.sexpr_parts();
@@ -354,7 +347,7 @@ impl RuleSpec {
     /// Pretty-print rule as a multi-line s-expression (Clara style).
     ///
     /// ```text
-    /// ((and (= proto udp)
+    /// ((and (= proto 17)
     ///       (= src-port 53))
     ///  =>
     ///  (rate-limit 1234))
@@ -431,7 +424,10 @@ pub struct PacketSample {
     pub protocol: u8,
     pub matched_rule: u8,
     pub action_taken: u8,
-    pub _pad: u8,
+    pub tcp_flags: u8,
+    pub ttl: u8,
+    pub df_bit: u8,
+    pub tcp_window: u16,
     pub data: [u8; SAMPLE_DATA_SIZE],
 }
 
@@ -463,23 +459,80 @@ impl PacketSample {
     pub fn size_class(&self) -> &'static str {
         match self.pkt_len { 0..=100 => "tiny", 101..=500 => "small", 501..=1500 => "medium", _ => "large" }
     }
+
+    // ── p0f-level fields ──
+
+    /// Human-readable TCP flags (e.g. "SYN", "SYN|ACK", "0x00")
+    pub fn tcp_flags_name(&self) -> String {
+        if self.protocol != 6 { return "n/a".to_string(); }
+        let mut parts = Vec::new();
+        if self.tcp_flags & 0x01 != 0 { parts.push("FIN"); }
+        if self.tcp_flags & 0x02 != 0 { parts.push("SYN"); }
+        if self.tcp_flags & 0x04 != 0 { parts.push("RST"); }
+        if self.tcp_flags & 0x08 != 0 { parts.push("PSH"); }
+        if self.tcp_flags & 0x10 != 0 { parts.push("ACK"); }
+        if self.tcp_flags & 0x20 != 0 { parts.push("URG"); }
+        if parts.is_empty() {
+            format!("0x{:02x}", self.tcp_flags)
+        } else {
+            parts.join("|")
+        }
+    }
+
+    /// TTL band — p0f uses initial TTL to fingerprint OS
+    pub fn ttl_band(&self) -> &'static str {
+        match self.ttl {
+            0..=32   => "ttl_32",   // unusual
+            33..=64  => "ttl_64",   // Linux
+            65..=128 => "ttl_128",  // Windows
+            _        => "ttl_255",  // Solaris / network gear
+        }
+    }
+
+    /// DF bit as human string
+    pub fn df_name(&self) -> &'static str {
+        if self.df_bit != 0 { "df_set" } else { "df_clear" }
+    }
+
+    /// TCP window size class (p0f-style)
+    pub fn tcp_window_class(&self) -> &'static str {
+        if self.protocol != 6 { return "n/a"; }
+        match self.tcp_window {
+            0             => "zero",
+            1..=1024      => "tiny",
+            1025..=8192   => "small",
+            8193..=32768  => "medium",
+            32769..=65534 => "large",
+            65535         => "max",
+        }
+    }
 }
 
 impl Walkable for PacketSample {
     fn walk_type(&self) -> WalkType { WalkType::Map }
     fn walk_map_items(&self) -> Vec<(&str, WalkableValue)> {
-        vec![
+        let mut items = vec![
             ("src_ip", WalkableValue::Scalar(ScalarValue::String(self.src_ip_addr().to_string()))),
             ("dst_ip", WalkableValue::Scalar(ScalarValue::String(self.dst_ip_addr().to_string()))),
             ("src_port", WalkableValue::Scalar(ScalarValue::Int(self.src_port as i64))),
             ("dst_port", WalkableValue::Scalar(ScalarValue::Int(self.dst_port as i64))),
-            ("protocol", WalkableValue::Scalar(ScalarValue::String(self.protocol_name().to_string()))),
+            ("protocol", WalkableValue::Scalar(ScalarValue::Int(self.protocol as i64))),
+            // Derived semantic fields (help Holon group similar traffic)
             ("src_port_band", WalkableValue::Scalar(ScalarValue::String(self.src_port_band().to_string()))),
             ("dst_port_band", WalkableValue::Scalar(ScalarValue::String(self.dst_port_band().to_string()))),
             ("direction", WalkableValue::Scalar(ScalarValue::String(self.direction().to_string()))),
             ("size_class", WalkableValue::Scalar(ScalarValue::String(self.size_class().to_string()))),
             ("pkt_len", WalkableValue::Scalar(ScalarValue::log(self.pkt_len as f64))),
-        ]
+            // p0f-level fields (raw numeric values)
+            ("ttl", WalkableValue::Scalar(ScalarValue::Int(self.ttl as i64))),
+            ("df_bit", WalkableValue::Scalar(ScalarValue::Int(self.df_bit as i64))),
+        ];
+        // TCP-only fields
+        if self.protocol == 6 {
+            items.push(("tcp_flags", WalkableValue::Scalar(ScalarValue::Int(self.tcp_flags as i64))));
+            items.push(("tcp_window", WalkableValue::Scalar(ScalarValue::Int(self.tcp_window as i64))));
+        }
+        items
     }
     fn has_fast_visitor(&self) -> bool { true }
     fn walk_map_visitor(&self, visitor: &mut dyn FnMut(&str, WalkableRef<'_>)) {
@@ -489,12 +542,20 @@ impl Walkable for PacketSample {
         visitor("dst_ip", WalkableRef::string(&dst_ip_str));
         visitor("src_port", WalkableRef::int(self.src_port as i64));
         visitor("dst_port", WalkableRef::int(self.dst_port as i64));
-        visitor("protocol", WalkableRef::string(self.protocol_name()));
+        visitor("protocol", WalkableRef::int(self.protocol as i64));
         visitor("src_port_band", WalkableRef::string(self.src_port_band()));
         visitor("dst_port_band", WalkableRef::string(self.dst_port_band()));
         visitor("direction", WalkableRef::string(self.direction()));
         visitor("size_class", WalkableRef::string(self.size_class()));
         visitor("pkt_len", WalkableRef::Scalar(ScalarRef::log(self.pkt_len as f64)));
+        // p0f-level fields (raw numeric values)
+        visitor("ttl", WalkableRef::int(self.ttl as i64));
+        visitor("df_bit", WalkableRef::int(self.df_bit as i64));
+        // TCP-only fields
+        if self.protocol == 6 {
+            visitor("tcp_flags", WalkableRef::int(self.tcp_flags as i64));
+            visitor("tcp_window", WalkableRef::int(self.tcp_window as i64));
+        }
     }
 }
 
@@ -1060,13 +1121,13 @@ mod tests {
             None,
         );
         let desc = spec.describe();
-        assert_eq!(desc, "((and (= proto tcp) (= dst-port 80)) => (drop))");
+        assert_eq!(desc, "((and (= proto 6) (= dst-port 80)) => (drop))");
     }
 
     #[test]
     fn test_sexpr_single_constraint() {
         let spec = RuleSpec::drop_field(FieldDim::Proto, 17);
-        assert_eq!(spec.to_sexpr(), "((= proto udp) => (drop))");
+        assert_eq!(spec.to_sexpr(), "((= proto 17) => (drop))");
     }
 
     #[test]
@@ -1088,7 +1149,7 @@ mod tests {
         let spec = RuleSpec::drop_field(FieldDim::TcpFlags, 0x02).with_priority(200);
         assert_eq!(
             spec.to_sexpr(),
-            "((= tcp-flags 0x02) => (drop) :priority 200)"
+            "((= tcp-flags 2) => (drop) :priority 200)"
         );
     }
 
@@ -1117,7 +1178,7 @@ mod tests {
         );
         let pretty = spec.to_sexpr_pretty();
         assert_eq!(pretty,
-            "((and (= proto udp)\n\
+            "((and (= proto 17)\n\
              \x20     (= src-addr 10.0.0.100)\n\
              \x20     (= dst-port 9999))\n\
              \x20=>\n\
@@ -1129,7 +1190,7 @@ mod tests {
         let spec = RuleSpec::drop_field(FieldDim::Proto, 17);
         let pretty = spec.to_sexpr_pretty();
         assert_eq!(pretty,
-            "((= proto udp)\n\
+            "((= proto 17)\n\
              \x20=>\n\
              \x20(drop))");
     }
