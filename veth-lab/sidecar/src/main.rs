@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
-use veth_filter::{PacketSample, Rule, RuleAction, RuleType, VethFilter};
+use veth_filter::{
+    FieldDim, PacketSample, RuleAction, RuleSpec, RuleType, VethFilter,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "veth-sidecar")]
@@ -713,68 +715,59 @@ struct Detection {
 }
 
 impl Detection {
-    fn to_rule(&self, use_rate_limit: bool, sample_rate: u32, window_samples: usize) -> Option<Rule> {
-        // Compute allowed PPS from vector-derived rate_factor
-        // rate_factor = 1/magnitude_ratio, so if we're seeing 100x traffic, rate_factor = 0.01
-        // 
-        // Estimate current PPS from samples: current_pps ≈ window_samples * sample_rate / 2 (2-sec window)
-        // Allowed PPS = current_pps * rate_factor = baseline-equivalent PPS
-        let estimated_current_pps = (window_samples as f64 * sample_rate as f64) / 2.0;
-        let allowed_pps = (estimated_current_pps * self.rate_factor).max(100.0) as u32; // Min 100 pps
-        
+    /// Convert a detection field/value into a (FieldDim, u32) constraint.
+    fn to_constraint(&self) -> Option<(FieldDim, u32)> {
         match self.field.as_str() {
-            "src_ip" => {
-                if let Ok(ip) = self.value.parse::<Ipv4Addr>() {
-                    if use_rate_limit {
-                        // Rate limit based on vector-derived rate_factor
-                        Some(Rule {
-                            rule_type: RuleType::SrcIp,
-                            value: ip.to_string(),
-                            action: RuleAction::RateLimit,
-                            rate_pps: Some(allowed_pps),
-                        })
-                    } else {
-                        Some(Rule::drop_src_ip(ip))
-                    }
-                } else {
-                    None
-                }
-            }
-            "dst_port" => {
-                if let Ok(port) = self.value.parse::<u16>() {
-                    if use_rate_limit {
-                        Some(Rule {
-                            rule_type: RuleType::DstPort,
-                            value: port.to_string(),
-                            action: RuleAction::RateLimit,
-                            rate_pps: Some(allowed_pps),
-                        })
-                    } else {
-                        Some(Rule::drop_dst_port(port))
-                    }
-                } else {
-                    None
-                }
-            }
-            "src_port" => {
-                if let Ok(port) = self.value.parse::<u16>() {
-                    if use_rate_limit {
-                        Some(Rule {
-                            rule_type: RuleType::SrcPort,
-                            value: port.to_string(),
-                            action: RuleAction::RateLimit,
-                            rate_pps: Some(allowed_pps),
-                        })
-                    } else {
-                        Some(Rule::drop_src_port(port))
-                    }
-                } else {
-                    None
-                }
-            }
+            "src_ip" => self.value.parse::<Ipv4Addr>().ok()
+                .map(|ip| (FieldDim::SrcIp, u32::from_ne_bytes(ip.octets()))),
+            "dst_ip" => self.value.parse::<Ipv4Addr>().ok()
+                .map(|ip| (FieldDim::DstIp, u32::from_ne_bytes(ip.octets()))),
+            "dst_port" => self.value.parse::<u16>().ok()
+                .map(|port| (FieldDim::L4Word1, port as u32)),
+            "src_port" => self.value.parse::<u16>().ok()
+                .map(|port| (FieldDim::L4Word0, port as u32)),
+            "protocol" => self.value.parse::<u8>().ok()
+                .map(|proto| (FieldDim::Proto, proto as u32)),
             _ => None,
         }
     }
+
+    /// Compile a single detection into a RuleSpec
+    fn compile_rule_spec(&self, use_rate_limit: bool, sample_rate: u32, window_samples: usize) -> Option<RuleSpec> {
+        let constraint = self.to_constraint()?;
+        let estimated_current_pps = (window_samples as f64 * sample_rate as f64) / 2.0;
+        let allowed_pps = (estimated_current_pps * self.rate_factor).max(100.0) as u32;
+        let action = if use_rate_limit { RuleAction::RateLimit } else { RuleAction::Drop };
+        let rate_pps = if use_rate_limit { Some(allowed_pps) } else { None };
+        Some(RuleSpec { constraints: vec![constraint], action, rate_pps, priority: 100 })
+    }
+}
+
+/// Compile multiple concentrated detections into a compound RuleSpec.
+/// Gathers all constraints and produces a single rule.
+fn compile_compound_rule(
+    detections: &[Detection],
+    use_rate_limit: bool,
+    sample_rate: u32,
+    window_samples: usize,
+) -> Option<RuleSpec> {
+    if detections.is_empty() { return None; }
+    if detections.len() == 1 {
+        return detections[0].compile_rule_spec(use_rate_limit, sample_rate, window_samples);
+    }
+
+    let constraints: Vec<(FieldDim, u32)> = detections.iter()
+        .filter_map(|d| d.to_constraint())
+        .collect();
+    if constraints.is_empty() { return None; }
+
+    let estimated_current_pps = (window_samples as f64 * sample_rate as f64) / 2.0;
+    let rate_factor = detections[0].rate_factor;
+    let allowed_pps = (estimated_current_pps * rate_factor).max(100.0) as u32;
+    let action = if use_rate_limit { RuleAction::RateLimit } else { RuleAction::Drop };
+    let rate_pps = if use_rate_limit { Some(allowed_pps) } else { None };
+
+    Some(RuleSpec::compound(constraints, action, rate_pps))
 }
 
 #[tokio::main]
@@ -840,6 +833,10 @@ async fn main() -> Result<()> {
     filter.set_sample_rate(args.sample_rate).await?;
     filter.set_enforce_mode(args.enforce).await?;
 
+    // Enable tree Rete evaluation engine (blue/green decision tree)
+    filter.set_eval_mode(2).await?;
+    info!("Tree Rete rule engine enabled (blue/green)");
+
     // Initialize Holon
     let holon = Arc::new(Holon::new(args.dimensions));
     info!("Holon initialized with {} dimensions", args.dimensions);
@@ -895,8 +892,15 @@ async fn main() -> Result<()> {
     }
     drop(sample_tx);
 
-    // Tracked rules
-    let active_rules: Arc<RwLock<HashMap<String, Instant>>> = Arc::new(RwLock::new(HashMap::new()));
+    // Tracked rules: key -> (last_seen, spec)
+    // With tree engine, we maintain the full rule set and recompile on changes.
+    struct ActiveRule {
+        last_seen: Instant,
+        spec: RuleSpec,
+    }
+    let active_rules: Arc<RwLock<HashMap<String, ActiveRule>>> = Arc::new(RwLock::new(HashMap::new()));
+    // Whether the tree needs recompilation (set when rules change)
+    let tree_dirty: Arc<std::sync::atomic::AtomicBool> = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     info!("Starting enhanced detection loop...");
     info!("  Warmup: {} windows or {} packets", args.warmup_windows, args.warmup_packets);
@@ -946,8 +950,8 @@ async fn main() -> Result<()> {
             let mut rules = active_rules.write().await;
             let now = Instant::now();
             for key in matched_rule_keys {
-                if rules.contains_key(&key) {
-                    rules.insert(key, now);
+                if let Some(active) = rules.get_mut(&key) {
+                    active.last_seen = now;
                 }
             }
         }
@@ -1044,55 +1048,65 @@ async fn main() -> Result<()> {
 
                     let mut actions_taken = Vec::new();
 
-                    for (field, value, conc) in &concentrated {
-                        let detection = Detection {
+                    // Build detections from concentrated fields
+                    let detections: Vec<Detection> = concentrated.iter().map(|(field, value, conc)| {
+                        warn!("    Concentrated: {}={} ({:.1}%)", field, value, conc * 100.0);
+                        Detection {
                             field: field.clone(),
                             value: value.clone(),
                             concentration: *conc,
                             drift: anomaly.drift,
                             anomalous_ratio: anomaly.anomalous_ratio,
                             attributed_pattern: attribution.as_ref().map(|(p, _)| p.clone()),
-                            rate_factor,  // Vector-derived: 1/magnitude_ratio
-                        };
+                            rate_factor,
+                        }
+                    }).collect();
 
-                        warn!(
-                            "    Concentrated: {}={} ({:.1}%)",
-                            field, value, conc * 100.0
-                        );
+                    // Compile compound rule from all concentrated detections
+                    if let Some(spec) =
+                        compile_compound_rule(&detections, args.rate_limit, args.sample_rate, window_count)
+                    {
+                        let rule_key = spec.describe();
 
-                        if let Some(rule) = detection.to_rule(args.rate_limit, args.sample_rate, window_count) {
-                            let rule_key = format!("{:?}:{}", rule.rule_type, rule.value);
+                        let mut rules = active_rules.write().await;
+                        if rules.contains_key(&rule_key) {
+                            rules.get_mut(&rule_key).unwrap().last_seen = Instant::now();
+                        } else {
+                            let action_str = match spec.action {
+                                RuleAction::Drop => "DROP",
+                                RuleAction::RateLimit => "RATE_LIMIT",
+                                RuleAction::Pass => "PASS",
+                            };
+                            warn!("    RULE:\n{}", spec.to_sexpr_pretty());
+                            actions_taken.push(RuleInfo {
+                                rule_type: "tree".to_string(),
+                                value: spec.describe(),
+                                action: action_str.to_string(),
+                                rate_pps: spec.rate_pps,
+                            });
+                            rules.insert(rule_key, ActiveRule {
+                                last_seen: Instant::now(),
+                                spec: spec.clone(),
+                            });
+                            tree_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
 
-                            let mut rules = active_rules.write().await;
-                            if rules.contains_key(&rule_key) {
-                                rules.insert(rule_key, Instant::now());
-                            } else {
-                                if args.enforce {
-                                    match filter.add_rule(&rule).await {
-                                        Ok(_) => {
-                                            let action_str = match rule.action {
-                                                RuleAction::Drop => "DROP",
-                                                RuleAction::RateLimit => "RATE_LIMIT",
-                                                RuleAction::Pass => "PASS",
-                                            };
-                                            warn!("    ADDED {} RULE: {:?}={} (rate: {:?})",
-                                                  action_str, rule.rule_type, rule.value, rule.rate_pps);
-                                            actions_taken.push(RuleInfo {
-                                                rule_type: format!("{:?}", rule.rule_type),
-                                                value: rule.value.clone(),
-                                                action: action_str.to_string(),
-                                                rate_pps: rule.rate_pps,
-                                            });
-                                            rules.insert(rule_key, Instant::now());
-                                        }
-                                        Err(e) => {
-                                            warn!("    Failed to add rule: {}", e);
-                                        }
-                                    }
-                                } else {
-                                    info!("    Would add rule (dry-run): {:?}={}", rule.rule_type, rule.value);
+                        // Recompile and flip tree if rules changed
+                        if tree_dirty.load(std::sync::atomic::Ordering::SeqCst) && args.enforce {
+                            let all_specs: Vec<RuleSpec> = rules.values()
+                                .map(|r| r.spec.clone())
+                                .collect();
+                            match filter.compile_and_flip_tree(&all_specs).await {
+                                Ok(nodes) => {
+                                    info!("    Tree recompiled: {} rules -> {} nodes", all_specs.len(), nodes);
+                                    tree_dirty.store(false, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                Err(e) => {
+                                    warn!("    Failed to compile tree: {}", e);
                                 }
                             }
+                        } else if !args.enforce {
+                            info!("    Would compile tree (dry-run): {} rules", rules.len());
                         }
                     }
 
@@ -1152,38 +1166,40 @@ async fn main() -> Result<()> {
             let mut rules = active_rules.write().await;
             let expired: Vec<String> = rules
                 .iter()
-                .filter(|(_, added)| added.elapsed() > rule_ttl)
+                .filter(|(_, active)| active.last_seen.elapsed() > rule_ttl)
                 .map(|(k, _)| k.clone())
                 .collect();
 
+            let had_expired = !expired.is_empty();
             for key in expired {
-                if let Some((type_str, value)) = key.split_once(':') {
-                    let rule_type = match type_str {
-                        "SrcIp" => Some(RuleType::SrcIp),
-                        "DstIp" => Some(RuleType::DstIp),
-                        "SrcPort" => Some(RuleType::SrcPort),
-                        "DstPort" => Some(RuleType::DstPort),
-                        _ => None,
-                    };
+                if let Some(active) = rules.remove(&key) {
+                    info!("<<< EXPIRED RULE: {}", active.spec.describe());
+                }
+            }
 
-                    if let Some(rt) = rule_type {
-                        let rule = Rule {
-                            rule_type: rt,
-                            value: value.to_string(),
-                            action: RuleAction::Drop,
-                            rate_pps: None,
-                        };
-
-                        if args.enforce {
-                            if let Err(e) = filter.remove_rule(&rule).await {
-                                warn!("Failed to remove expired rule: {}", e);
-                            } else {
-                                info!("<<< EXPIRED RULE: {:?}={}", rt, value);
-                            }
+            // Recompile tree if rules were expired
+            if had_expired && args.enforce {
+                if rules.is_empty() {
+                    // No rules left: clear the tree
+                    if let Err(e) = filter.clear_tree().await {
+                        warn!("Failed to clear tree: {}", e);
+                    } else {
+                        info!("Tree cleared (all rules expired)");
+                    }
+                } else {
+                    let all_specs: Vec<RuleSpec> = rules.values()
+                        .map(|r| r.spec.clone())
+                        .collect();
+                    match filter.compile_and_flip_tree(&all_specs).await {
+                        Ok(nodes) => {
+                            info!("Tree recompiled after expiry: {} rules -> {} nodes", all_specs.len(), nodes);
+                        }
+                        Err(e) => {
+                            warn!("Failed to recompile tree after expiry: {}", e);
                         }
                     }
                 }
-                rules.remove(&key);
+                tree_dirty.store(false, std::sync::atomic::Ordering::SeqCst);
             }
         }
 
