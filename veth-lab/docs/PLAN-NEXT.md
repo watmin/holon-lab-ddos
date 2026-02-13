@@ -1350,6 +1350,250 @@ characterization. Worth documenting as contributions.
 
 ---
 
+## 16. Holon Primitive Integration — Untapped Toolkit
+
+These are holon-rs primitives we're not using that have direct, pragmatic
+applications in the detection loop. No eBPF changes for any of them.
+
+### 16a. Accumulator Decay (Continuous Detection)
+
+**What it does:** `accumulator.decay(factor)` multiplies all sums by a
+factor (e.g., 0.99). Old observations lose weight exponentially.
+
+**Current approach:** Fixed 2-second windows. Accumulate, normalize, compare,
+reset. Detection is discrete — drift is computed once per window.
+
+**With decay:** No window resets. The accumulator runs continuously. Every
+N packets (or every M milliseconds), decay by a factor and compute drift.
+Detection becomes continuous — no 2-second blind spots.
+
+```rust
+// Instead of: accumulate for 2s, check, reset
+// Do: continuously accumulate with exponential forgetting
+loop {
+    let sample = receive_sample().await;
+    let vec = holon.encode_walkable(&sample);
+
+    recent_acc.add(&vec);
+    packet_count += 1;
+
+    // Decay every 100 packets (tuneable)
+    if packet_count % 100 == 0 {
+        recent_acc.decay(0.95);  // 5% forgetting per cycle
+
+        // Continuous drift check
+        let recent_vec = recent_acc.normalize();
+        let drift = holon.similarity(&recent_vec, &baseline_vec);
+
+        if drift < threshold {
+            // Anomaly detected — no window boundary needed
+        }
+    }
+}
+```
+
+**Benefits:**
+- No window duration to tune (the decay factor replaces it)
+- No "missed" attacks that start in the middle of a window
+- Drift signal is smoother (no discrete jumps at window boundaries)
+- Naturally adapts: fast attacks show up fast, slow attacks show up slow
+
+**Trade-off:** Harder to reason about "how many packets contributed to this
+signal." The effective window is `1 / (1 - decay_factor)` packets (for
+decay=0.95, the effective window is ~20 packets before 50% contribution).
+
+**Implementation:**
+- `sidecar/src/main.rs` — replace window-based loop with continuous loop
+- Can coexist: keep window-based for logging/metrics, add continuous for detection
+- The magnitude-based rate derivation still works: `||recent_acc||` still
+  correlates with volume, just with exponential weighting
+
+### 16b. Negate (Attack Peeling)
+
+**What it does:** `Primitives::negate(superposition, component)` removes
+a known component from a superposition.
+
+**Application:** After detecting and mitigating attack A, check if there's
+a hidden attack B underneath.
+
+```rust
+// Detected DNS amplification, generated rule for it
+let dns_attack_profile = compute_attack_profile(&anomalous_packets);
+
+// Remove the known attack from the recent accumulator
+let cleaned = Primitives::negate(&recent_vec, &dns_attack_profile);
+
+// Does the cleaned signal still drift from baseline?
+let residual_drift = holon.similarity(&cleaned, &baseline_vec);
+
+if residual_drift < threshold {
+    // Second attack detected! The DNS amp was masking it.
+    // Repeat: analyze `cleaned` for concentrated fields, generate rules
+    let second_anomaly = analyze_concentrated_fields(&cleaned, &baseline_vec);
+}
+```
+
+**This is iterative peeling.** Detect → mitigate → peel → detect again.
+It can find N layered attacks, one at a time, by removing each detected
+pattern and looking at what remains.
+
+**Implementation:**
+- `sidecar/src/main.rs` — add peeling loop after initial anomaly detection
+- Store detected attack profiles for peeling
+- Max peeling depth (e.g., 3 layers) to prevent infinite loops on noise
+
+### 16c. Prototype (Robust Attack Profiling)
+
+**What it does:** `Primitives::prototype(vectors, threshold)` extracts the
+common pattern across multiple vectors using majority agreement.
+
+**Current approach:** Each anomalous window generates rules independently.
+If an attack spans 5 windows, you get 5 slightly different rule sets.
+
+**With prototype:** Accumulate anomalous window vectors, then extract the
+common pattern:
+
+```rust
+let mut anomalous_windows: Vec<Vector> = vec![];
+
+// Collect several anomalous windows
+if drift < threshold {
+    anomalous_windows.push(recent_vec.clone());
+}
+
+// After 3+ anomalous windows, extract stable attack profile
+if anomalous_windows.len() >= 3 {
+    let refs: Vec<&Vector> = anomalous_windows.iter().collect();
+    let attack_prototype = Primitives::prototype(&refs, 0.5);
+
+    // Generate rules from prototype (more stable than any single window)
+    let concentrated = analyze_concentrated_fields(&attack_prototype, &baseline_vec);
+}
+```
+
+**Benefits:**
+- Rules are more stable (based on consensus across windows, not one snapshot)
+- Noisy single-window artifacts get filtered out
+- The prototype is the "essence" of the attack
+
+**Implementation:**
+- `sidecar/src/main.rs` — buffer anomalous windows, apply prototype before rule gen
+- Threshold parameter controls how much agreement is needed (0.5 = majority)
+
+### 16d. Resonance (Anomaly Isolation)
+
+**What it does:** `Primitives::resonance(vec, reference)` keeps only
+dimensions where `vec` and `reference` agree. Everything else is zeroed.
+
+**Application:** Separate the "normal part" of traffic from the "anomalous
+part":
+
+```rust
+// Extract what's normal about the recent window
+let normal_component = Primitives::resonance(&recent_vec, &baseline_vec);
+
+// The anomaly is everything that DOESN'T agree with baseline
+let anomaly_signal = Primitives::difference(&recent_vec, &normal_component);
+
+// Analyze the pure anomaly signal (baseline noise removed)
+let concentrated = analyze_concentrated_fields(&anomaly_signal, &zero_vec);
+```
+
+**Benefits:**
+- Cleaner anomaly signal (baseline noise removed)
+- More precise concentration analysis (only looks at what changed)
+- Works even when the attack is a small fraction of total traffic
+
+### 16e. Complexity (Baseline-Free Anomaly Signal)
+
+**What it does:** `Primitives::complexity(vec)` returns a 0.0–1.0 measure
+of how "mixed" a vector is (density × balance of active dimensions).
+
+**Application:** A single-number anomaly signal that doesn't need a baseline:
+
+```rust
+let recent_vec = recent_acc.normalize();
+let c = Primitives::complexity(&recent_vec);
+
+// Low complexity = homogeneous traffic = likely attack
+// High complexity = diverse traffic = likely normal
+if c < 0.3 {
+    warn!("Low complexity ({:.2}) — traffic is unusually homogeneous", c);
+}
+```
+
+**Benefits:**
+- Works from packet 1 (no warmup needed)
+- Complementary to drift (drift needs a baseline, complexity doesn't)
+- Good for the warmup period when baseline isn't established yet
+
+**Implementation:**
+- Add to detection loop as an auxiliary signal
+- Could trigger early detection during warmup windows
+
+### 16f. Sequence Encoding (Flow-Level Detection)
+
+**What it does:** `encode_sequence(items, Ngram { n: 3 })` encodes
+3-element windows of a sequence, capturing local ordering patterns.
+
+**Application:** Encode packet *flows* instead of individual packets:
+
+```rust
+// Maintain a sliding window of recent packet vectors
+let mut flow_window: VecDeque<Vector> = VecDeque::with_capacity(3);
+
+for sample in samples {
+    let vec = holon.encode_walkable(&sample);
+    flow_window.push_back(vec);
+
+    if flow_window.len() == 3 {
+        // Encode the 3-packet motif
+        let refs: Vec<&Vector> = flow_window.iter().collect();
+        let trigram = holon.encode_sequence(&refs, SequenceMode::Ngram { n: 3 });
+
+        flow_acc.add(&trigram);
+        flow_window.pop_front();
+    }
+}
+
+// Compare flow patterns to baseline flow patterns
+let flow_drift = holon.similarity(&flow_acc.normalize(), &baseline_flow_vec);
+```
+
+**What this detects that per-packet can't:**
+- SYN→RST→SYN→RST loops (individual SYNs and RSTs are normal)
+- Slow scans (SYN to port A → SYN to port B → SYN to port C)
+- Protocol anomalies (data before handshake completes)
+
+**Implementation:**
+- Add flow accumulator alongside packet accumulator in detection loop
+- Separate drift threshold for flow-level anomalies
+- Higher latency (needs 3 packets to form a trigram) but deeper signal
+
+### 16g. Weighted Bundle (Confidence-Weighted Accumulation)
+
+**What it does:** `accumulator.add_weighted(example, weight)` adds a
+vector with a weight factor.
+
+**Application:** Not all sampled packets are equally informative. Weight by:
+- **Packet size:** Larger packets carry more information
+- **Novelty:** Packets dissimilar to the accumulator get higher weight
+- **Recency within window:** Later packets may be more relevant
+
+```rust
+// Weight by novelty: dissimilar packets get higher weight
+let sim = holon.similarity(&vec, &recent_acc.normalize());
+let novelty_weight = 1.0 - sim.abs();  // high when dissimilar
+recent_acc.add_weighted(&vec, novelty_weight);
+```
+
+**Benefits:**
+- Novel traffic patterns are amplified (detected faster)
+- Redundant traffic is dampened (less noise)
+- Attack onset shows up sooner (first anomalous packets get high weight)
+
+---
+
 ## Updated Priority Table
 
 | Feature | Complexity | eBPF Changes | Value |
@@ -1362,6 +1606,13 @@ characterization. Worth documenting as contributions.
 | Metrics reactor | Medium | Read-only (new reads) | High |
 | Vector-native cardinality | Low | None | **Very High** |
 | Magnitude spectrum | Low | None | **Very High** |
+| Accumulator decay | Low | None | **Very High** |
+| Attack peeling (negate) | Low | None | High |
+| Prototype (robust profiling) | Low | None | High |
+| Resonance (anomaly isolation) | Low | None | Medium |
+| Complexity (baseline-free) | Low | None | Medium |
+| Weighted accumulation | Low | None | Medium |
+| Sequence/n-gram detection | Medium | None | High |
 | `In` predicate | Low | None (compiler only) | High |
 | Negation (`not`) | Medium | Exclusion field on TreeNode | Medium |
 | Range predicates | Medium | Node annotation or expansion | Medium |
@@ -1380,26 +1631,35 @@ characterization. Worth documenting as contributions.
 3. Named rate limiters + compound naming
 4. `In` predicate (compiler-only, multi-edge to shared child)
 
-**Batch 2 — Vector intelligence (no eBPF changes):**
+**Batch 2 — Holon detection enrichment (no eBPF changes):**
 5. TTL + tcp_window log-scale encoding (fuzzy field clustering)
-6. Vector-native cardinality (unbinding as diversity estimator)
-7. Magnitude spectrum (per-field diversity profile)
-8. Interference detection (correlated attack signal)
-9. Cardinality-aware rule generation (botnet vs amplification strategy)
+6. Accumulator decay (continuous detection, no window resets)
+7. Complexity as auxiliary signal (baseline-free, works during warmup)
+8. Attack peeling via negate (layered attack detection)
+9. Prototype for robust attack profiling (consensus across windows)
+10. Resonance for anomaly isolation (remove baseline noise)
+11. Weighted accumulation (novelty-weighted packets)
 
-**Batch 3 — eBPF observability:**
-10. Count action (new map, new action type in walker)
-11. Metrics reactor (async collection + emission loop)
-12. HyperLogLog in `veth_filter` (ground-truth cardinality for dashboards)
+**Batch 3 — Vector-native intelligence (no eBPF changes):**
+12. Vector-native cardinality (unbinding as diversity estimator)
+13. Magnitude spectrum (per-field diversity profile)
+14. Interference detection (correlated attack signal)
+15. Cardinality-aware rule generation (botnet vs amplification strategy)
+16. Sequence/n-gram flow detection (packet motif anomalies)
 
-**Batch 4 — eBPF predicates:**
-13. Negation (exclusion field on TreeNode)
-14. Range predicates (start with expansion, then node annotation)
-15. Bitmask predicate (node annotation)
+**Batch 4 — eBPF observability:**
+17. Count action (new map, new action type in walker)
+18. Metrics reactor (async collection + emission loop)
+19. HyperLogLog in `veth_filter` (ground-truth cardinality for dashboards)
 
-**Batch 5 — Scale features (prefix lists):**
-16. Dynamic prefix lists (LPM tries with ipset-style TTL + counters)
-17. Blue/green prefix list swaps
-18. Holon integration (auto-populate prefix lists from detection)
-19. Cross-field OR (compiler rule duplication)
-20. Bloom filters (if needed)
+**Batch 5 — eBPF predicates:**
+20. Negation (exclusion field on TreeNode)
+21. Range predicates (start with expansion, then node annotation)
+22. Bitmask predicate (node annotation)
+
+**Batch 6 — Scale features (prefix lists):**
+23. Dynamic prefix lists (LPM tries with ipset-style TTL + counters)
+24. Blue/green prefix list swaps
+25. Holon integration (auto-populate prefix lists from detection)
+26. Cross-field OR (compiler rule duplication)
+27. Bloom filters (if needed)
