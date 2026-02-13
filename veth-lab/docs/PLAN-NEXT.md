@@ -1097,50 +1097,256 @@ struct PrefixEntry {
 
 ---
 
-## 15. HyperLogLog: Placement Decision
+## 15. Vector-Native Cardinality & Field Diversity
 
-### Question
+### Revision Note
 
-Is HLL a firewall feature (eBPF) or a sidecar/Holon feature?
+The original version of this section dismissed cardinality estimation as
+"not a VSA operation." That was wrong. The magnitude-based rate derivation
+already proved that accumulator geometry encodes traffic properties beyond
+what standard VSA/HDC literature describes. The same principles extend to
+cardinality estimation and far richer signals.
 
-### Answer: Both, Different Roles
+### The Core Insight: Magnitude Encodes Diversity
 
-**eBPF-side HLL (in `veth_filter`):**
-- Runs on EVERY packet (not just sampled ones)
-- Gives ground-truth cardinality for the full traffic stream
-- 256 bytes per counter, ~10 instructions per observe
-- Best for: real-time cardinality tracking as a first-class XDP metric
+In bipolar VSA, binding produces near-orthogonal vectors for different filler
+values. When you accumulate (sum) bound vectors:
 
-**Sidecar-side HLL (in Holon analysis):**
-- Runs on SAMPLED packets only
-- Gives approximate cardinality (subject to sample rate)
-- But can be combined with Holon's vector analysis for richer signals
-- Best for: enriching anomaly detection with cardinality context
+- **N copies of the SAME vector:** magnitude ≈ N (linear growth)
+- **N ORTHOGONAL vectors:** magnitude ≈ √N (square-root growth)
+- **Mix:** magnitude is between √N and N
 
-**Recommendation: eBPF-side for core metrics, sidecar-side for detection.**
+The **magnitude-to-count ratio** of an accumulator is a cardinality signal:
 
-The eBPF program maintains a few HLL counters (src_ip, dst_port, src_port)
-updated on every packet. The metrics reactor reads these and reports exact*
-cardinality. (* ~5% error, but over the full stream, not sampled.)
+| Scenario | Packets | Unique Sources | Magnitude | Ratio (mag/count) |
+|---|---|---|---|---|
+| Amplification | 1000 | 1 | ~1000 | ~1.0 |
+| Mixed | 1000 | 10 | ~316 | ~0.316 |
+| Botnet | 1000 | 1000 | ~31.6 | ~0.032 |
 
-The sidecar uses the cardinality estimates as additional signals for rule
-generation. "Unique source IPs jumped from 50 to 50,000" is a detection
-trigger, not just a metric.
+High ratio → low cardinality (amplification: few sources, high volume).
+Low ratio → high cardinality (botnet: many unique sources).
 
-**What about Holon vectors?**
+**This falls out of the existing algebra.** No new data structure. No HLL.
+The accumulator you already have IS a cardinality estimator.
 
-HLL and Holon vectors answer different questions:
-- **Holon drift:** "Has the traffic distribution changed?" (distributional)
-- **HLL cardinality:** "How many unique values exist?" (counting)
+### Per-Field Cardinality via Unbinding
 
-They're complementary. A DDoS with 50K unique IPs attacking one port will
-show high drift AND high source cardinality. An amplification attack from
-3 IPs will show high drift but LOW source cardinality. HLL disambiguates
-attack types that Holon's drift score alone cannot.
+The full packet accumulator contains ALL fields superimposed. Because binding
+is its own inverse in bipolar VSA (`bind(A, bind(A, X)) ≈ X`), you can
+**query the accumulator for field-specific information:**
 
-HLL doesn't belong in the Holon primitive library itself — it's not a VSA
-operation. It's a separate observability primitive that lives alongside Holon
-in the sidecar's analysis pipeline.
+```rust
+// "What does the accumulator say about source IPs specifically?"
+let src_ip_component = Primitives::bind(&accumulator_normalized, &role_src_ip);
+
+// Magnitude of this component reflects src_ip diversity
+let src_ip_diversity = src_ip_component.norm();
+```
+
+Unbinding with `role_src_ip` extracts the subspace contributed by source IP
+bindings. Cross-terms from other fields (dst_port, proto, etc.) are
+near-orthogonal to this subspace and contribute only noise.
+
+**One accumulator. Any field. On demand.** No per-field counters, no per-field
+HLLs, no per-field maps. Just unbind and measure.
+
+### Magnitude Spectrum: Per-Field Diversity Profile
+
+Unbind the accumulator with EVERY role vector to get a full diversity profile:
+
+```rust
+fn magnitude_spectrum(
+    acc: &Vector,
+    roles: &[(&str, &Vector)],
+    count: usize,
+) -> Vec<(String, f64)> {
+    roles.iter().map(|(name, role)| {
+        let component = Primitives::bind(acc, role);
+        let diversity = component.norm() / count as f64;
+        (name.to_string(), diversity)
+    }).collect()
+}
+
+// Example output during a DNS amplification attack:
+// [("src_ip",   0.95),    ← very few unique sources (amplification!)
+//  ("dst_port", 0.97),    ← one destination port (targeted)
+//  ("proto",    0.99),    ← one protocol (UDP)
+//  ("src_port", 0.03),    ← many source ports (randomized by reflectors)
+//  ("dst_ip",   0.98)]    ← one destination IP (victim)
+```
+
+**Flat spectrum** = diverse traffic across all fields (normal).
+**Spiky spectrum** = concentration in specific fields (attack).
+
+This is richer than the current binary concentration metric. It gives a
+**continuous diversity measure per field** from a single vector operation.
+
+### Accumulator Difference as Continuous Attribution
+
+The current approach uses `similarity_profile(recent, baseline)` for
+per-dimension agreement/disagreement. The **raw accumulator difference**
+preserves more information:
+
+```rust
+// Difference accumulator (what changed?)
+let delta: Vec<f64> = recent_acc.sums.iter()
+    .zip(baseline_acc.sums.iter())
+    .map(|(r, b)| r - b)
+    .collect();
+
+// Unbind delta with each role to get per-field change magnitude
+let src_ip_change = bind_f64(&delta, &role_src_ip).norm();
+let dst_port_change = bind_f64(&delta, &role_dst_port).norm();
+let proto_change = bind_f64(&delta, &role_proto).norm();
+
+// "Source IPs changed a lot, destination port barely changed"
+// → New sources hitting the same service = botnet recruitment
+```
+
+Unbinding the DIFFERENCE gives "how much did this specific field change?" —
+a continuous attribution metric instead of "concentrated or not."
+
+### Interference Detection: Correlated Concurrent Attacks
+
+When two independent attacks overlap in time, their vectors superimpose. If
+the attacks are truly independent (different sources, different targets, no
+shared fields), their contributions are orthogonal and magnitudes add in
+quadrature:
+
+```
+||attack_A + attack_B|| ≈ √(||attack_A||² + ||attack_B||²)
+```
+
+If the observed magnitude EXCEEDS this (super-additive), the attacks share
+structure — same botnet, same reflectors, correlated command-and-control.
+
+```rust
+fn detect_attack_correlation(
+    combined_magnitude: f64,
+    individual_estimates: &[f64],  // magnitudes of suspected independent attacks
+) -> f64 {
+    let independent_expected = individual_estimates.iter()
+        .map(|m| m * m)
+        .sum::<f64>()
+        .sqrt();
+
+    // correlation_signal > 1.0 means attacks share structure
+    combined_magnitude / independent_expected
+}
+```
+
+Two independent SYN flood + DNS amplification → correlation ~1.0.
+Same botnet running both → correlation > 1.0 (shared source IPs reinforce).
+
+This is a signal NO per-field counter can give you. It emerges from the
+superposition properties of the vector space itself.
+
+### Where eBPF HLL Still Fits
+
+The vector-native approach operates on **sampled** packets (1-in-100). It
+gives rich compositional signals but with sample-rate noise.
+
+eBPF-side HLL operates on **every packet.** It gives ground-truth cardinality
+as a crisp number: "42,187 unique source IPs this window."
+
+**They serve different purposes:**
+
+| Signal | Source | What It Gives |
+|---|---|---|
+| Exact unique count | eBPF HLL | Dashboard metric, alerting threshold |
+| Per-field diversity profile | Vector unbinding | Rich forensic signal |
+| Cross-field correlation | Vector interference | Attack relationship detection |
+| Rate derivation | Accumulator magnitude | Already implemented |
+| Phase detection | Window vector sequence | Already implemented |
+
+**Recommendation:** Implement vector-native cardinality FIRST (zero new
+infrastructure). Add eBPF HLL later as a metrics feature if you need exact
+counts for dashboards or external alerting systems.
+
+### Implementation: Vector-Native Cardinality
+
+**New sidecar analysis (no eBPF changes, no new maps):**
+
+```rust
+/// Per-field diversity profile from accumulator unbinding.
+fn analyze_field_diversity(&self) -> FieldDiversityProfile {
+    let roles = self.holon.role_vectors();  // pre-computed role vectors
+    let acc_vec = self.recent_acc_normalized();
+    let count = self.window_packet_count;
+
+    let mut profile = FieldDiversityProfile::new();
+
+    for (field_name, role_vec) in roles {
+        // Unbind to extract field-specific component
+        let component = Primitives::bind(&acc_vec, role_vec);
+        let diversity = component.norm();
+
+        // Compare to baseline diversity for this field
+        let baseline_div = self.baseline_field_diversity.get(field_name);
+        let change = diversity / baseline_div.max(1e-10);
+
+        profile.insert(field_name.clone(), FieldDiversity {
+            diversity,
+            baseline_ratio: change,
+            cardinality_class: classify_cardinality(diversity, count),
+        });
+    }
+
+    profile
+}
+
+fn classify_cardinality(diversity: f64, count: usize) -> CardinalityClass {
+    let ratio = diversity / (count as f64).max(1.0);
+    if ratio > 0.8      { CardinalityClass::VeryLow }   // 1-3 unique values
+    else if ratio > 0.3 { CardinalityClass::Low }        // handful
+    else if ratio > 0.05 { CardinalityClass::Medium }    // tens to hundreds
+    else                 { CardinalityClass::High }       // thousands+
+}
+```
+
+**Integration with rule generation:**
+
+```rust
+// During anomaly detection, after drift exceeds threshold:
+let diversity = self.analyze_field_diversity();
+
+if diversity["src_ip"].cardinality_class == CardinalityClass::VeryLow {
+    // Few unique sources → per-IP drop rules
+    // (amplification pattern)
+} else if diversity["src_ip"].cardinality_class == CardinalityClass::High {
+    // Many unique sources → rate-limit on dst_port or proto
+    // (botnet pattern — can't enumerate sources)
+}
+```
+
+**Files to change:**
+- `sidecar/src/main.rs` — new `analyze_field_diversity()` in detection loop
+- `holon-rs/src/primitives.rs` — possibly add `unbind_spectrum()` convenience
+
+**No eBPF changes. No new maps. No new data structures.** Just new questions
+asked of the accumulator that already exists.
+
+### Novel VSA/HDC Contributions
+
+These techniques appear to be novel in the VSA/HDC literature:
+
+1. **Magnitude as volume proxy** — using accumulator norm for rate derivation
+   (already implemented, already novel)
+
+2. **Unbinding as cardinality estimator** — magnitude of unbound component as
+   field-specific diversity signal
+
+3. **Magnitude spectrum** — per-field diversity profile from systematic
+   unbinding of a single accumulator
+
+4. **Interference detection** — super-additive magnitude as a correlated
+   attack signal
+
+5. **Difference unbinding** — per-field attribution from accumulator delta
+
+All are consequences of bipolar VSA algebra applied to network traffic
+characterization. Worth documenting as contributions.
 
 ---
 
@@ -1154,6 +1360,8 @@ in the sidecar's analysis pipeline.
 | Compound naming | Low | None | Medium |
 | Count action | Medium | New map + action type | Medium |
 | Metrics reactor | Medium | Read-only (new reads) | High |
+| Vector-native cardinality | Low | None | **Very High** |
+| Magnitude spectrum | Low | None | **Very High** |
 | `In` predicate | Low | None (compiler only) | High |
 | Negation (`not`) | Medium | Exclusion field on TreeNode | Medium |
 | Range predicates | Medium | Node annotation or expansion | Medium |
@@ -1161,8 +1369,7 @@ in the sidecar's analysis pipeline.
 | Dynamic prefix lists (LPM) | High | New map type + predicate | High |
 | Blue/green prefix lists | Medium | Double-buffered LPM tries | Medium |
 | ipset-style counters/TTL | Medium | PrefixEntry struct in LPM | High |
-| HyperLogLog (eBPF) | Medium | Small array + observe fn | High |
-| HyperLogLog (sidecar) | Low | None (reads eBPF HLL) | Medium |
+| HyperLogLog (eBPF) | Medium | Small array + observe fn | Medium |
 | Bloom filters | Medium | New map type | Low (niche) |
 
 ### Updated Implementation Order
@@ -1173,19 +1380,25 @@ in the sidecar's analysis pipeline.
 3. Named rate limiters + compound naming
 4. `In` predicate (compiler-only, multi-edge to shared child)
 
-**Batch 2 — eBPF observability:**
-5. Count action (new map, new action type in walker)
-6. HyperLogLog in `veth_filter` (per-field cardinality)
-7. Metrics reactor (async collection + emission loop)
+**Batch 2 — Vector intelligence (no eBPF changes):**
+5. Vector-native cardinality (unbinding as diversity estimator)
+6. Magnitude spectrum (per-field diversity profile)
+7. Interference detection (correlated attack signal)
+8. Cardinality-aware rule generation (botnet vs amplification strategy)
 
-**Batch 3 — eBPF predicates:**
-8. Negation (exclusion field on TreeNode)
-9. Range predicates (start with expansion, then node annotation)
-10. Bitmask predicate (node annotation)
+**Batch 3 — eBPF observability:**
+9. Count action (new map, new action type in walker)
+10. Metrics reactor (async collection + emission loop)
+11. HyperLogLog in `veth_filter` (ground-truth cardinality for dashboards)
 
-**Batch 4 — Scale features (prefix lists):**
-11. Dynamic prefix lists (LPM tries with ipset-style TTL + counters)
-12. Blue/green prefix list swaps
-13. Holon integration (auto-populate prefix lists from detection)
-14. Cross-field OR (compiler rule duplication)
-15. Bloom filters (if needed)
+**Batch 4 — eBPF predicates:**
+12. Negation (exclusion field on TreeNode)
+13. Range predicates (start with expansion, then node annotation)
+14. Bitmask predicate (node annotation)
+
+**Batch 5 — Scale features (prefix lists):**
+15. Dynamic prefix lists (LPM tries with ipset-style TTL + counters)
+16. Blue/green prefix list swaps
+17. Holon integration (auto-populate prefix lists from detection)
+18. Cross-field OR (compiler rule duplication)
+19. Bloom filters (if needed)
