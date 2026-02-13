@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use aya::{
     include_bytes_aligned,
-    maps::{Array, HashMap, MapData, PerCpuArray, PerCpuValues, AsyncPerfEventArray},
+    maps::{Array, HashMap, MapData, PerCpuArray, PerCpuValues, AsyncPerfEventArray, ProgramArray},
     programs::{Xdp, XdpFlags},
     Ebpf,
 };
@@ -71,7 +71,7 @@ unsafe impl aya::Pod for RuleValue {}
 // =============================================================================
 
 /// Dispatch dimension identifiers (must match eBPF DONT_CARE array indices)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum FieldDim {
     // Phase 1
@@ -179,6 +179,66 @@ impl FieldDim {
     }
 }
 
+// =============================================================================
+// Field Reference and Predicate Types (extensible rule language foundation)
+// =============================================================================
+
+/// What field a predicate operates on.
+/// `Dim` covers parsed header fields (proto, src_ip, dst_port, ttl, etc.).
+/// Future variants (ByteAt, PktLen, Dscp, ...) extend matching without
+/// changing `Predicate` or tree structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FieldRef {
+    /// A parsed packet header field
+    Dim(FieldDim),
+    // Future:
+    // ByteAt { offset: u16, len: u8 },
+    // PktLen,
+    // Dscp,
+}
+
+/// A matching predicate for a single field constraint.
+/// Only `Eq` is implemented now; the enum is designed for extension
+/// (ranges, bitmask, negation, disjunction) without refactoring.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Predicate {
+    /// Exact equality: field == value
+    Eq(FieldRef, u32),
+    // Future:
+    // Gt(FieldRef, u32),
+    // Lt(FieldRef, u32),
+    // Gte(FieldRef, u32),
+    // Lte(FieldRef, u32),
+    // Mask(FieldRef, u32),
+    // In(FieldRef, Vec<u32>),
+    // Not(Box<Predicate>),
+    // Or(Vec<Predicate>),
+}
+
+impl Predicate {
+    /// Convenience: create an Eq predicate on a parsed header field.
+    pub fn eq(dim: FieldDim, value: u32) -> Self {
+        Predicate::Eq(FieldRef::Dim(dim), value)
+    }
+
+    /// Extract (FieldDim, value) if this is an Eq on a Dim ref.
+    /// Returns `None` for future predicate variants.
+    pub fn as_eq_dim(&self) -> Option<(FieldDim, u32)> {
+        match self {
+            Predicate::Eq(FieldRef::Dim(dim), value) => Some((*dim, *value)),
+        }
+    }
+
+    /// Render this predicate as an s-expression clause.
+    pub fn to_sexpr_clause(&self) -> String {
+        match self {
+            Predicate::Eq(FieldRef::Dim(dim), value) => {
+                format!("(= {} {})", dim.sexpr_name(), dim.sexpr_value(*value))
+            }
+        }
+    }
+}
+
 /// Total number of dispatch dimensions
 pub const NUM_DIMENSIONS: usize = 9;
 
@@ -212,7 +272,9 @@ unsafe impl aya::Pod for TokenBucket {}
 // =============================================================================
 
 /// Blue/green slot size: max nodes per slot
-pub const TREE_SLOT_SIZE: u32 = 250_000;
+/// 2.5M per slot × 2 slots = 5M total TREE_NODES capacity.
+/// Supports ~1M rules at ~2 nodes/rule with headroom for Holon additions.
+pub const TREE_SLOT_SIZE: u32 = 2_500_000;
 
 /// Sentinel: dimension value meaning "this is a leaf node"
 pub const DIM_LEAF: u8 = 0xFF;
@@ -263,12 +325,12 @@ pub struct EdgeKey {
 unsafe impl aya::Pod for EdgeKey {}
 
 /// A rule specification: set of constraints + action.
-/// Each constraint is (dimension, value) meaning "this field must equal this value".
-/// Unconstrained dimensions get dont_care bits set.
+/// Each constraint is a `Predicate` (currently only `Eq`).
+/// Unconstrained dimensions get dont_care bits set (bitmask rete) or wildcard (tree rete).
 #[derive(Debug, Clone)]
 pub struct RuleSpec {
-    /// Constraints: (dimension, expected_value). Unconstrained dims get dont_care.
-    pub constraints: Vec<(FieldDim, u32)>,
+    /// Constraints: each predicate must match for the rule to fire.
+    pub constraints: Vec<Predicate>,
     /// Action to take when all constraints match
     pub action: RuleAction,
     /// Rate limit PPS (only for RateLimit action)
@@ -280,16 +342,16 @@ pub struct RuleSpec {
 impl RuleSpec {
     /// Create a simple single-field drop rule
     pub fn drop_field(dim: FieldDim, value: u32) -> Self {
-        Self { constraints: vec![(dim, value)], action: RuleAction::Drop, rate_pps: None, priority: 100 }
+        Self { constraints: vec![Predicate::eq(dim, value)], action: RuleAction::Drop, rate_pps: None, priority: 100 }
     }
 
     /// Create a simple single-field rate limit rule
     pub fn rate_limit_field(dim: FieldDim, value: u32, pps: u32) -> Self {
-        Self { constraints: vec![(dim, value)], action: RuleAction::RateLimit, rate_pps: Some(pps), priority: 100 }
+        Self { constraints: vec![Predicate::eq(dim, value)], action: RuleAction::RateLimit, rate_pps: Some(pps), priority: 100 }
     }
 
     /// Create a compound rule with multiple constraints (all must match)
-    pub fn compound(constraints: Vec<(FieldDim, u32)>, action: RuleAction, rate_pps: Option<u32>) -> Self {
+    pub fn compound(constraints: Vec<Predicate>, action: RuleAction, rate_pps: Option<u32>) -> Self {
         Self { constraints, action, rate_pps, priority: 100 }
     }
 
@@ -305,9 +367,10 @@ impl RuleSpec {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
-        // Sort constraints for canonical ordering
+        // Sort constraints for canonical ordering (Eq predicates by dim then value)
         let mut sorted: Vec<(u8, u32)> = self.constraints.iter()
-            .map(|(d, v)| (*d as u8, *v))
+            .filter_map(|p| p.as_eq_dim())
+            .map(|(d, v)| (d as u8, v))
             .collect();
         sorted.sort();
         for (dim, val) in &sorted {
@@ -322,7 +385,9 @@ impl RuleSpec {
 
     /// Whether this rule needs Phase 2 fields
     pub fn needs_phase2(&self) -> bool {
-        self.constraints.iter().any(|(dim, _)| dim.is_phase2())
+        self.constraints.iter().any(|p| {
+            p.as_eq_dim().map_or(false, |(dim, _)| dim.is_phase2())
+        })
     }
 
     /// Human-readable description (legacy format)
@@ -358,7 +423,7 @@ impl RuleSpec {
         // For compound rules, break clauses across lines aligned after `(and `
         let lhs_pretty = if self.constraints.len() > 1 {
             let clauses: Vec<String> = self.constraints.iter()
-                .map(|(dim, val)| format!("(= {} {})", dim.sexpr_name(), dim.sexpr_value(*val)))
+                .map(|p| p.to_sexpr_clause())
                 .collect();
             // "(and " is 5 chars, inside outer "(" that's at col 1, so align at col 6
             let indent = "      ";
@@ -386,11 +451,10 @@ impl RuleSpec {
         let lhs = if self.constraints.is_empty() {
             "()".to_string()
         } else if self.constraints.len() == 1 {
-            let (dim, val) = &self.constraints[0];
-            format!("(= {} {})", dim.sexpr_name(), dim.sexpr_value(*val))
+            self.constraints[0].to_sexpr_clause()
         } else {
             let clauses: Vec<String> = self.constraints.iter()
-                .map(|(dim, val)| format!("(= {} {})", dim.sexpr_name(), dim.sexpr_value(*val)))
+                .map(|p| p.to_sexpr_clause())
                 .collect();
             format!("(and {})", clauses.join(" "))
         };
@@ -570,6 +634,20 @@ pub struct FilterStats {
     pub dropped_packets: u64,
     pub sampled_packets: u64,
     pub rate_limited_packets: u64,
+    /// Diagnostic: DFS completions (STATS[6])
+    pub dfs_completions: u64,
+    /// Diagnostic: tail-call entries (STATS[7])
+    pub tail_call_entries: u64,
+    /// Diagnostic: eval_mode==2 entered (STATS[8])
+    pub diag_eval2: u64,
+    /// Diagnostic: root non-zero (STATS[9])
+    pub diag_root_ok: u64,
+    /// Diagnostic: got DFS state ptr (STATS[10])
+    pub diag_state_ok: u64,
+    /// Diagnostic: tail call attempted (STATS[11])
+    pub diag_tc_attempt: u64,
+    /// Diagnostic: tail call FAILED (STATS[12])
+    pub diag_tc_fail: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -637,6 +715,9 @@ pub struct VethFilter {
     allocated_bits: AtomicU64,
     /// Tree rete engine manager (blue/green)
     tree_manager: tokio::sync::Mutex<tree::TreeManager>,
+    /// Keep the prog_array alive so the tail-call entry persists.
+    /// Dropping this closes the map fd, which clears the prog_array entries.
+    _prog_array: Option<ProgramArray<MapData>>,
 }
 
 impl VethFilter {
@@ -681,11 +762,46 @@ impl VethFilter {
             Err(e) => { return Err(e).context("Failed to attach XDP program"); }
         }
 
+        // Load tree_walk_step (tail-call target for tree rete DFS).
+        // Load only — do NOT attach to any interface.
+        {
+            let tree_walk: &mut Xdp = bpf
+                .program_mut("tree_walk_step")
+                .context("tree_walk_step program not found")?
+                .try_into()
+                .context("tree_walk_step is not XDP")?;
+            tree_walk.load().context("Failed to load tree_walk_step")?;
+            info!("tree_walk_step loaded (tail-call target for tree DFS)");
+        }
+
+        // Set up tail-call program array: insert tree_walk_step fd at index 0.
+        // IMPORTANT: We must keep the ProgramArray alive for the lifetime of VethFilter.
+        // Dropping it closes the map fd, which causes the kernel to clear the entries.
+        let prog_array = {
+            let tree_walk_fd = {
+                let prog = bpf.program("tree_walk_step")
+                    .context("tree_walk_step program not found after load")?;
+                prog.fd()
+                    .context("tree_walk_step has no fd")?
+                    .try_clone()
+                    .context("Failed to clone tree_walk_step fd")?
+            };
+            let map = bpf.take_map("TREE_WALK_PROG")
+                .context("TREE_WALK_PROG map not found")?;
+            let mut prog_array = ProgramArray::try_from(map)
+                .context("Failed to create ProgramArray from TREE_WALK_PROG")?;
+            prog_array.set(0, &tree_walk_fd, 0)
+                .context("Failed to set tree_walk_step in TREE_WALK_PROG")?;
+            info!("TREE_WALK_PROG[0] = tree_walk_step fd");
+            prog_array
+        };
+
         Ok(Self {
             bpf: Arc::new(RwLock::new(bpf)),
             interface: interface.to_string(),
             allocated_bits: AtomicU64::new(0),
             tree_manager: tokio::sync::Mutex::new(tree::TreeManager::new()),
+            _prog_array: Some(prog_array),
         })
     }
 
@@ -700,6 +816,13 @@ impl VethFilter {
             dropped_packets: stats.get(&2, 0).map(|v| sum_percpu(&v)).unwrap_or(0),
             sampled_packets: stats.get(&4, 0).map(|v| sum_percpu(&v)).unwrap_or(0),
             rate_limited_packets: stats.get(&5, 0).map(|v| sum_percpu(&v)).unwrap_or(0),
+            dfs_completions: stats.get(&6, 0).map(|v| sum_percpu(&v)).unwrap_or(0),
+            tail_call_entries: stats.get(&7, 0).map(|v| sum_percpu(&v)).unwrap_or(0),
+            diag_eval2: stats.get(&8, 0).map(|v| sum_percpu(&v)).unwrap_or(0),
+            diag_root_ok: stats.get(&9, 0).map(|v| sum_percpu(&v)).unwrap_or(0),
+            diag_state_ok: stats.get(&10, 0).map(|v| sum_percpu(&v)).unwrap_or(0),
+            diag_tc_attempt: stats.get(&11, 0).map(|v| sum_percpu(&v)).unwrap_or(0),
+            diag_tc_fail: stats.get(&12, 0).map(|v| sum_percpu(&v)).unwrap_or(0),
         })
     }
 
@@ -862,7 +985,8 @@ impl VethFilter {
         }
 
         // 2. For each constraint, set the bit in the corresponding dispatch map
-        for &(dim, value) in &spec.constraints {
+        for pred in &spec.constraints {
+            let (dim, value) = pred.as_eq_dim().expect("bitmask rete requires Eq predicates");
             let map_name = dim.map_name();
             let mut dispatch: HashMap<_, u32, u64> = bpf
                 .map_mut(map_name)
@@ -875,7 +999,10 @@ impl VethFilter {
 
         // 3. For unconstrained dimensions, set dont_care bit
         {
-            let constrained_dims: Vec<u8> = spec.constraints.iter().map(|(d, _)| *d as u8).collect();
+            let constrained_dims: Vec<u8> = spec.constraints.iter()
+                .filter_map(|p| p.as_eq_dim())
+                .map(|(d, _)| d as u8)
+                .collect();
             let mut dont_care_map: Array<_, u64> = bpf
                 .map_mut("DONT_CARE").context("DONT_CARE not found")?.try_into()?;
 
@@ -927,7 +1054,8 @@ impl VethFilter {
         let mut bpf = self.bpf.write().await;
 
         // 1. Clear bit from all dispatch maps that have constraints
-        for &(dim, value) in &spec.constraints {
+        for pred in &spec.constraints {
+            let (dim, value) = pred.as_eq_dim().expect("bitmask rete requires Eq predicates");
             let map_name = dim.map_name();
             let mut dispatch: HashMap<_, u32, u64> = bpf
                 .map_mut(map_name)
@@ -1076,7 +1204,7 @@ mod tests {
     fn test_rule_spec_simple() {
         let spec = RuleSpec::drop_field(FieldDim::Proto, 17);
         assert_eq!(spec.constraints.len(), 1);
-        assert_eq!(spec.constraints[0], (FieldDim::Proto, 17));
+        assert_eq!(spec.constraints[0], Predicate::eq(FieldDim::Proto, 17));
         assert_eq!(spec.action, RuleAction::Drop);
         assert!(!spec.needs_phase2());
     }
@@ -1085,8 +1213,8 @@ mod tests {
     fn test_rule_spec_compound() {
         let spec = RuleSpec::compound(
             vec![
-                (FieldDim::SrcIp, 0x0A000001),
-                (FieldDim::L4Word1, 9999),
+                Predicate::eq(FieldDim::SrcIp, 0x0A000001),
+                Predicate::eq(FieldDim::L4Word1, 9999),
             ],
             RuleAction::RateLimit,
             Some(5000),
@@ -1101,8 +1229,8 @@ mod tests {
     fn test_rule_spec_phase2() {
         let spec = RuleSpec::compound(
             vec![
-                (FieldDim::SrcIp, 0x0A000001),
-                (FieldDim::TcpFlags, 0x02), // SYN
+                Predicate::eq(FieldDim::SrcIp, 0x0A000001),
+                Predicate::eq(FieldDim::TcpFlags, 0x02), // SYN
             ],
             RuleAction::Drop,
             None,
@@ -1114,8 +1242,8 @@ mod tests {
     fn test_rule_spec_describe() {
         let spec = RuleSpec::compound(
             vec![
-                (FieldDim::Proto, 6),
-                (FieldDim::L4Word1, 80),
+                Predicate::eq(FieldDim::Proto, 6),
+                Predicate::eq(FieldDim::L4Word1, 80),
             ],
             RuleAction::Drop,
             None,
@@ -1134,7 +1262,7 @@ mod tests {
     fn test_sexpr_rate_limit() {
         let ip = u32::from_ne_bytes([10, 0, 0, 100]);
         let spec = RuleSpec::compound(
-            vec![(FieldDim::SrcIp, ip), (FieldDim::L4Word1, 9999)],
+            vec![Predicate::eq(FieldDim::SrcIp, ip), Predicate::eq(FieldDim::L4Word1, 9999)],
             RuleAction::RateLimit,
             Some(1906),
         );
@@ -1169,9 +1297,9 @@ mod tests {
         let ip = u32::from_ne_bytes([10, 0, 0, 100]);
         let spec = RuleSpec::compound(
             vec![
-                (FieldDim::Proto, 17),
-                (FieldDim::SrcIp, ip),
-                (FieldDim::L4Word1, 9999),
+                Predicate::eq(FieldDim::Proto, 17),
+                Predicate::eq(FieldDim::SrcIp, ip),
+                Predicate::eq(FieldDim::L4Word1, 9999),
             ],
             RuleAction::RateLimit,
             Some(1906),

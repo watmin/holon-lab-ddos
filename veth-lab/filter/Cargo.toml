@@ -20,6 +20,9 @@ bytes = "1"
 # Holon for Walkable trait implementation
 holon = { path = "../../../holon-rs" }
 
+[dev-dependencies]
+rand = "0.8"
+
 [[bin]]
 name = "veth-loader"
 path = "src/bin/loader.rs"

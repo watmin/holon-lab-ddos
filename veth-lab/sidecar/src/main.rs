@@ -26,7 +26,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use veth_filter::{
-    FieldDim, PacketSample, RuleAction, RuleSpec, RuleType, VethFilter,
+    FieldDim, PacketSample, Predicate, RuleAction, RuleSpec, RuleType, VethFilter,
 };
 
 #[derive(Parser, Debug)]
@@ -89,6 +89,13 @@ struct Args {
     /// Enable rate limiting instead of binary DROP (experimental)
     #[arg(long)]
     rate_limit: bool,
+
+    /// Pre-load rules from a JSON file at startup.
+    /// Rules are compiled into the tree before detection begins.
+    /// Holon detection adds rules on top of these at runtime.
+    /// Format: JSON array of {constraints, action, rate_pps?, priority?}
+    #[arg(long)]
+    rules_file: Option<PathBuf>,
 }
 
 // =============================================================================
@@ -724,28 +731,28 @@ struct Detection {
 }
 
 impl Detection {
-    /// Convert a detection field/value into a (FieldDim, u32) constraint.
-    fn to_constraint(&self) -> Option<(FieldDim, u32)> {
+    /// Convert a detection field/value into a Predicate constraint.
+    fn to_constraint(&self) -> Option<Predicate> {
         match self.field.as_str() {
             "src_ip" => self.value.parse::<Ipv4Addr>().ok()
-                .map(|ip| (FieldDim::SrcIp, u32::from_ne_bytes(ip.octets()))),
+                .map(|ip| Predicate::eq(FieldDim::SrcIp, u32::from_ne_bytes(ip.octets()))),
             "dst_ip" => self.value.parse::<Ipv4Addr>().ok()
-                .map(|ip| (FieldDim::DstIp, u32::from_ne_bytes(ip.octets()))),
+                .map(|ip| Predicate::eq(FieldDim::DstIp, u32::from_ne_bytes(ip.octets()))),
             "dst_port" => self.value.parse::<u16>().ok()
-                .map(|port| (FieldDim::L4Word1, port as u32)),
+                .map(|port| Predicate::eq(FieldDim::L4Word1, port as u32)),
             "src_port" => self.value.parse::<u16>().ok()
-                .map(|port| (FieldDim::L4Word0, port as u32)),
+                .map(|port| Predicate::eq(FieldDim::L4Word0, port as u32)),
             "protocol" => self.value.parse::<u8>().ok()
-                .map(|proto| (FieldDim::Proto, proto as u32)),
+                .map(|proto| Predicate::eq(FieldDim::Proto, proto as u32)),
             // p0f-level fields
             "tcp_flags" => self.value.parse::<u8>().ok()
-                .map(|flags| (FieldDim::TcpFlags, flags as u32)),
+                .map(|flags| Predicate::eq(FieldDim::TcpFlags, flags as u32)),
             "ttl" => self.value.parse::<u8>().ok()
-                .map(|ttl| (FieldDim::Ttl, ttl as u32)),
+                .map(|ttl| Predicate::eq(FieldDim::Ttl, ttl as u32)),
             "df_bit" => self.value.parse::<u8>().ok()
-                .map(|df| (FieldDim::DfBit, df as u32)),
+                .map(|df| Predicate::eq(FieldDim::DfBit, df as u32)),
             "tcp_window" => self.value.parse::<u16>().ok()
-                .map(|win| (FieldDim::TcpWindow, win as u32)),
+                .map(|win| Predicate::eq(FieldDim::TcpWindow, win as u32)),
             _ => None,
         }
     }
@@ -761,6 +768,120 @@ impl Detection {
     }
 }
 
+// =============================================================================
+// Rules File Loader
+// =============================================================================
+
+/// JSON schema for a single rule in the rules file
+#[derive(serde::Deserialize)]
+struct RuleFileEntry {
+    constraints: Vec<ConstraintFileEntry>,
+    action: String,
+    rate_pps: Option<u32>,
+    priority: Option<u8>,
+}
+
+#[derive(serde::Deserialize)]
+struct ConstraintFileEntry {
+    field: String,
+    value: serde_json::Value,
+}
+
+/// Parse a JSON rules file into RuleSpecs.
+///
+/// Format: JSON array of objects:
+/// ```json
+/// [
+///   {
+///     "constraints": [
+///       {"field": "proto", "value": 17},
+///       {"field": "src-addr", "value": "10.0.0.200"}
+///     ],
+///     "action": "rate-limit",
+///     "rate_pps": 500,
+///     "priority": 200
+///   }
+/// ]
+/// ```
+///
+/// Field names match s-expression names: proto, src-addr, dst-addr, src-port,
+/// dst-port, tcp-flags, ttl, df, tcp-window.
+fn parse_rules_file(path: &std::path::Path) -> Result<Vec<RuleSpec>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read rules file: {:?}", path))?;
+
+    let entries: Vec<RuleFileEntry> = serde_json::from_str(&content)
+        .context("Failed to parse rules file as JSON")?;
+
+    let mut rules = Vec::with_capacity(entries.len());
+    let mut skipped = 0usize;
+
+    for entry in &entries {
+        let mut constraints = Vec::new();
+        for c in &entry.constraints {
+            let dim = match c.field.as_str() {
+                "proto" => FieldDim::Proto,
+                "src-addr" => FieldDim::SrcIp,
+                "dst-addr" => FieldDim::DstIp,
+                "src-port" => FieldDim::L4Word0,
+                "dst-port" => FieldDim::L4Word1,
+                "tcp-flags" => FieldDim::TcpFlags,
+                "ttl" => FieldDim::Ttl,
+                "df" => FieldDim::DfBit,
+                "tcp-window" => FieldDim::TcpWindow,
+                other => {
+                    warn!("Unknown field '{}' in rules file, skipping constraint", other);
+                    continue;
+                }
+            };
+            let value = match &c.value {
+                serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as u32,
+                serde_json::Value::String(s) => {
+                    if let Ok(ip) = s.parse::<Ipv4Addr>() {
+                        u32::from_ne_bytes(ip.octets())
+                    } else {
+                        warn!("Cannot parse value '{}' for field '{}', skipping", s, c.field);
+                        continue;
+                    }
+                }
+                _ => {
+                    warn!("Invalid value type for field '{}', skipping", c.field);
+                    continue;
+                }
+            };
+            constraints.push(Predicate::eq(dim, value));
+        }
+
+        if constraints.is_empty() {
+            skipped += 1;
+            continue;
+        }
+
+        let action = match entry.action.as_str() {
+            "drop" => RuleAction::Drop,
+            "rate-limit" => RuleAction::RateLimit,
+            "pass" => RuleAction::Pass,
+            other => {
+                warn!("Unknown action '{}', defaulting to drop", other);
+                RuleAction::Drop
+            }
+        };
+
+        rules.push(RuleSpec {
+            constraints,
+            action,
+            rate_pps: entry.rate_pps,
+            priority: entry.priority.unwrap_or(100),
+        });
+    }
+
+    if skipped > 0 {
+        warn!("Skipped {} rules with empty constraints", skipped);
+    }
+
+    Ok(rules)
+}
+
 /// Compile multiple concentrated detections into a compound RuleSpec.
 /// Gathers all constraints and produces a single rule.
 fn compile_compound_rule(
@@ -774,7 +895,7 @@ fn compile_compound_rule(
         return detections[0].compile_rule_spec(use_rate_limit, sample_rate, window_samples);
     }
 
-    let constraints: Vec<(FieldDim, u32)> = detections.iter()
+    let constraints: Vec<Predicate> = detections.iter()
         .filter_map(|d| d.to_constraint())
         .collect();
     if constraints.is_empty() { return None; }
@@ -828,6 +949,7 @@ async fn main() -> Result<()> {
     info!("  Concentration threshold: {}", args.concentration);
     info!("  Enforce mode: {}", args.enforce);
     info!("  Rate limit mode: {}", args.rate_limit);
+    info!("  Rules file: {:?}", args.rules_file.as_deref().unwrap_or(std::path::Path::new("(none)")));
     info!("  Dimensions: {}", args.dimensions);
     info!("  Warmup: {} windows / {} packets", args.warmup_windows, args.warmup_packets);
     info!("  Sample rate: 1 in {} packets", args.sample_rate);
@@ -915,12 +1037,53 @@ async fn main() -> Result<()> {
     struct ActiveRule {
         last_seen: Instant,
         spec: RuleSpec,
+        /// Pre-loaded rules never expire
+        preloaded: bool,
     }
     let active_rules: Arc<RwLock<HashMap<String, ActiveRule>>> = Arc::new(RwLock::new(HashMap::new()));
     // Whether the tree needs recompilation (set when rules change)
     let tree_dirty: Arc<std::sync::atomic::AtomicBool> = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // ── Pre-load rules from file if specified ──
+    if let Some(ref rules_path) = args.rules_file {
+        let start = Instant::now();
+        let preloaded = parse_rules_file(rules_path)?;
+        let parse_time = start.elapsed();
+        info!("Parsed {} rules from {:?} in {:?}", preloaded.len(), rules_path, parse_time);
+
+        if !preloaded.is_empty() {
+            let mut rules = active_rules.write().await;
+            for spec in &preloaded {
+                let key = spec.describe();
+                rules.insert(key, ActiveRule {
+                    last_seen: Instant::now(),
+                    spec: spec.clone(),
+                    preloaded: true,
+                });
+            }
+
+            if args.enforce {
+                let all_specs: Vec<RuleSpec> = rules.values().map(|r| r.spec.clone()).collect();
+                let start = Instant::now();
+                let nodes = filter.compile_and_flip_tree(&all_specs).await?;
+                let compile_time = start.elapsed();
+                let capacity_pct = (nodes as f64 / 2_500_000.0) * 100.0;
+                info!("========================================");
+                info!("PRE-LOADED TREE COMPILED");
+                info!("  Rules:    {}", all_specs.len());
+                info!("  Nodes:    {} ({:.1}% of slot capacity)", nodes, capacity_pct);
+                info!("  Time:     {:?}", compile_time);
+                info!("  Headroom: ~{} nodes for Holon additions", 2_500_000u64.saturating_sub(nodes as u64));
+                info!("========================================");
+            } else {
+                info!("Pre-loaded {} rules (dry-run, not compiled to tree)", rules.len());
+            }
+        }
+    }
+
+    let preloaded_count = active_rules.read().await.values().filter(|r| r.preloaded).count();
     info!("Starting enhanced detection loop...");
+    info!("  Pre-loaded rules: {} (permanent)", preloaded_count);
     info!("  Warmup: {} windows or {} packets", args.warmup_windows, args.warmup_packets);
     info!("");
 
@@ -1012,8 +1175,17 @@ async fn main() -> Result<()> {
                 total_warmup_packets += window_count;
 
                 let stats = filter.stats().await.ok();
-                let drops = stats.as_ref().map(|s| s.dropped_packets).unwrap_or(0);
+                let hard_drops = stats.as_ref().map(|s| s.dropped_packets).unwrap_or(0);
+                let rate_drops = stats.as_ref().map(|s| s.rate_limited_packets).unwrap_or(0);
+                let drops = hard_drops + rate_drops;
                 let total = stats.as_ref().map(|s| s.total_packets).unwrap_or(0);
+                let dfs_comp = stats.as_ref().map(|s| s.dfs_completions).unwrap_or(0);
+                let tc_entries = stats.as_ref().map(|s| s.tail_call_entries).unwrap_or(0);
+                let d_eval2 = stats.as_ref().map(|s| s.diag_eval2).unwrap_or(0);
+                let d_root = stats.as_ref().map(|s| s.diag_root_ok).unwrap_or(0);
+                let d_state = stats.as_ref().map(|s| s.diag_state_ok).unwrap_or(0);
+                let d_tc_try = stats.as_ref().map(|s| s.diag_tc_attempt).unwrap_or(0);
+                let d_tc_fail = stats.as_ref().map(|s| s.diag_tc_fail).unwrap_or(0);
 
                 // Check warmup
                 if !warmup_complete {
@@ -1033,8 +1205,10 @@ async fn main() -> Result<()> {
                         continue;
                     } else {
                         info!(
-                            "Window {} [WARMUP]: {} packets, drift={:.3} | XDP total: {}, dropped: {} | warmup {}/{} windows, {}/{} packets",
-                            windows_processed, window_count, anomaly.drift, total, drops,
+                            "Window {} [WARMUP]: {} packets, drift={:.3} | XDP total: {}, dropped: {} (hard:{} rate:{}) | DFS tc:{} comp:{} | DIAG eval2:{} root:{} state:{} tc_try:{} tc_fail:{} | warmup {}/{} windows, {}/{} packets",
+                            windows_processed, window_count, anomaly.drift, total, drops, hard_drops, rate_drops,
+                            tc_entries, dfs_comp,
+                            d_eval2, d_root, d_state, d_tc_try, d_tc_fail,
                             windows_processed, args.warmup_windows,
                             total_warmup_packets, args.warmup_packets
                         );
@@ -1049,9 +1223,10 @@ async fn main() -> Result<()> {
                 }
 
                 info!(
-                    "Window {}: {} packets, drift={:.3}, anom_ratio={:.1}%, phase={} | XDP total: {}, dropped: {}",
+                    "Window {}: {} packets, drift={:.3}, anom_ratio={:.1}%, phase={} | XDP total: {}, dropped: {} (hard:{} rate:{}) | DFS tc:{} comp:{} | DIAG eval2:{} root:{} state:{} tc_try:{} tc_fail:{}",
                     windows_processed, window_count, anomaly.drift, anomaly.anomalous_ratio * 100.0,
-                    current_phase, total, drops
+                    current_phase, total, drops, hard_drops, rate_drops, tc_entries, dfs_comp,
+                    d_eval2, d_root, d_state, d_tc_try, d_tc_fail
                 );
 
                 // Log attribution if available
@@ -1105,6 +1280,7 @@ async fn main() -> Result<()> {
                             rules.insert(rule_key, ActiveRule {
                                 last_seen: Instant::now(),
                                 spec: spec.clone(),
+                                preloaded: false,
                             });
                             tree_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
@@ -1184,7 +1360,7 @@ async fn main() -> Result<()> {
             let mut rules = active_rules.write().await;
             let expired: Vec<String> = rules
                 .iter()
-                .filter(|(_, active)| active.last_seen.elapsed() > rule_ttl)
+                .filter(|(_, active)| !active.preloaded && active.last_seen.elapsed() > rule_ttl)
                 .map(|(k, _)| k.clone())
                 .collect();
 

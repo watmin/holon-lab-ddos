@@ -1,10 +1,10 @@
 # Veth Lab: Holon-Powered XDP DDoS Mitigation
 
-**Status:** Tree Rete Engine Live  
+**Status:** Tree Rete Engine Live — 1M Rules Proven  
 **Date:** February 2026  
-**Latest Update:** February 12, 2026  
-**Result:** Scalable decision-tree rule engine with blue/green atomic deployment and s-expression rule representation  
-**Key Achievement:** 100k–1M rule capacity, single-path eBPF traversal (~9 levels), zero-downtime rule updates
+**Latest Update:** February 13, 2026  
+**Result:** Scalable decision-tree rule engine with BPF tail-call DFS, blue/green atomic deployment, and s-expression rule representation  
+**Key Achievement:** 1,000,000 rules loaded and dropping packets, BPF tail-call architecture, stack-based DFS trie traversal, ~5 tail calls per packet regardless of rule count
 
 ## Overview
 
@@ -59,10 +59,12 @@ Holon offers a different approach:
 │  │  │                                                   │      ││
 │  │  │  ┌──────────────────────────────────────────┐    │      ││
 │  │  │  │ Tree Rete Engine (eval_mode=2)           │    │      ││
-│  │  │  │  TREE_NODES: Array<TreeNode> [500K]      │    │      ││
-│  │  │  │  TREE_EDGES: HashMap<EdgeKey,u32> [1M]   │    │      ││
+│  │  │  │  TREE_NODES: Array<TreeNode> [5M]        │    │      ││
+│  │  │  │  TREE_EDGES: HashMap<EdgeKey,u32> [5M]   │    │      ││
 │  │  │  │  TREE_ROOT: Array<u32> [1] (atomic ptr)  │    │      ││
 │  │  │  │  TREE_RATE_STATE: HashMap<u32,Bucket>    │    │      ││
+│  │  │  │  TREE_DFS_STATE: PerCpuArray<DfsState>   │    │      ││
+│  │  │  │  TREE_WALK_PROG: ProgramArray [1]        │    │      ││
 │  │  │  └──────────────────────────────────────────┘    │      ││
 │  │  │  ┌─────────┐  ┌─────────┐  ┌─────────┐          │      ││
 │  │  │  │ STATS   │  │ CONFIG  │  │ SAMPLES │          │      ││
@@ -98,7 +100,7 @@ Holon offers a different approach:
 
 The original bitmask Rete engine used a 64-bit bitmask to track which rules matched a packet. This fundamentally capped the system at **64 rules** -- a non-starter for the goal of hosting **100k–1M rules** while probabilistically evaluating only **10–30 per packet**.
 
-The Tree Rete replaces linear rule iteration with a **decision tree** where packet field values drive traversal. A packet enters at the root and walks down at most 9 levels (one per field dimension), following edges that match its field values. The leaf node contains the highest-priority action.
+The Tree Rete replaces linear rule iteration with a **decision tree** where packet field values drive traversal. A packet enters at the root and a **stack-based DFS** explores all matching paths — both specific-value edges and wildcard branches — collecting every terminating node. The highest-priority match wins. The DFS is implemented via **BPF tail calls**, where each iteration is a separate ~100-instruction XDP program that tail-calls itself. This avoids BPF verifier instruction limits while keeping per-packet cost at ~5 tail calls regardless of tree size.
 
 ### Dimensions (Traversal Order)
 
@@ -153,29 +155,32 @@ The compact one-liner form is also available:
 | `df` | DF Bit | 0=clear, 1=set |
 | `tcp-window` | TCP Window | 0–65535 |
 
-### Tree Compilation
+### Tree Compilation (DAG Compiler)
 
-The userspace compiler (`filter/src/tree.rs`) recursively builds the tree:
+The userspace compiler (`filter/src/tree.rs`) builds a DAG (Directed Acyclic Graph) with memoization and structural deduplication:
 
 1. **Partition** rules by the current dimension into specific-value and wildcard groups
-2. **Replicate** wildcard rules into every specific-value subtree (ensures single-path correctness)
-3. **Skip** dimensions not constrained by any rule in the current subtree
-4. **Recurse** until all dimensions are exhausted or only one rule remains
-5. **Flatten** the recursive tree into `(node_id → TreeNode)` and `(EdgeKey → child_id)` for eBPF maps
+2. **Replicate** wildcard rules into every specific-value subtree via `Rc<ShadowNode>` sharing
+3. **Memoize** recursive calls — identical `(rule_set, dimension)` pairs produce shared subtrees
+4. **Skip** dimensions not constrained by any rule in the current subtree
+5. **Recurse** until all dimensions are exhausted or only one rule remains
+6. **Flatten** the DAG into `(node_id → TreeNode)` and `(EdgeKey → child_id)` with content-hash deduplication
 
-Priority resolution: when multiple rules reach the same leaf, the highest-priority (lowest numeric value) rule wins.
+The DFS trie walker in eBPF explores both specific-value and wildcard branches at each node, so the compiler doesn't need to fully replicate wildcards — the DAG structure is preserved in the flat tree, dramatically reducing node count.
+
+Priority resolution: when multiple paths terminate at matching nodes, the DFS collects all matches and the highest-priority (lowest numeric value) rule wins.
 
 ### Blue/Green Atomic Deployment
 
 Rule updates are zero-downtime via double buffering:
 
 ```
-TREE_NODES array (500K entries):
-  ┌─────────────────┬─────────────────┐
-  │ Slot 0: 0–249K  │ Slot 1: 250K+   │
-  └────────┬────────┴────────┬────────┘
-           │                 │
-     TREE_ROOT ──────► active slot root node ID
+TREE_NODES array (5M entries):
+  ┌──────────────────────┬──────────────────────┐
+  │ Slot 0: 1–2,500,000  │ Slot 1: 2,500,001+   │
+  └──────────┬───────────┴──────────┬───────────┘
+             │                      │
+       TREE_ROOT ──────► active slot root node ID
 ```
 
 **Update sequence:**
@@ -188,23 +193,51 @@ TREE_NODES array (500K entries):
 
 Packets in-flight during the flip see either the old or new tree -- never a partial state.
 
-### eBPF Tree Walker
+### eBPF Tree Walker — BPF Tail-Call DFS
 
-The eBPF program uses a macro-unrolled 9-level loop (required by the BPF verifier -- no dynamic loops):
+The eBPF walker uses a **two-program tail-call architecture** to implement a stack-based DFS that explores all matching paths through the decision tree:
 
-```rust
-tree_walk_level!(ctx, hdr, node_id, best_act, best_prio, best_rule,
-                 proto, src_ip, dst_ip, l4_0, l4_1, /* lazy Phase 2 */ ...);
+```
+veth_filter (XDP entry point)
+  │
+  ├── Parse packet, extract fields into DfsState
+  ├── Sample packet (before tail call — packet data only accessible here)
+  ├── Initialize DFS stack with root node
+  │
+  └── tail_call → tree_walk_step (index 0 in TREE_WALK_PROG)
+                    │
+                    ├── Pop node from stack
+                    ├── Check for action (update best if higher priority)
+                    ├── Look up specific-value edge → push child
+                    ├── Look up wildcard child → push child
+                    │
+                    └── tail_call → tree_walk_step (self, loop)
+                          │
+                          └── ... until stack empty or 33 tail calls exhausted
+                                │
+                                └── apply_dfs_result()
+                                      ├── Rate limit check (token bucket)
+                                      ├── Update STATS counters
+                                      └── Return XDP_DROP or XDP_PASS
 ```
 
-Each level:
-1. Loads the `TreeNode` from `TREE_NODES[node_id]`
-2. If the node has an action with higher priority than current best, updates best
-3. Extracts the packet field for the node's branch dimension
-4. Looks up `EdgeKey { parent: node_id, value: field_value }` in `TREE_EDGES`
-5. If found, follows the edge; if not, tries the wildcard child; otherwise stops
+**Key design decisions:**
 
-Total instruction budget: ~270 instructions for a full 9-level traversal -- well within eBPF verifier limits.
+- **Per-CPU DfsState** (`PerCpuArray<DfsState>`): Carries the 16-entry DFS stack, pre-extracted packet fields, and best-match state between tail calls. BPF programs don't migrate CPUs between tail calls, so this is safe without locks.
+- **Field pre-extraction**: All 9 packet field values are extracted once in `veth_filter` and stored in `DfsState.fields[]`. The tail-called program never touches raw packet data — this avoids verifier issues with packet pointer invalidation across tail calls.
+- **Sampling before tail call**: `sample_packet()` runs in `veth_filter` where packet bounds checks are established. The tail-called `tree_walk_step` operates purely on map data.
+- **Field-by-field initialization**: `DfsState` fields are written individually (not via bulk array assignment) to avoid Rust generating `memset` operations that blow up the verifier's instruction count.
+
+**Performance characteristics:**
+
+| Metric | Value |
+|--------|-------|
+| Instructions per `tree_walk_step` | ~100 (2-3 map lookups) |
+| Tail calls per packet (normal traffic) | ~5 |
+| Tail calls per packet (attack, more wildcards) | ~7-10 |
+| Maximum tail calls (kernel limit) | 33 |
+| DFS stack depth | 16 entries |
+| Verifier compliance | Each program independently verified |
 
 ### Idempotent Rule Insertion
 
@@ -230,13 +263,15 @@ eBPF program running at the network driver level with three evaluation modes:
 
 ```rust
 // Tree Rete maps
-static TREE_NODES: Array<TreeNode>              // 500K entries (2 slots × 250K)
-static TREE_EDGES: HashMap<EdgeKey, u32>        // 1M entries
+static TREE_NODES: Array<TreeNode>              // 5M entries (2 slots × 2.5M)
+static TREE_EDGES: HashMap<EdgeKey, u32>        // 5M entries
 static TREE_ROOT: Array<u32>                    // Atomic pointer to active root
-static TREE_RATE_STATE: HashMap<u32, TokenBucket> // Rate state keyed by rule hash
+static TREE_RATE_STATE: HashMap<u32, TokenBucket> // 2M entries, keyed by rule hash
+static TREE_DFS_STATE: PerCpuArray<DfsState>    // Per-CPU DFS scratch (stack, fields, match state)
+static TREE_WALK_PROG: ProgramArray             // Tail-call target (index 0 = tree_walk_step)
 
 // Shared maps
-static STATS: PerCpuArray<u64>                  // Counters
+static STATS: PerCpuArray<u64>                  // Counters (16 slots)
 static CONFIG: Array<u32>                       // Sample rate, enforce mode, eval mode
 static SAMPLES: PerfEventArray<PacketSample>    // Packet samples to userspace
 ```
@@ -296,6 +331,56 @@ Rule Expired (TTL) → Removed from active set →
 ```
 
 ## Results
+
+### 1,000,000 Rules — BPF Tail-Call DFS (February 13, 2026)
+
+The culmination of the scalable rule engine work: **one million pre-loaded rules** with live anomaly detection and packet drops, powered by a BPF tail-call DFS architecture.
+
+#### The Journey
+
+The path to 1M rules required solving several fundamental eBPF constraints:
+
+1. **64-rule bitmask limit** (Feb 10) → Tree Rete decision tree
+2. **Verifier instruction limit** (1M insn) → Unrolled macro walker, then stack-based DFS
+3. **DFS loop blew verifier** → Pre-extracted fields, bounded loops
+4. **Still too many instructions** → **BPF tail calls** — each DFS step is a separate ~100-insn program
+5. **Verifier crash with tail calls** → Field-by-field DfsState init (no memset), sampling moved before tail call
+6. **Tail calls silently failing** → `bpftool map dump` revealed empty prog_array — `take_map()` + drop closed the fd, clearing entries. Fixed by keeping `ProgramArray` alive in the struct.
+
+#### 1M Rule Test Results
+
+| Metric | Value |
+|--------|-------|
+| **Rules loaded** | 1,000,000 |
+| **JSON parse time** | 677ms (149 MB file) |
+| **Tree compile time** | 3.8 seconds |
+| **Tree nodes** | 2,000,004 (80% of 2.5M slot capacity) |
+| **Tree edges** | 2,000,000 |
+| **Blue/green flip time** | ~1.6s (writing 2M nodes + 2M edges to BPF maps) |
+| **Headroom** | ~500K nodes for Holon dynamic additions |
+| **Tail calls per packet** | ~5 (normal), ~7-10 (attack) — **same as 50K rules** |
+| **Tail call failures** | **0** |
+| **Total drops** | 3,944,072 (hard:1,972,036 + rate:1,972,036) |
+| **Detection latency** | First anomaly window 18, drops by window 19 |
+| **Post-mitigation** | Normal by window 34 (97%+ confidence) |
+
+#### Scaling Properties
+
+The decision tree gets **wider** with more rules, not deeper. The 9-dimension depth is fixed. Per-packet traversal cost is bounded by the number of dimensions (~5 tail calls for normal traffic), not the number of rules. This means:
+
+- 50K rules: ~5 tail calls/packet
+- 1M rules: ~5 tail calls/packet
+- Theoretical ceiling: ~5M rules before compile time and hash map cache pressure become concerns
+
+#### Map Capacity (scaled for 1M+)
+
+| Map | Entries | Value Size | Total Memory |
+|-----|---------|-----------|-------------|
+| `TREE_NODES` | 5,000,000 | 16B | ~80 MB |
+| `TREE_EDGES` | 5,000,000 | 12B (+hash) | ~300 MB |
+| `TREE_RATE_STATE` | 2,000,000 | 16B (+hash) | ~150 MB |
+| `TREE_DFS_STATE` | 1 × nCPU | 164B | ~2 KB |
+| **Total** | | | **~530 MB** |
 
 ### p0f-Level Field Detection (February 12, 2026)
 
@@ -416,6 +501,9 @@ An unintentional stress test occurred when a rate-limiting bug caused the genera
 | Feb 11 | Vector-derived rate limiting, token bucket in eBPF, Walkable trait |
 | Feb 12 | **Tree Rete engine** — decision tree, blue/green flip, s-expressions |
 | Feb 12 | **p0f-level fields** — TCP flags, TTL, DF bit, TCP window in sampling, encoding, and rule compilation. Multi-attack-type detection (UDP amplification + TCP SYN flood) with 6-constraint compound rules |
+| Feb 12 | **Extended rule language** — ranges, OR, negation, bitmask, byte-at-offset design. 50K rule stress test. DAG compiler with structural deduplication and memoization |
+| Feb 13 | **BPF tail-call DFS** — stack-based trie traversal via `tree_walk_step` self-tail-call. Per-CPU `DfsState` for cross-call state. Explores all matching paths (specific + wildcard), picks highest priority |
+| Feb 13 | **1,000,000 rules** — 2M nodes, 3.8s compile, ~5 tail calls/packet, 3.9M drops. Maps scaled to 5M nodes / 5M edges. Proved per-packet cost is independent of rule count |
 
 ## Future Work
 
@@ -430,6 +518,10 @@ An unintentional stress test occurred when a rate-limiting bug caused the genera
 - [x] **p0f field integration** — TCP flags, TTL, DF bit, TCP window in PacketSample, Walkable encoding, concentration analysis, and rule compilation
 - [x] **Multi-attack-type detection** — Distinct fingerprints for UDP amplification (TTL=255, DF=0) and TCP SYN flood (flags=2, window=65535, TTL=128)
 - [x] **TCP SYN packet generation** — `craft_tcp_syn_packet` + `syn_flood` phase type in scenarios
+- [x] **BPF tail-call DFS architecture** — Stack-based DFS trie traversal via self-tail-calling `tree_walk_step`, per-CPU `DfsState`, explores all matching paths
+- [x] **1,000,000 rule scale** — Proven with live traffic: 2M nodes, 3.8s compile, ~5 tail calls/packet, full detection and mitigation
+- [x] **DAG compiler with memoization** — Structural deduplication, content-hash sharing, `Rc<ShadowNode>` for memory efficiency
+- [x] **Extended rule language design** — Ranges, OR, negation, bitmask, byte-at-offset (extensibility proven, implementation deferred)
 
 ### Short Term
 - [ ] Make rule TTL configurable via CLI
