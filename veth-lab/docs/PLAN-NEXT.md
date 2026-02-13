@@ -498,3 +498,434 @@ prefix sets. Bloom filters are the escape hatch for extreme scale.
 9. Bloom filters (if needed)
 
 Each batch should be a commit or small PR. Tests first for each feature.
+
+---
+
+## 7. Metrics Collection and Emission
+
+### Problem
+
+We have counters scattered across BPF maps (STATS, TREE_COUNTERS, rate limiter
+state) but no systematic way to collect, aggregate, and export them. The sidecar
+currently reads stats inline during the detection loop, but there's no dedicated
+metrics pipeline.
+
+### Design: Async Reactor Loop
+
+A dedicated async task in the sidecar that periodically:
+
+1. **Drains counters** from BPF maps (STATS, TREE_COUNTERS, rate state)
+2. **Aggregates** per-CPU values into totals
+3. **Computes deltas** (rate of change since last collection)
+4. **Emits** to one or more sinks (log, file, socket, prometheus endpoint)
+
+```rust
+// Runs alongside the detection loop
+async fn metrics_reactor(filter: Arc<VethFilter>, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    let mut prev_stats = FilterStats::default();
+
+    loop {
+        ticker.tick().await;
+
+        let stats = filter.stats().await?;
+        let counters = filter.read_counters().await?;  // TREE_COUNTERS
+        let rate_states = filter.read_rate_states().await?;  // TREE_RATE_STATE
+
+        let delta = stats.delta(&prev_stats);
+        prev_stats = stats.clone();
+
+        // Emit to configured sinks
+        emit_metrics(&delta, &counters, &rate_states).await;
+    }
+}
+```
+
+**Collection interval:** 1–5 seconds. Independent of detection window cadence.
+
+### Emission Sinks (Pick One to Start)
+
+| Sink | Complexity | Integration |
+|---|---|---|
+| **Structured JSON log file** | Low | grep/jq friendly |
+| **Unix socket (line protocol)** | Low | Telegraf/Vector compatible |
+| **Prometheus `/metrics` endpoint** | Medium | Industry standard |
+| **StatsD UDP** | Low | Broad ecosystem |
+
+**Recommendation:** Start with structured JSON log (one line per collection).
+Add Prometheus endpoint later — it's the most useful but requires an HTTP
+server dependency.
+
+### Counter Draining
+
+The `TREE_COUNTERS` map should be **read-and-reset** — atomically read the
+value and set it to 0. This prevents counter overflow and gives clean deltas.
+BPF has no atomic read-and-reset, but we can:
+
+1. Read the value
+2. Delete the key (or write 0)
+3. Accept a small race window (packets between read and reset are lost from
+   this collection cycle, counted in the next)
+
+For high-fidelity: use a per-CPU counter map and sum across CPUs in userspace
+(same as STATS today). Per-CPU maps avoid cross-CPU contention entirely.
+
+---
+
+## 8. Compound Naming (Namespaces)
+
+### Problem
+
+As the system grows multi-tenant or multi-concern, flat names like
+`"syn-flood"` will collide. We need namespaced identifiers.
+
+### Design: Compound Keys
+
+Names become tuples: `[namespace, name]`.
+
+```clojure
+;; Tenant-scoped rate limiter
+((and (= proto 6) (= tcp-flags 2) (= dst-addr 10.0.0.1))
+ =>
+ {:action (rate-limit 500 :name ["tenant-1" "syn-limit"])
+  :priority 200})
+
+;; Tenant-scoped counter
+((and (= proto 17) (= src-port 53))
+ =>
+ {:action (count :name ["tenant-1" "dns-responses"])})
+```
+
+### Implementation
+
+**Userspace:** The name is a `Vec<String>` or `(String, String)`. The hash
+for the BPF map key is computed from the concatenation:
+
+```rust
+fn compound_key(namespace: &str, name: &str) -> u32 {
+    let mut hasher = DefaultHasher::new();
+    namespace.hash(&mut hasher);
+    name.hash(&mut hasher);
+    (hasher.finish() & 0xFFFFFFFF) as u32
+}
+```
+
+**eBPF side:** No change. The map key is still a u32. The compound-ness is
+a userspace abstraction over the hash.
+
+**JSON format:**
+
+```json
+{
+  "actions": [
+    {"type": "rate-limit", "pps": 500, "name": ["tenant-1", "syn-limit"]}
+  ]
+}
+```
+
+**Backward compat:** A plain string `"syn-limit"` is treated as `["", "syn-limit"]`
+(empty namespace).
+
+### Metrics Integration
+
+The metrics reactor uses compound names for grouping:
+
+```json
+{"ts": "2026-02-13T...", "namespace": "tenant-1", "counter": "dns-responses", "value": 4281, "delta": 127}
+{"ts": "2026-02-13T...", "namespace": "tenant-1", "limiter": "syn-limit", "tokens": 342, "drops": 18}
+```
+
+This naturally supports per-tenant dashboards and alerting.
+
+---
+
+## 9. Dynamic Prefix Lists (Lazy Accumulation)
+
+### Problem
+
+Instead of expressing 10K individual `(= src-addr ...)` rules, accumulate
+"bad" source addresses into a prefix list that rules reference by name. The
+list grows lazily as the system detects new offenders, and entries expire
+after a TTL.
+
+### Design
+
+```clojure
+;; Rule references a dynamic prefix list by name
+((in-prefix-list src-addr "bad-sources")
+ =>
+ {:action (rate-limit 100), :priority 200})
+```
+
+The prefix list `"bad-sources"` is populated by the detection engine:
+
+```rust
+// When Holon detects a concentrated src-addr in anomalous traffic:
+prefix_lists.insert("bad-sources", src_addr, ttl: Duration::from_secs(3600));
+```
+
+### Implementation: LPM Trie with TTL
+
+**BPF map:** `BPF_MAP_TYPE_LPM_TRIE` — the kernel's native longest-prefix-match
+structure. Supports CIDR lookups natively.
+
+```rust
+// Key: prefix + address
+struct LpmKey {
+    prefix_len: u32,  // e.g., 32 for /32, 24 for /24
+    addr: u32,        // IP address
+}
+
+static PREFIX_LISTS: HashMap<u32, LpmTrie<LpmKey, u8>> = ...;
+// Outer key: hash of list name
+// Inner: LPM trie of prefixes → action flags
+```
+
+**Actually, BPF doesn't support map-in-map with LPM tries directly.** Simpler
+approach: one LPM trie per list, pre-created at startup:
+
+```rust
+static BAD_SOURCES: LpmTrie<LpmKey, u64> = LpmTrie::with_max_entries(1_000_000, 0);
+// Value: expiry timestamp (or 0 for permanent)
+```
+
+**eBPF lookup:** In `tree_walk_step`, when a node has a prefix-list check:
+
+```rust
+let key = LpmKey { prefix_len: 32, addr: src_ip };
+if let Some(entry) = BAD_SOURCES.get(&key) {
+    if *entry == 0 || *entry > now_ns { /* match */ }
+}
+```
+
+**Userspace management:**
+- Insert: `lpm_trie.insert(LpmKey { prefix_len: 32, addr: ip }, expiry_ts)`
+- Eviction: Periodic sweep deleting entries where `expiry_ts < now`
+- No tree recompilation needed — the prefix list is checked at runtime
+
+**This is powerful.** The tree says "check prefix list X for src-addr" and the
+prefix list is managed independently. Adding 10K IPs to the list is 10K map
+updates, not a tree recompile. Entries auto-expire.
+
+### Interaction with Holon
+
+When Holon detects anomalous traffic concentrated on a source address:
+1. Instead of (or in addition to) generating a tree rule, insert the source
+   IP into the `"bad-sources"` prefix list with a 1-hour TTL
+2. A single tree rule `(in-prefix-list src-addr "bad-sources")` handles all
+   current and future entries
+3. As IPs expire, they stop matching without any tree recompilation
+
+This is the **separation of policy (tree rule) from data (prefix list).**
+
+---
+
+## 10. Negation Syntax
+
+### Clojure Precedent
+
+In Clojure:
+- `(not (= x y))` — composable, wraps any predicate
+- `(not= x y)` — shorthand, common but only for equality
+
+For a rule language where `not` should wrap ANY predicate (not just `=`), the
+composable form is better:
+
+```clojure
+;; Negate equality
+(not (= dst-port 9999))
+
+;; Negate set membership (future)
+(not (in src-port 53 123))
+
+;; Negate range (future)
+(not (> ttl 200))
+```
+
+`(not ...)` is the Clojure way. It's a higher-order form that wraps any
+predicate. This is more composable than dedicated `!=`, `not-in`, etc.
+
+### The SYN Counter Example
+
+```clojure
+;; Count SYN packets that AREN'T hitting the game server
+((and (= proto 6)
+      (= tcp-flags 2)
+      (not (= dst-port 9999)))
+ =>
+ {:action (count :name ["monitoring" "non-game-syns"])})
+
+;; Rate-limit SYNs TO the game server
+((and (= proto 6)
+      (= tcp-flags 2)
+      (= dst-port 9999))
+ =>
+ {:action (rate-limit 100 :name ["game" "syn-limit"])
+  :priority 200})
+```
+
+### Compilation Strategy for Negation
+
+For `(not (= dst-port 9999))`:
+
+**In the tree:** The rule needs to match when `dst-port != 9999`. At the
+dst-port dimension in the tree:
+
+1. The rule lives in the **wildcard branch** (matches any dst-port value)
+2. But has an **exclusion**: if `dst-port == 9999`, skip this rule
+
+Implementation: add an `exclusions: Vec<u32>` to the compiler's intermediate
+representation. During flattening, a node with exclusions becomes a node that
+the DFS visits via wildcard but skips if the field value matches an exclusion.
+
+**eBPF impact:** Add an `exclude_value: u32` field to `TreeNode` (0 = no
+exclusion). In `tree_walk_step`:
+
+```rust
+if node.exclude_value != 0 && fields[node.dimension] == node.exclude_value {
+    // Skip this node — negation excludes it
+    continue;  // don't push children, don't check action
+}
+```
+
+One comparison per node. Minimal verifier impact. Supports single-value
+negation. Multi-value negation (`(not (in ...))`) would need an exclusion
+set, but single-value covers 90% of use cases.
+
+---
+
+## 11. HyperLogLog for Cardinality Estimation
+
+### What You're Thinking Of
+
+A **HyperLogLog (HLL)** estimates the number of **distinct** elements in a
+stream. "How many unique source IPs are hitting port 443?" — HLL answers this
+in ~1.2KB of memory with ~2% error, regardless of whether the answer is 50
+or 50 million.
+
+This isn't an anti-bloom filter (that would be a cuckoo filter or counting
+bloom filter). HLL is specifically for **cardinality estimation** — counting
+unique things without storing them.
+
+### Why This Matters for DDoS
+
+| Signal | What HLL Tells You |
+|---|---|
+| Source IP cardinality spike | Botnet activation (50 → 50,000 unique sources) |
+| Destination port cardinality | Port scan detection |
+| Low source cardinality + high PPS | Amplification attack (few sources, huge volume) |
+| Source port cardinality | Randomized vs fixed source ports |
+
+Holon already detects drift, but HLL gives a **specific, interpretable metric**:
+"unique source count jumped 1000x." This feeds directly into rule generation.
+
+### Implementation
+
+**BPF doesn't have a native HLL map type.** But HLL is simple enough to
+implement in a BPF array:
+
+```rust
+// HLL with 256 registers (m=256), ~5% error, 256 bytes
+static HLL_SRC_IP: Array<u8> = Array::with_max_entries(256, 0);
+
+fn hll_observe(value: u32) {
+    let hash = bpf_hash(value);
+    let register = (hash & 0xFF) as u32;       // first 8 bits → register index
+    let remaining = hash >> 8;                   // remaining bits
+    let leading_zeros = remaining.leading_zeros() + 1;  // ρ(remaining)
+
+    if let Some(current) = HLL_SRC_IP.get_ptr_mut(register) {
+        let cur = unsafe { *current };
+        if leading_zeros as u8 > cur {
+            unsafe { *current = leading_zeros as u8; }
+        }
+    }
+}
+```
+
+**Userspace reads the 256 registers and computes the estimate:**
+
+```rust
+fn hll_count(registers: &[u8; 256]) -> f64 {
+    let m = 256.0;
+    let alpha = 0.7213 / (1.0 + 1.079 / m);  // bias correction
+    let sum: f64 = registers.iter().map(|&r| 2.0_f64.powi(-(r as i32))).sum();
+    let estimate = alpha * m * m / sum;
+    // Small/large range corrections omitted for brevity
+    estimate
+}
+```
+
+**256 bytes per HLL counter.** We could have dozens of them:
+- `HLL_SRC_IP` — unique source IPs
+- `HLL_DST_PORT` — unique destination ports
+- `HLL_SRC_PORT` — unique source ports
+- Per-prefix HLLs (unique sources hitting a specific destination)
+
+**Integration with metrics reactor:**
+The metrics loop reads HLL registers every N seconds, computes cardinality
+estimates, and emits them. Cardinality changes between cycles are a powerful
+anomaly signal that complements Holon's drift detection.
+
+**Integration with rules:**
+HLL cardinality could feed into rule generation heuristics:
+
+```
+if hll_src_ip_cardinality > 10_000 && drift > 0.7 {
+    // Botnet detected — generate broad rate-limit rule
+}
+if hll_src_ip_cardinality < 5 && pps > 100_000 {
+    // Amplification — generate per-source drop rules
+}
+```
+
+**Reset:** HLLs need periodic reset (or decay) to track *recent* cardinality.
+The metrics reactor can zero the registers at configurable intervals.
+
+### BPF Verifier Feasibility
+
+The `hll_observe` function is ~10 instructions: one hash, one AND, one
+shift, one leading_zeros (CLZ instruction), one array lookup, one compare,
+one conditional store. Trivially verified. Can run in `veth_filter` alongside
+sampling, before the tail call.
+
+---
+
+## Updated Priority Table
+
+| Feature | Complexity | eBPF Changes | Value |
+|---|---|---|---|
+| RHS syntax redesign | Low | None | High |
+| Named rate limiters | Low | None | High |
+| Compound naming | Low | None | Medium |
+| Count action | Medium | New map + action type | Medium |
+| Metrics reactor | Medium | Read-only (new reads) | High |
+| `In` predicate | Low | None (compiler only) | High |
+| Negation (`not`) | Medium | Exclusion field on TreeNode | Medium |
+| Range predicates | Medium | Node annotation or expansion | Medium |
+| Bitmask predicate | Medium | Node annotation | Medium |
+| Dynamic prefix lists (LPM) | High | New map type + predicate | High |
+| HyperLogLog | Medium | Small array + observe fn | High |
+| Bloom filters | Medium | New map type | Low (niche) |
+
+### Updated Implementation Order
+
+**Batch 1 — Foundation (no eBPF changes):**
+1. RHS syntax redesign (struct changes, formatting, JSON parsing)
+2. Named rate limiters + compound naming
+3. `In` predicate (compiler-only, multi-edge to shared child)
+
+**Batch 2 — eBPF observability:**
+4. Count action (new map, new action type in walker)
+5. HyperLogLog (per-field cardinality in veth_filter)
+6. Metrics reactor (async collection + emission loop)
+
+**Batch 3 — eBPF predicates:**
+7. Negation (exclusion field on TreeNode)
+8. Range predicates (start with expansion, then node annotation)
+9. Bitmask predicate (node annotation)
+
+**Batch 4 — Scale features:**
+10. Dynamic prefix lists (LPM tries with TTL)
+11. Cross-field OR (compiler rule duplication)
+12. Bloom filters (if needed)
