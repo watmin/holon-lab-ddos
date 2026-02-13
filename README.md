@@ -3,143 +3,72 @@
 [![Powered by Holon-rs](https://img.shields.io/badge/Powered%20by-Holon--rs-blue)](https://github.com/watmin/holon-rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-XDP/eBPF-based DDoS detection and mitigation powered by [Holon-rs](https://github.com/watmin/holon-rs) — a Rust implementation of Vector Symbolic Architecture (VSA/HDC).
+Autonomous DDoS detection and mitigation at kernel level, powered by [Holon-rs](https://github.com/watmin/holon-rs) (Vector Symbolic Architecture / Hyperdimensional Computing) and an eBPF tree Rete engine.
 
-This lab demonstrates real-time anomaly detection at kernel level: **1.3M PPS handled with 99.5% drop rate and 52ms detection latency**.
+**No signatures. No thresholds to configure. No domain knowledge hardcoded.** Holon learns what normal traffic looks like, detects when it changes, figures out what changed, and writes filter rules — all autonomously.
 
-## Status
+## Key Results (Feb 2026)
 
-**Stress-tested (Feb 2026):**
-- ✅ **1.3M PPS** attack traffic handled without degradation
-- ✅ **52ms** detection latency (attack start → rule insertion)
-- ✅ **99.5%** drop rate during attacks
-- ✅ **Zero false positives** after attack ends (baseline freezing)
-- ✅ **100% rate accuracy** for traffic generation (1k-200k PPS)
-
-**Components:**
-- XDP/eBPF filter in Rust using [aya](https://aya-rs.dev/)
-- [Holon-rs](https://github.com/watmin/holon-rs) for VSA-based anomaly detection
-- Configurable packet sampling (1:N)
-- Dynamic rule injection from userspace
-- Scenario-based traffic generation with per-phase PPS control
-
-**Veth Lab** (`veth-lab/`): Reproducible local testing using network namespaces - no special hardware required.
-
-**Limitations:**
-- Macvlan interfaces don't support AF_XDP (veth lab uses veth pairs instead)
-- Currently DROP-only rules (rate limiting planned)
+- **1,000,000 rules** compiled into a decision tree and enforced at line rate
+- **~5 BPF tail calls per packet** regardless of rule count (O(depth), not O(rules))
+- **Zero-config detection** — anomaly detection and rule derivation from vector algebra alone
+- **Atomic rule updates** — blue/green tree deployment with zero-downtime flips
+- **Sub-second detection** — anomaly flagged within one 2-second window of attack onset
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Host                                                           │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ Packet Generator (test_sendmmsg)                        │   │
-│  │ AF_PACKET + sendmmsg() batching                         │   │
-│  │ ~45k pps, 100x fewer syscalls than sendto()             │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                    │                                            │
-│                    ▼                                            │
-│              macv1 (host macvlan)                               │
-│                    │                                            │
-│                    ▼ (hairpin via macvlan driver)               │
-│              eth1 (container macvlan)                           │
-│                    │                                            │
-│  ┌─────────────────┴───────────────────────────────────────┐   │
-│  │ XDP Filter (xdp-filter-ebpf)                            │   │
-│  │ - Classifies packets by source IP                       │   │
-│  │ - 10.0.0.0/8 = attack traffic                           │   │
-│  │ - Samples packets to perf buffer (256 bytes each)       │   │
-│  │ - Detect mode: count & pass | Enforce mode: drop        │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                    │                                            │
-│                    ▼                                            │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ Userspace (pcap_capture / test_xdp)                     │   │
-│  │ - Reads samples from perf buffer                        │   │
-│  │ - Writes pcap files for analysis                        │   │
-│  │ - Future: VSA/HDC classification pipeline               │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                    │                                            │
-│                    ▼                                            │
-│              Nginx container (192.168.1.200)                    │
-└─────────────────────────────────────────────────────────────────┘
+Packets ──► XDP (veth_filter) ──► BPF Tail-Call DFS ──► DROP / RATE-LIMIT / PASS
+                │                     │
+                │ perf sample         │ reads TREE_NODES, TREE_EDGES
+                ▼                     │
+            Sidecar                   │
+            ├─ Holon-rs encode        │
+            ├─ Drift detection        │
+            ├─ Pattern attribution    │
+            ├─ Rule generation        │
+            ├─ DAG compiler ──────────┘
+            └─ Blue/green flip         (atomic TREE_ROOT swap)
 ```
 
-## Build
+The eBPF program evaluates a million-rule decision tree via depth-first search using BPF tail calls. Each tail call processes one DFS step (~4K instructions, trivially verified). The userspace sidecar uses Holon's VSA/HDC to detect anomalies and compile new rules into the tree without stopping packet processing.
+
+## Veth Lab
+
+**[`veth-lab/`](veth-lab/)** — the primary development and testing environment. Reproducible local testing using veth pairs and network namespaces. No special hardware required.
 
 ```bash
-# Build eBPF program (requires nightly Rust)
-CARGO_CFG_BPF_TARGET_ARCH=x86_64 cargo build -p xdp-filter-ebpf \
-  --target bpfel-unknown-none -Z build-std=core --release
-
-# Build userspace tools
-cargo build --release -p xdp-filter -p xdp-generator
+cd veth-lab
+./scripts/build.sh
+sudo ./scripts/setup.sh
+sudo ./target/release/veth-sidecar --interface veth-filter --enforce --rate-limit
 ```
 
-## Usage
+See the [Veth Lab README](veth-lab/README.md) for full setup and usage instructions.
 
-### Packet Capture (for analysis)
+## Documentation
 
-```bash
-# Get nginx container PID
-NGINX_PID=$(docker inspect -f '{{.State.Pid}}' wordpress_nginx)
+The `veth-lab/docs/` directory contains comprehensive documentation:
 
-# Run pcap capture inside container's network namespace
-# Sample rate: 1 = every packet, 100 = 1 in 100
-sudo nsenter -t $NGINX_PID -n ./target/release/pcap_capture eth1 /tmp/capture.pcap 1
-
-# View captured packets
-tcpdump -r /tmp/capture.pcap -n | head -20
-```
-
-### Attack Simulation
-
-```bash
-# Generate SYN flood with spoofed 10.x.x.x sources
-# Args: interface, target_ip, packets_per_second
-sudo ./target/release/test_sendmmsg macv1 192.168.1.200 50000
-```
-
-### XDP Filter Stats
-
-```bash
-# Monitor filter statistics (detect or enforce mode)
-sudo nsenter -t $NGINX_PID -n ./target/release/test_xdp eth1 detect
-
-# Switch to enforce mode (actually drop attack packets)
-sudo nsenter -t $NGINX_PID -n ./target/release/test_xdp eth1 enforce
-```
-
-## Test Results
-
-**Attack Traffic (10s test):**
-- 456k packets generated at ~45k pps
-- 380k+ packets captured and classified as attack
-- XDP filter correctly identified 10.x.x.x sources
-
-**Legitimate Traffic:**
-- WordPress traffic generator requests captured
-- Full TCP handshakes and HTTP/TLS flows visible
-- 0% false positive attack classification
+| Document | Description |
+|---|---|
+| [PROGRESS.md](veth-lab/docs/PROGRESS.md) | Timeline, architecture overview, test results |
+| [RETE.md](veth-lab/docs/RETE.md) | How we implement Rete in spirit (Clara comparison) |
+| [VSA.md](veth-lab/docs/VSA.md) | Holon/HDC theory — encoding, detection, rule derivation |
+| [EBPF.md](veth-lab/docs/EBPF.md) | The eBPF engineering story — 6 chapters of verifier battles |
+| [DECISIONS.md](veth-lab/docs/DECISIONS.md) | 10 architecture decision records with rationale |
+| [SCALING.md](veth-lab/docs/SCALING.md) | Performance data from 50K to 1M rules, projections to 5M+ |
+| [RULES.md](veth-lab/docs/RULES.md) | Rule language reference — s-expressions, predicates, extensions |
+| [OPERATIONS.md](veth-lab/docs/OPERATIONS.md) | Build, run, tune, monitor, and debug runbook |
 
 ## Components
 
 | Crate | Description |
-|-------|-------------|
-| `xdp-filter-ebpf` | eBPF/XDP program (runs in kernel) |
-| `xdp-filter` | Userspace loader, stats, pcap capture |
-| `xdp-generator` | Packet generator (sendmmsg + AF_XDP stub) |
-| `control-plane` | HTTP API for management (WIP) |
-
-## Future Improvements
-
-1. **Second NIC** - Enable AF_XDP zero-copy for 10x+ throughput
-2. **VSA/HDC Integration** - Replace simple IP classification with learned embeddings
-3. **Ring buffer** - Use BPF ring buffer instead of perf buffer (newer kernels)
-4. **Native XDP mode** - Requires physical NIC, not macvlan
+|---|---|
+| `veth-lab/filter-ebpf` | XDP eBPF programs — `veth_filter` (entry) + `tree_walk_step` (DFS) |
+| `veth-lab/filter` | Userspace library — DAG compiler, tree flattener, blue/green deployment |
+| `veth-lab/sidecar` | Holon detection engine — anomaly detection, rule generation, CLI |
+| `veth-lab/generator` | Traffic generator — normal + multi-phase attack traffic |
 
 ## Dependencies
 
@@ -148,45 +77,12 @@ sudo nsenter -t $NGINX_PID -n ./target/release/test_xdp eth1 enforce
 rustup install nightly
 cargo install bpf-linker
 
-# Linux headers
+# Linux headers and tools
 sudo apt install linux-headers-$(uname -r) clang llvm libelf-dev
+sudo apt install linux-tools-common linux-tools-$(uname -r)  # bpftool
 ```
-
-## Pinned Versions
-
-Due to aya-ebpf toolchain issues, specific versions are pinned in `xdp-filter-ebpf/Cargo.toml`:
-- `aya-ebpf = "=0.1.0"`
-- `aya-ebpf-bindings = "=0.1.0"`  
-- `aya-ebpf-cty = "=0.2.1"`
-
-## Holon Integration
-
-This lab integrates [holon-rs](https://github.com/watmin/holon-rs) for VSA/HDC-based packet classification:
-
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  XDP Filter     │────▶│  Perf Buffer    │────▶│  Holon-rs       │
-│  (kernel)       │     │  (sampled pkts) │     │  (VSA encoding) │
-└─────────────────┘     └─────────────────┘     └────────┬────────┘
-        ▲                                                │
-        │                                                ▼
-        │                                       ┌─────────────────┐
-        └───────────────────────────────────────│  Anomaly Detect │
-                   Dynamic rule injection       │  (drift + conc) │
-                                                └─────────────────┘
-```
-
-**Key concept:** Instead of hard-coded rules, Holon learns traffic patterns:
-- Encode packet headers as hypervectors (src_ip, dst_port, protocol, etc.)
-- Build baseline accumulator during warmup, then freeze
-- Detect anomalies via accumulator drift (current vs baseline similarity)
-- Identify attack vectors via field concentration analysis
-- Inject DROP rules dynamically into XDP
-
-**Results:** 100% attack recall with zero domain knowledge hardcoded.
 
 ## See Also
 
-- [holon-rs](https://github.com/watmin/holon-rs) — Rust VSA library (12x faster than Python)
+- [holon-rs](https://github.com/watmin/holon-rs) — Rust VSA/HDC library
 - [holon](https://github.com/watmin/holon) — Python reference implementation with extensive documentation
-- [veth-lab/docs/PROGRESS.md](veth-lab/docs/PROGRESS.md) — Detailed stress test results and architecture

@@ -1,6 +1,6 @@
-# Veth Lab - AF_XDP + Holon Sidecar
+# Veth Lab
 
-Local development environment for XDP packet filtering with Holon-based detection.
+Local development and testing environment for the Holon-powered eBPF DDoS mitigation system. Uses veth pairs and network namespaces — no special hardware required.
 
 ## Architecture
 
@@ -9,21 +9,28 @@ Local development environment for XDP packet filtering with Holon-based detectio
 │  netns: veth-lab-gen     │              │  Host (default netns)             │
 │                          │              │                                    │
 │  ┌────────────────────┐  │              │  ┌──────────────────────────────┐ │
-│  │ Generator          │  │              │  │ XDP Filter (native)          │ │
-│  │ - AF_PACKET/AF_XDP │  │              │  │ - RULES map (drop rules)     │ │
-│  │ - Spoofed sources  │  │    veth      │  │ - STATS map (counters)       │ │
-│  │ - Attack patterns  │  │◄────────────►│  │ - Ring buffer (samples)      │ │
-│  └────────────────────┘  │    pair      │  └──────────────────────────────┘ │
-│                          │              │                 │                  │
-│  veth-gen: 10.100.0.1/24 │              │  veth-filter: 10.100.0.2/24      │
-│                          │              │                 │                  │
-└──────────────────────────┘              │                 ▼                  │
+│  │ Generator          │  │              │  │ veth_filter (XDP entry)      │ │
+│  │ - Normal traffic   │  │              │  │ - Parse + extract fields     │ │
+│  │ - UDP amplification│  │    veth      │  │ - Sample to perf buffer     │ │
+│  │ - TCP SYN flood    │  │◄────────────►│  │ - Init DFS, tail call ──┐   │ │
+│  └────────────────────┘  │    pair      │  │                         │   │ │
+│                          │              │  │ tree_walk_step (DFS)  ◄──┘   │ │
+│  veth-gen                │              │  │ - Pop stack, check node     │ │
+│                          │              │  │ - Push wildcard + specific  │ │
+│                          │              │  │ - Tail call self            │ │
+└──────────────────────────┘              │  │ - Apply: DROP/RATE/PASS    │ │
+                                          │  └──────────────────────────────┘ │
+                                          │                 │                  │
+                                          │  veth-filter    │ perf samples    │
+                                          │                 ▼                  │
                                           │  ┌──────────────────────────────┐ │
                                           │  │ Sidecar                      │ │
-                                          │  │ - Reads ring buffer samples  │ │
-                                          │  │ - Holon-rs encoding          │ │
-                                          │  │ - Anomaly detection          │ │
-                                          │  │ - Updates RULES map          │ │
+                                          │  │ - Holon-rs VSA encoding     │ │
+                                          │  │ - Anomaly detection (drift) │ │
+                                          │  │ - Pattern attribution       │ │
+                                          │  │ - Rule generation (s-expr)  │ │
+                                          │  │ - DAG compiler              │ │
+                                          │  │ - Blue/green tree flip      │ │
                                           │  └──────────────────────────────┘ │
                                           └───────────────────────────────────┘
 ```
@@ -31,68 +38,106 @@ Local development environment for XDP packet filtering with Holon-based detectio
 ## Quick Start
 
 ```bash
-# 1. Setup veth pair + namespace (requires sudo)
-sudo ./scripts/setup.sh
-
-# 2. Build everything
+# 1. Build everything (eBPF + userspace)
 ./scripts/build.sh
 
-# 3. Run the demo
-sudo ./scripts/demo.sh
+# 2. Setup veth pair + namespace
+sudo ./scripts/setup.sh
 
-# 4. Cleanup when done
+# 3. Run with enforcement and rate limiting
+sudo ./target/release/veth-sidecar \
+    --interface veth-filter \
+    --enforce \
+    --rate-limit \
+    --warmup-windows 10 \
+    --warmup-packets 1000 \
+    --sample-rate 100
+
+# 4. (Separate terminal) Generate traffic
+sudo ./target/release/veth-generator --interface veth-inside
+
+# 5. Cleanup when done
 sudo ./scripts/teardown.sh
+```
+
+### With Pre-Loaded Rules (Stress Test)
+
+```bash
+# Generate 1M rules
+python3 scripts/generate_ruleset.py --count 1000000 --output scenarios/rules-1m.json
+
+# Run with pre-loaded rules
+sudo ./target/release/veth-sidecar \
+    --interface veth-filter \
+    --enforce \
+    --rate-limit \
+    --rules-file scenarios/rules-1m.json \
+    --warmup-windows 15 \
+    --warmup-packets 1500 \
+    --sample-rate 100
 ```
 
 ## Components
 
 | Component | Description |
-|-----------|-------------|
-| `scripts/` | Setup, teardown, and orchestration scripts |
-| `filter-ebpf/` | XDP eBPF program with dynamic rules |
-| `filter/` | Userspace loader and rule management |
-| `generator/` | Traffic generator (AF_PACKET, AF_XDP) |
-| `sidecar/` | Holon detection and rule updates |
+|---|---|
+| `filter-ebpf/` | XDP eBPF programs — `veth_filter` (entry point) + `tree_walk_step` (DFS walker) |
+| `filter/` | Userspace library — `VethFilter`, DAG compiler, tree flattener, blue/green deployment |
+| `sidecar/` | Detection engine — Holon analysis, rule generation, JSON parsing, CLI |
+| `generator/` | Traffic generator — normal traffic + multi-phase attacks (UDP amp, SYN flood) |
+| `scripts/` | Build, setup, teardown, demo, rule generation |
 
-## Network Setup
+## How It Works
 
-- **veth-gen** (10.100.0.1/24): Generator side, in `veth-lab-gen` namespace
-- **veth-filter** (10.100.0.2/24): Filter side, in host namespace
+1. **eBPF parses packets** and samples 1-in-N to userspace via perf buffer
+2. **Holon encodes samples** as 4096-dimensional hypervectors using VSA binding and bundling
+3. **Drift detection** compares the current window's accumulator against the frozen baseline
+4. **Pattern attribution** identifies which fields (proto, src-ip, dst-port, etc.) are concentrated in anomalous traffic
+5. **Rules are generated** as s-expressions: `((and (= proto 17) (= src-port 53)) => (rate-limit 1906))`
+6. **DAG compiler** builds a decision tree with memoization and structural sharing (`Rc<ShadowNode>`)
+7. **Blue/green flip** writes the new tree to the inactive slot and atomically swaps `TREE_ROOT`
+8. **BPF tail-call DFS** walks the tree — ~5 tail calls per packet, regardless of rule count
 
-The veth pair acts like a virtual cable. Packets sent on veth-gen appear on veth-filter.
+## Rule Language
 
-## Rule Format
+Rules use s-expressions in Clara-style LHS => RHS format with raw numeric values:
 
-Rules are stored in a BPF HashMap with this structure:
-
-```rust
-// Key: what to match
-struct RuleKey {
-    rule_type: u8,    // 0=src_ip, 1=dst_ip, 2=src_port, 3=dst_port, 4=protocol
-    _pad: [u8; 3],
-    value: u32,       // IP address or port (in network order)
-}
-
-// Value: what to do
-struct RuleValue {
-    action: u8,       // 0=pass, 1=drop, 2=rate_limit
-    _pad: [u8; 3],
-    rate_pps: u32,    // For rate_limit action
-    tokens: u32,      // Token bucket state
-    last_update: u64, // Timestamp for token refill
-}
 ```
+((and (= proto 17)
+      (= src-port 53)
+      (= src-addr 10.0.0.200))
+ =>
+ (rate-limit 1906))
+```
+
+Fields: `proto`, `src-addr`, `dst-addr`, `src-port`, `dst-port`, `tcp-flags`, `ttl`, `df`, `tcp-window`
+
+See [docs/RULES.md](docs/RULES.md) for the complete language reference.
+
+## Documentation
+
+| Document | Description |
+|---|---|
+| [PROGRESS.md](docs/PROGRESS.md) | Timeline, results, architecture overview |
+| [RETE.md](docs/RETE.md) | Rete theory — how this implements a discrimination network |
+| [VSA.md](docs/VSA.md) | Holon/HDC theory — encoding, detection, rule derivation |
+| [EBPF.md](docs/EBPF.md) | eBPF engineering — 6 chapters of verifier battles |
+| [DECISIONS.md](docs/DECISIONS.md) | 10 architecture decision records |
+| [SCALING.md](docs/SCALING.md) | Performance from 50K to 1M rules, projections to 5M+ |
+| [RULES.md](docs/RULES.md) | Rule language reference and extension roadmap |
+| [OPERATIONS.md](docs/OPERATIONS.md) | Build, run, tune, monitor, debug runbook |
 
 ## Safety
 
-This lab uses network namespaces to isolate traffic. Your laptop's networking is not affected:
-- veth-gen is in a separate namespace
-- veth-filter is attached to host but only receives traffic from veth-gen
-- No routing changes are made to your default routes
+This lab uses network namespaces to isolate traffic. Your host networking is not affected:
+- Traffic generator runs in a separate namespace
+- veth-filter only receives traffic from the veth pair
+- No routing changes are made to default routes
 
 ## Requirements
 
-- Linux kernel 5.4+ (for ring buffer, AF_XDP improvements)
-- Rust nightly (for eBPF)
-- bpf-linker
-- Root access (for XDP attachment)
+- Linux kernel 5.15+ (BPF tail calls, BTF)
+- Rust nightly (for eBPF compilation)
+- `bpf-linker` (`cargo install bpf-linker`)
+- Root access (XDP requires `CAP_NET_ADMIN`)
+- Optional: `bpftool` for debugging (`sudo apt install linux-tools-common`)
