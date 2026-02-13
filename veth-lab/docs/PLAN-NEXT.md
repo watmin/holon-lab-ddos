@@ -891,11 +891,265 @@ sampling, before the tail call.
 
 ---
 
+## 12. EDN as the Rule Language
+
+### Why EDN Over JSON
+
+[EDN (Extensible Data Notation)](https://github.com/edn-format/edn) is
+Clojure's data format. JSON is a subset of what EDN can express, but EDN
+adds:
+
+| Feature | JSON | EDN |
+|---|---|---|
+| Keywords | No | `:action`, `:priority` |
+| Sets | No (`[]` only) | `#{53 123 5353}` |
+| Symbols | No | `rate-limit`, `drop` |
+| Tagged literals | No | `#inst "2026-..."`, `#cidr "10.0.0.0/8"` |
+| Comments | No | `; this is a comment` |
+| Commas optional | Required | Whitespace-separated |
+
+Sets are a native EDN type — perfect for `(in src-port #{53 123 5353})`.
+Tagged literals let us define `#cidr "10.0.0.0/8"` as a first-class value.
+Keywords make the RHS map natural: `{:action (drop) :priority 200}`.
+
+### What Rules Look Like in EDN
+
+```clojure
+;; Current JSON (verbose, no comments)
+[{"constraints": [{"field": "proto", "value": 17}], "action": "drop"}]
+
+;; EDN equivalent (native, composable)
+[{:constraints [(= proto 17)]
+  :action      (drop)}]
+
+;; Full rule with all features
+{:constraints [(= proto 6)
+               (= tcp-flags 2)
+               (not (= dst-port 9999))]
+ :actions     [(rate-limit 500 :name ["game" "syn-limit"])
+               (count :name ["monitoring" "non-game-syns"])]
+ :priority    200}
+
+;; Prefix set reference with tagged literal
+{:constraints [(in-prefix-list src-addr "bad-sources")
+               (= proto 17)]
+ :actions     [(rate-limit 100)]
+ :priority    150}
+
+;; Set membership with native EDN set
+{:constraints [(in src-port #{53 123 5353})]
+ :actions     [(rate-limit 300 :name "dns-ntp-amp")]}
+```
+
+### Rust EDN Libraries
+
+Three options exist:
+
+| Crate | Version | Notes |
+|---|---|---|
+| `edn-format` | 3.3.0 | Most mature, good docs, parse/emit |
+| `edn-rs` | 0.18.0 | Serde-like macros (`map!`, `set!`), deser traits |
+| `rsedn` | 0.2.0 | Two-stage lex+parse, lower-level |
+
+**Recommendation:** `edn-rs` for its serde integration — we already use serde
+for JSON parsing. Evaluating `edn-format` as a fallback if `edn-rs` doesn't
+handle our nested s-expression predicates cleanly.
+
+### Migration Path
+
+1. Add `edn-rs` (or `edn-format`) dependency to sidecar
+2. Write an EDN rule parser alongside the existing JSON parser
+3. Auto-detect format: if file starts with `[{` → JSON, if `[{:` or `({` → EDN
+4. Keep JSON support permanently (it's a subset, costs nothing)
+5. Log emitted rules in EDN format (more readable than JSON s-exprs)
+6. Eventually: rules API accepts EDN over the wire
+
+**Files to change:**
+- `sidecar/Cargo.toml` — add `edn-rs` or `edn-format`
+- `sidecar/src/main.rs` — new `parse_rules_edn()` alongside `parse_rules_file()`
+- `filter/src/lib.rs` — `to_edn()` emitter on `RuleSpec`
+
+---
+
+## 13. Blue/Green Prefix Lists
+
+### Question
+
+If prefix lists are loaded from external sources (compute cluster, user API,
+threat intel feed), can we do atomic swaps on them too?
+
+### Answer: Yes, Same Pattern as the Tree
+
+**Double-buffered LPM tries.** Create two LPM trie maps per prefix list:
+
+```rust
+static PREFIX_LIST_A: LpmTrie<LpmKey, PrefixEntry> = LpmTrie::with_max_entries(1_000_000, 0);
+static PREFIX_LIST_B: LpmTrie<LpmKey, PrefixEntry> = LpmTrie::with_max_entries(1_000_000, 0);
+static PREFIX_LIST_ACTIVE: Array<u32> = Array::with_max_entries(1, 0);  // 0 = A, 1 = B
+```
+
+**Swap protocol (same as tree blue/green):**
+
+1. Load new prefix data into the inactive list (B)
+2. Atomic write to `PREFIX_LIST_ACTIVE`: 0 → 1
+3. eBPF reads `PREFIX_LIST_ACTIVE` to choose which trie to query
+4. Old list (A) is now available for the next update
+
+**Alternatively: map-in-map.** BPF supports `BPF_MAP_TYPE_ARRAY_OF_MAPS` and
+`BPF_MAP_TYPE_HASH_OF_MAPS`. Create an outer array map that holds references
+to inner LPM tries. Swap by updating the outer map entry to point to the new
+inner trie. This is cleaner than named A/B maps but more complex to set up
+with aya.
+
+**Recommendation:** Start with the simple A/B pattern (matches what we already
+do for tree nodes). Graduate to map-in-map if we need many independent
+prefix lists (the A/B approach requires 2 maps per list).
+
+### Incremental Updates vs Full Swaps
+
+For prefix lists fed by external sources, two update modes:
+
+**Full swap (blue/green):** Replace the entire list atomically. Best for
+batch updates from threat intel feeds that provide complete lists.
+
+**Incremental updates:** Insert/delete individual entries in the active list.
+Best for real-time feeds (e.g., Holon adding IPs as it detects them). No swap
+needed — individual map updates are atomic at the entry level.
+
+The two modes aren't mutually exclusive. Use incremental for Holon's live
+detections, full swap for periodic bulk loads from external sources.
+
+---
+
+## 14. Prefix Lists: ipset Inspiration
+
+### netfilter ipset Features Worth Emulating
+
+Linux `ipset` is the gold standard for kernel-space IP set management. Key
+features we should study and selectively adopt:
+
+**Timeout/TTL (ipset has this):**
+```bash
+ipset create bad-sources hash:ip timeout 3600  # entries expire after 1 hour
+ipset add bad-sources 10.0.0.200 timeout 600   # this one expires in 10 minutes
+```
+
+Our design already includes TTL on prefix list entries. The `PrefixEntry`
+value in the LPM trie stores an expiry timestamp.
+
+**Counters (ipset has this):**
+```bash
+ipset create tracked hash:ip counters
+# Each entry tracks packets and bytes matched
+```
+
+We should store `{expiry_ts, packet_count, byte_count}` in prefix list
+entries. The eBPF walker atomically increments counters when an entry matches.
+This gives per-IP observability without separate counter rules.
+
+**Comment/metadata (ipset has this):**
+```bash
+ipset add bad-sources 10.0.0.200 comment "detected by holon window 42"
+```
+
+Userspace-only metadata — store in a sidecar HashMap alongside the BPF entry.
+Useful for audit trails ("why is this IP blocked?").
+
+**Set types we should support:**
+
+| ipset Type | Our Equivalent | Implementation |
+|---|---|---|
+| `hash:ip` | LPM trie with /32 prefixes | `BPF_MAP_TYPE_LPM_TRIE` |
+| `hash:net` | LPM trie with variable prefixes | Same, native CIDR support |
+| `hash:ip,port` | Compound key in HashMap | `BPF_MAP_TYPE_HASH` |
+| `hash:net,port` | Two-stage: LPM trie + edge | LPM for net, then tree edge for port |
+| `bitmap:port` | BPF array (65536 entries) | `BPF_MAP_TYPE_ARRAY` — O(1) lookup |
+
+**Eviction strategies beyond TTL:**
+
+| Strategy | ipset | Our Approach |
+|---|---|---|
+| Timeout (TTL) | Native | Store expiry_ts, periodic sweep |
+| LRU | Not native | Touch timestamp on match, evict oldest |
+| Max size | `maxelem` flag | Reject inserts beyond capacity |
+| Forceadd | `forceadd` flag | On full, evict random entry to make room |
+
+**Recommendation:** Implement TTL + max size first. LRU is a nice-to-have
+but requires updating the entry on every match (write amplification in eBPF).
+Forceadd is useful for Holon's live detection where we'd rather evict a stale
+entry than fail to block a new attacker.
+
+### PrefixEntry Struct
+
+```rust
+#[repr(C)]
+struct PrefixEntry {
+    expiry_ns: u64,      // 0 = permanent, else ktime_get_ns() deadline
+    packets: u64,         // atomically incremented on match
+    bytes: u64,           // atomically incremented on match
+    action: u8,           // ACT_DROP, ACT_RATE_LIMIT, etc.
+    flags: u8,            // reserved
+    _pad: [u8; 6],
+}
+```
+
+32 bytes per entry. At 1M entries in an LPM trie, ~32MB. Comfortable.
+
+---
+
+## 15. HyperLogLog: Placement Decision
+
+### Question
+
+Is HLL a firewall feature (eBPF) or a sidecar/Holon feature?
+
+### Answer: Both, Different Roles
+
+**eBPF-side HLL (in `veth_filter`):**
+- Runs on EVERY packet (not just sampled ones)
+- Gives ground-truth cardinality for the full traffic stream
+- 256 bytes per counter, ~10 instructions per observe
+- Best for: real-time cardinality tracking as a first-class XDP metric
+
+**Sidecar-side HLL (in Holon analysis):**
+- Runs on SAMPLED packets only
+- Gives approximate cardinality (subject to sample rate)
+- But can be combined with Holon's vector analysis for richer signals
+- Best for: enriching anomaly detection with cardinality context
+
+**Recommendation: eBPF-side for core metrics, sidecar-side for detection.**
+
+The eBPF program maintains a few HLL counters (src_ip, dst_port, src_port)
+updated on every packet. The metrics reactor reads these and reports exact*
+cardinality. (* ~5% error, but over the full stream, not sampled.)
+
+The sidecar uses the cardinality estimates as additional signals for rule
+generation. "Unique source IPs jumped from 50 to 50,000" is a detection
+trigger, not just a metric.
+
+**What about Holon vectors?**
+
+HLL and Holon vectors answer different questions:
+- **Holon drift:** "Has the traffic distribution changed?" (distributional)
+- **HLL cardinality:** "How many unique values exist?" (counting)
+
+They're complementary. A DDoS with 50K unique IPs attacking one port will
+show high drift AND high source cardinality. An amplification attack from
+3 IPs will show high drift but LOW source cardinality. HLL disambiguates
+attack types that Holon's drift score alone cannot.
+
+HLL doesn't belong in the Holon primitive library itself — it's not a VSA
+operation. It's a separate observability primitive that lives alongside Holon
+in the sidecar's analysis pipeline.
+
+---
+
 ## Updated Priority Table
 
 | Feature | Complexity | eBPF Changes | Value |
 |---|---|---|---|
 | RHS syntax redesign | Low | None | High |
+| EDN rule parser | Low | None | High |
 | Named rate limiters | Low | None | High |
 | Compound naming | Low | None | Medium |
 | Count action | Medium | New map + action type | Medium |
@@ -905,27 +1159,33 @@ sampling, before the tail call.
 | Range predicates | Medium | Node annotation or expansion | Medium |
 | Bitmask predicate | Medium | Node annotation | Medium |
 | Dynamic prefix lists (LPM) | High | New map type + predicate | High |
-| HyperLogLog | Medium | Small array + observe fn | High |
+| Blue/green prefix lists | Medium | Double-buffered LPM tries | Medium |
+| ipset-style counters/TTL | Medium | PrefixEntry struct in LPM | High |
+| HyperLogLog (eBPF) | Medium | Small array + observe fn | High |
+| HyperLogLog (sidecar) | Low | None (reads eBPF HLL) | Medium |
 | Bloom filters | Medium | New map type | Low (niche) |
 
 ### Updated Implementation Order
 
 **Batch 1 — Foundation (no eBPF changes):**
 1. RHS syntax redesign (struct changes, formatting, JSON parsing)
-2. Named rate limiters + compound naming
-3. `In` predicate (compiler-only, multi-edge to shared child)
+2. EDN parser integration (`edn-rs` or `edn-format`)
+3. Named rate limiters + compound naming
+4. `In` predicate (compiler-only, multi-edge to shared child)
 
 **Batch 2 — eBPF observability:**
-4. Count action (new map, new action type in walker)
-5. HyperLogLog (per-field cardinality in veth_filter)
-6. Metrics reactor (async collection + emission loop)
+5. Count action (new map, new action type in walker)
+6. HyperLogLog in `veth_filter` (per-field cardinality)
+7. Metrics reactor (async collection + emission loop)
 
 **Batch 3 — eBPF predicates:**
-7. Negation (exclusion field on TreeNode)
-8. Range predicates (start with expansion, then node annotation)
-9. Bitmask predicate (node annotation)
+8. Negation (exclusion field on TreeNode)
+9. Range predicates (start with expansion, then node annotation)
+10. Bitmask predicate (node annotation)
 
-**Batch 4 — Scale features:**
-10. Dynamic prefix lists (LPM tries with TTL)
-11. Cross-field OR (compiler rule duplication)
-12. Bloom filters (if needed)
+**Batch 4 — Scale features (prefix lists):**
+11. Dynamic prefix lists (LPM tries with ipset-style TTL + counters)
+12. Blue/green prefix list swaps
+13. Holon integration (auto-populate prefix lists from detection)
+14. Cross-field OR (compiler rule duplication)
+15. Bloom filters (if needed)
