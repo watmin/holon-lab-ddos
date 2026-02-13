@@ -1381,24 +1381,25 @@ characterization. Worth documenting as contributions.
 4. `In` predicate (compiler-only, multi-edge to shared child)
 
 **Batch 2 — Vector intelligence (no eBPF changes):**
-5. Vector-native cardinality (unbinding as diversity estimator)
-6. Magnitude spectrum (per-field diversity profile)
-7. Interference detection (correlated attack signal)
-8. Cardinality-aware rule generation (botnet vs amplification strategy)
+5. TTL + tcp_window log-scale encoding (fuzzy field clustering)
+6. Vector-native cardinality (unbinding as diversity estimator)
+7. Magnitude spectrum (per-field diversity profile)
+8. Interference detection (correlated attack signal)
+9. Cardinality-aware rule generation (botnet vs amplification strategy)
 
 **Batch 3 — eBPF observability:**
-9. Count action (new map, new action type in walker)
-10. Metrics reactor (async collection + emission loop)
-11. HyperLogLog in `veth_filter` (ground-truth cardinality for dashboards)
+10. Count action (new map, new action type in walker)
+11. Metrics reactor (async collection + emission loop)
+12. HyperLogLog in `veth_filter` (ground-truth cardinality for dashboards)
 
 **Batch 4 — eBPF predicates:**
-12. Negation (exclusion field on TreeNode)
-13. Range predicates (start with expansion, then node annotation)
-14. Bitmask predicate (node annotation)
+13. Negation (exclusion field on TreeNode)
+14. Range predicates (start with expansion, then node annotation)
+15. Bitmask predicate (node annotation)
 
 **Batch 5 — Scale features (prefix lists):**
-15. Dynamic prefix lists (LPM tries with ipset-style TTL + counters)
-16. Blue/green prefix list swaps
-17. Holon integration (auto-populate prefix lists from detection)
-18. Cross-field OR (compiler rule duplication)
-19. Bloom filters (if needed)
+16. Dynamic prefix lists (LPM tries with ipset-style TTL + counters)
+17. Blue/green prefix list swaps
+18. Holon integration (auto-populate prefix lists from detection)
+19. Cross-field OR (compiler rule duplication)
+20. Bloom filters (if needed)
