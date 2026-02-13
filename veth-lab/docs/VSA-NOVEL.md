@@ -342,6 +342,230 @@ Holon's anomaly detection naturally align with range predicates.
 
 ---
 
+## 7. The Holon-rs Primitive Library: Kernel Design
+
+### Design Philosophy
+
+Holon-rs is modeled after two design precedents:
+
+- **Linux kernel:** Provides syscalls, scheduling, memory management.
+  Applications build everything else.
+- **Clojure core:** Provides persistent data structures, sequences,
+  transducers. Applications build everything else.
+- **Holon-rs:** Provides vectors, binding, bundling, similarity, encoding.
+  Applications build everything else.
+
+The library boundary is: **given structured data, produce vectors. Given
+vectors, perform algebra.** Everything domain-specific — anomaly detection,
+rate derivation, rule generation, tree compilation — lives in "userland"
+(the sidecar). The library has no concept of packets, attacks, or network
+traffic.
+
+This boundary was a deliberate design choice, debated extensively. The
+temptation was to build "anomaly detection" into the library. The
+counter-argument (which won): the magnitude-as-volume trick, the
+unbinding-as-cardinality trick, the interference detection — none of these
+were predictable at library design time. They emerged from creative
+application of general primitives. If the library had a built-in "detect
+anomaly" function, it would have normalized the accumulator (destroying
+magnitude information) because that's what the literature says to do.
+
+**The less the library assumes, the more the application can discover.**
+
+### The Full Primitive Inventory
+
+The library provides far more than the DDoS lab currently uses. Here's the
+complete inventory, with usage status and potential DDoS applications:
+
+#### Encoding Primitives
+
+| Primitive | Used in DDoS | Potential Application |
+|---|---|---|
+| `encode_walkable()` | **Yes** | Zero-serialization packet encoding |
+| `encode_json()` | No | Rule file encoding (EDN/JSON rules as vectors) |
+| `encode_sequence(Bundle)` | No | Unordered packet burst encoding |
+| `encode_sequence(Positional)` | No | **Ordered flow encoding** (SYN→SYN-ACK→ACK as a sequence) |
+| `encode_sequence(Chained)` | No | Protocol state machine encoding |
+| `encode_sequence(Ngram)` | No | **Packet n-gram patterns** (detect recurring 3-packet motifs) |
+| `ScalarValue::log()` | **Yes** (pkt_len) | TTL, tcp_window (proposed in this doc) |
+| `ScalarValue::linear()` | No | Inter-arrival time encoding |
+| `ScalarValue::circular()` | No | **Time-of-day encoding** (hour 23 ≈ hour 0) |
+
+**Sequence encoding is the big untapped one.** Currently each packet is
+encoded independently. But network traffic has temporal structure: a TCP
+handshake is SYN → SYN-ACK → ACK. An HTTP request is SYN → ... → PSH →
+FIN. Encoding packet *sequences* (not just individual packets) would let
+Holon detect anomalous *flows*, not just anomalous packets.
+
+The `Ngram` mode is particularly interesting: encode every 3-packet window
+as a vector. The accumulator of 3-grams becomes a representation of "what
+packet sequences are normal." A novel attack sequence (SYN → RST → SYN →
+RST → ...) would show up as a drift in the 3-gram accumulator even if
+individual packets look normal.
+
+**Circular encoding** is interesting for time-based features. If we encode
+the hour of day circularly, traffic at 23:00 and 01:00 are "close" — which
+is correct (they're both late-night traffic). Linear encoding would make
+them distant (22 hours apart on a 0-23 scale).
+
+#### Core VSA Primitives
+
+| Primitive | Used in DDoS | Potential Application |
+|---|---|---|
+| `bind(a, b)` | **Yes** (in encoder) | Role-filler association |
+| `unbind(bound, key)` | Not directly | **Per-field cardinality** (proposed in this doc) |
+| `bundle(vectors)` | **Yes** (in encoder) | Superposition of bound pairs |
+| `weighted_bundle()` | No | **Confidence-weighted accumulation** (weight recent packets higher) |
+| `negate(super, component)` | No | **Remove known traffic pattern from accumulator** |
+| `amplify(super, component, k)` | No | Strengthen a weak signal in noise |
+| `prototype(vectors, threshold)` | No | **Extract common pattern across attack windows** |
+| `prototype_add(proto, example, n)` | No | Incremental attack profile update |
+| `difference(before, after)` | No | **Continuous attribution** (proposed in this doc) |
+| `blend(a, b, alpha)` | No | Interpolate between two attack profiles |
+| `resonance(vec, ref)` | No | **Extract only the agreeing dimensions** between two windows |
+| `permute(vec, k)` | No | Sequence position encoding |
+| `cleanup(noisy, codebook)` | No | Classify noisy packet vector to nearest known pattern |
+
+**`negate` is powerful and unused.** Imagine: you've detected a DNS
+amplification attack and generated a rule for it. But the overall traffic
+still drifts. Is there a SECOND attack hidden under the first? Use `negate`
+to remove the known DNS attack pattern from the accumulator:
+
+```rust
+let cleaned = Primitives::negate(&recent_acc, &known_dns_attack_pattern);
+// Now compute drift on `cleaned` — does the REMAINDER still drift?
+// If yes: there's a second attack hiding under the first.
+```
+
+This is **peeling** — removing known signals to expose hidden ones. It's
+how radio engineers separate overlapping signals. In the DDoS context, it
+lets you detect layered attacks where one attack masks another.
+
+**`prototype` extracts the common pattern across multiple vectors.** If you
+have 10 anomalous windows, `prototype` gives you the "essence" of the
+anomaly — what all 10 windows share. This is a more robust attack profile
+than any single window.
+
+**`resonance` filters a vector to keep only dimensions that agree with a
+reference.** Apply it to a recent window + baseline: you get a vector
+containing ONLY the dimensions where traffic matches the baseline. Everything
+else (the anomaly) is zeroed out. The complement (recent - resonance) is
+the pure anomaly signal with baseline noise removed.
+
+**`weighted_bundle` could weight recent packets higher** — a form of
+exponential decay within a window. The last 100 packets matter more than
+the first 100 packets in a window because attacks ramp up.
+
+#### Extended Algebra
+
+| Primitive | Used in DDoS | Potential Application |
+|---|---|---|
+| `similarity_profile(a, b)` | **Yes** | Per-dimension agreement vector |
+| `attend(query, memory, str, mode)` | No | **Attention-weighted anomaly scoring** |
+| `analogy(a, b, c)` | **Yes** | Zero-shot attack variant detection |
+| `project(vec, subspace, ortho)` | No | **Extract specific field subspace from accumulator** |
+| `conditional_bind(a, b, gate, mode)` | No | **Selective encoding** (only encode fields that are active) |
+| `complexity(vec)` | No | **Measure how mixed/structured a window is** |
+| `invert(vec, codebook, k, threshold)` | **Yes** | Pattern attribution to known attack types |
+| `segment(stream, window, threshold)` | **Yes** | Phase change detection |
+
+**`attend` is the bridge to transformers.** In Hard mode, it's a gate that
+passes only dimensions where query matches memory. In Soft mode, it's a
+weighted modulation. In Amplify mode, it boosts matching dimensions.
+
+Applied to DDoS: the "query" is the current window, the "memory" is the
+baseline. `attend(recent, baseline, strength, Soft)` produces a vector that
+emphasizes dimensions where recent traffic AGREES with baseline. The
+complement emphasizes where they disagree. This is a softer version of
+`resonance` with a tuneable strength parameter.
+
+**`project` extracts a subspace.** Given a set of role vectors, project the
+accumulator onto that subspace to get ONLY the contribution of those fields.
+This is a cleaner version of unbinding for multi-field extraction:
+
+```rust
+// Extract the [src_ip, src_port] subspace
+let attack_source_profile = Primitives::project(
+    &recent_vec,
+    &[role_src_ip.clone(), role_src_port.clone()],
+    false,  // don't orthogonalize (we want overlap if it exists)
+);
+```
+
+**`complexity` measures how "mixed" a vector is.** A pure signal (one
+dominant pattern) has low complexity. A superposition of many patterns has
+high complexity. For traffic: low complexity = homogeneous (possibly attack).
+High complexity = diverse (possibly normal). This is a single-number
+anomaly signal that doesn't require a baseline.
+
+**`conditional_bind` with gating** could enable per-protocol encoding: only
+bind TCP-specific fields (tcp_flags, tcp_window) when the protocol dimension
+is active. This is already done manually in the Walkable impl (`if proto == 6`),
+but `conditional_bind` makes it algebraic rather than procedural.
+
+#### Streaming & Similarity
+
+| Primitive | Used in DDoS | Potential Application |
+|---|---|---|
+| `accumulator.add()` | **Yes** | Frequency-preserving accumulation |
+| `accumulator.add_weighted()` | No | Importance-weighted packets |
+| `accumulator.decay(factor)` | No | **Exponential forgetting** (recent > old) |
+| `accumulator.merge(other)` | No | **Parallel accumulation** (multi-core) |
+| `similarity(Cosine)` | **Yes** | Drift detection |
+| `similarity(Hamming)` | No | Structural similarity (count of agreeing dims) |
+| `similarity(Overlap)` | No | Non-zero agreement (ignore inactive dimensions) |
+
+**`decay` is unused but important.** Currently the accumulator sums all
+packets equally within a window, then resets. With decay, old packets
+contribute less — the accumulator naturally forgets. This would let you use
+a **single continuous accumulator** instead of windowed resets:
+
+```rust
+// Every N packets, decay the accumulator slightly
+accumulator.decay(0.99);  // multiply all sums by 0.99
+accumulator.add(&new_packet_vec);
+```
+
+Over time, the accumulator converges to a running average weighted toward
+recent traffic. No window boundaries needed. Drift becomes continuous
+instead of discrete.
+
+**`merge` enables parallel accumulation.** If multiple cores process packet
+samples, each maintains a local accumulator. Periodically merge them. This
+is important at high PPS where a single-threaded accumulation loop is a
+bottleneck.
+
+### What the Library Design Enables
+
+The key insight from this inventory: **most of the unused primitives have
+direct applications to DDoS detection that weren't envisioned at library
+design time.** This validates the kernel-like boundary:
+
+| Primitive | Designed For | Discovered Application |
+|---|---|---|
+| `negate` | Removing known concepts | **Attack peeling** (layered attack detection) |
+| `prototype` | Common pattern extraction | **Robust attack profile** from multiple windows |
+| `resonance` | Agreement filtering | **Anomaly isolation** (remove baseline agreement) |
+| `attend` | Transformer-like attention | **Soft anomaly scoring** with tuneable sensitivity |
+| `complexity` | Vector introspection | **Single-number anomaly signal** (no baseline needed) |
+| `sequence(Ngram)` | Text/sequence patterns | **Flow anomaly detection** (packet sequence motifs) |
+| `decay` | Time-weighted streaming | **Continuous detection** (no window boundaries) |
+| `circular` | Periodic features | **Time-of-day baseline** (late night ≈ early morning) |
+
+Not a single one of these was "designed for DDoS." They're algebraic
+primitives that happen to have network security applications. The library
+authors (you, with Grok's help) couldn't have predicted the
+magnitude-as-volume trick because the library was designed to normalize
+magnitudes away. The trick was discovered by a different "userland"
+application that looked at the raw accumulator differently.
+
+This is the Linux kernel analogy in action: `mmap` was designed for file
+I/O. It turned out to be the foundation of shared memory, memory-mapped
+databases, and zero-copy networking. The primitive was more general than its
+original use case. Holon's primitives are the same.
+
+---
+
 ## Summary: Classical vs Holon Usage
 
 | Concept | Classical VSA/HDC | Holon |
@@ -352,6 +576,15 @@ Holon's anomaly detection naturally align with range predicates.
 | Difference vector | Analogical reasoning (A:B::C:?) | **Per-field attribution** → blame |
 | Scalar encoding | Not standard (discrete codebooks) | **Log-scale for fuzzy fields** → clustering |
 | Baseline comparison | Nearest-neighbor in codebook | **Drift + spectrum** → anomaly + fingerprint |
+| Negation | Remove concept from memory | **Attack peeling** → layered detection |
+| Sequence encoding | Text/NLP | **Flow-level anomaly** → protocol motifs |
+| Complexity | Vector quality metric | **Single-number anomaly** → no baseline needed |
+| Decay | Forgetting in memory | **Continuous detection** → no window boundaries |
+| Library boundary | Application-specific APIs | **General primitives** → emergent applications |
 
 The common thread: **every vector operation has two outputs — direction and
 magnitude — and the literature only uses direction.** Holon uses both.
+
+And the meta-insight: **a library that provides less domain-specific
+functionality enables more domain-specific discovery.** The primitives you
+don't use today are the tricks you'll discover tomorrow.
