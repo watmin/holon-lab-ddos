@@ -132,10 +132,7 @@ fn compile_tree(rules: &[RuleSpec]) -> Rc<ShadowNode> {
 /// and rule manifest (post-compilation rule_id → action/label mapping).
 /// Also populates byte_patterns on the returned PatternAlloc for pattern guard edges.
 pub(crate) fn compile_tree_full(rules: &[RuleSpec]) -> (Rc<ShadowNode>, CustomDimMapping, Vec<FieldDim>, Vec<crate::RuleManifestEntry>) {
-    // Expand In predicates into multiple Eq-based rules.
-    // Range predicates are NOT expanded — they become range edges in the tree,
-    // evaluated at runtime by the eBPF walker.
-    let mut expanded = expand_in_predicates(rules);
+    let mut expanded: Vec<RuleSpec> = rules.to_vec();
 
     // Save pre-transformation labels (before resolve/allocate modify predicates)
     let pre_labels: Vec<String> = expanded.iter().map(|r| r.display_label()).collect();
@@ -197,7 +194,7 @@ thread_local! {
 fn pick_guard_dim(rule: &RuleSpec) -> FieldDim {
     let used_dims: Vec<FieldDim> = rule.constraints.iter()
         .filter_map(|p| match p {
-            Predicate::Eq(FieldRef::Dim(d), _) | Predicate::In(FieldRef::Dim(d), _) => Some(*d),
+            Predicate::Eq(FieldRef::Dim(d), _) => Some(*d),
             _ => None,
         })
         .collect();
@@ -499,47 +496,6 @@ fn compile_recursive_dynamic(rules: &[RuleSpec], dim_idx: usize, dim_order: &[Fi
     Rc::new(node)
 }
 
-/// Expand In predicates into multiple Eq-based rules.
-/// (in proto 6 17) becomes two rules: one with (= proto 6), one with (= proto 17)
-pub fn expand_in_predicates(rules: &[RuleSpec]) -> Vec<RuleSpec> {
-    let mut expanded = Vec::new();
-    
-    for rule in rules {
-        // Check if this rule has any In predicates
-        let has_in = rule.constraints.iter().any(|p| matches!(p, Predicate::In(_, _)));
-        
-        if !has_in {
-            // No In predicates - keep as-is
-            expanded.push(rule.clone());
-            continue;
-        }
-        
-        // Expand: create one rule per combination of In values
-        let mut current_rules = vec![rule.clone()];
-        
-        for (pred_idx, pred) in rule.constraints.iter().enumerate() {
-            if let Predicate::In(field_ref, values) = pred {
-                let mut new_rules = Vec::new();
-                
-                // For each existing rule, create N variants (one per value in the In set)
-                for base_rule in &current_rules {
-                    for val in values {
-                        let mut new_rule = base_rule.clone();
-                        // Replace the In predicate with an Eq predicate
-                        new_rule.constraints[pred_idx] = Predicate::Eq(field_ref.clone(), *val);
-                        new_rules.push(new_rule);
-                    }
-                }
-                
-                current_rules = new_rules;
-            }
-        }
-        
-        expanded.extend(current_rules);
-    }
-    
-    expanded
-}
 
 
 // (compile_recursive removed — replaced by compile_recursive_dynamic)
@@ -1936,9 +1892,6 @@ mod tests {
                     Predicate::Eq(crate::FieldRef::Dim(dim), value) => {
                         pkt.get(dim).copied() == Some(*value)
                     }
-                    Predicate::In(crate::FieldRef::Dim(dim), values) => {
-                        pkt.get(dim).map_or(false, |v| values.contains(v))
-                    }
                     Predicate::Gt(crate::FieldRef::Dim(dim), value) => {
                         pkt.get(dim).map_or(false, |v| v > value)
                     }
@@ -2043,7 +1996,7 @@ mod tests {
                         let matching: Vec<_> = rules.iter().enumerate().filter(|(_, r)| {
                             r.constraints.iter().all(|pred| match pred {
                                 Predicate::Eq(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).copied() == Some(*val),
-                                Predicate::In(crate::FieldRef::Dim(dim), vals) => pkt_map.get(dim).map_or(false, |v| vals.contains(v)),
+
                                 Predicate::Gt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v > val),
                                 Predicate::Lt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v < val),
                                 Predicate::Gte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v >= val),
@@ -2068,7 +2021,7 @@ mod tests {
                     let top_prio_count = rules.iter().filter(|r| {
                         r.priority == bf_p && r.constraints.iter().all(|pred| match pred {
                             Predicate::Eq(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).copied() == Some(*val),
-                            Predicate::In(crate::FieldRef::Dim(dim), vals) => pkt_map.get(dim).map_or(false, |v| vals.contains(v)),
+
                             Predicate::Gt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v > val),
                             Predicate::Lt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v < val),
                             Predicate::Gte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v >= val),
@@ -2161,7 +2114,7 @@ mod tests {
                         let matching: Vec<_> = rules.iter().enumerate().filter(|(_, r)| {
                             r.constraints.iter().all(|pred| match pred {
                                 Predicate::Eq(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).copied() == Some(*val),
-                                Predicate::In(crate::FieldRef::Dim(dim), vals) => pkt_map.get(dim).map_or(false, |v| vals.contains(v)),
+
                                 Predicate::Gt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v > val),
                                 Predicate::Lt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v < val),
                                 Predicate::Gte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v >= val),
@@ -2185,7 +2138,7 @@ mod tests {
                     let top_prio_count = rules.iter().filter(|r| {
                         r.priority == bf_p && r.constraints.iter().all(|pred| match pred {
                             Predicate::Eq(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).copied() == Some(*val),
-                            Predicate::In(crate::FieldRef::Dim(dim), vals) => pkt_map.get(dim).map_or(false, |v| vals.contains(v)),
+
                             Predicate::Gt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v > val),
                             Predicate::Lt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v < val),
                             Predicate::Gte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v >= val),

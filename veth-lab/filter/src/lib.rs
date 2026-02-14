@@ -257,14 +257,12 @@ pub enum FieldRef {
 }
 
 /// A matching predicate for a single field constraint.
-/// Only `Eq` is implemented now; the enum is designed for extension
-/// (ranges, bitmask, negation, disjunction) without refactoring.
+/// Predicates define match conditions on packet fields.
+/// Each predicate maps 1:1 to a single DAG operation — no hidden expansion.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Predicate {
     /// Exact equality: field == value
     Eq(FieldRef, u32),
-    /// Set membership: field in [val1, val2, ...]
-    In(FieldRef, Vec<u32>),
     /// Greater than: field > value
     Gt(FieldRef, u32),
     /// Less than: field < value
@@ -343,7 +341,6 @@ impl Predicate {
     pub fn field_dim(&self) -> Option<FieldDim> {
         match self {
             Predicate::Eq(FieldRef::Dim(dim), _) 
-            | Predicate::In(FieldRef::Dim(dim), _)
             | Predicate::Gt(FieldRef::Dim(dim), _)
             | Predicate::Lt(FieldRef::Dim(dim), _)
             | Predicate::Gte(FieldRef::Dim(dim), _)
@@ -362,7 +359,6 @@ impl Predicate {
         static PATTERN_REF: FieldRef = FieldRef::Dim(FieldDim::Proto);
         match self {
             Predicate::Eq(fr, _)
-            | Predicate::In(fr, _)
             | Predicate::Gt(fr, _)
             | Predicate::Lt(fr, _)
             | Predicate::Gte(fr, _)
@@ -377,12 +373,6 @@ impl Predicate {
         match self {
             Predicate::Eq(FieldRef::Dim(dim), value) => {
                 format!("(= {} {})", dim.sexpr_name(), dim.sexpr_value(*value))
-            }
-            Predicate::In(FieldRef::Dim(dim), values) => {
-                let vals: Vec<String> = values.iter()
-                    .map(|v| dim.sexpr_value(*v))
-                    .collect();
-                format!("(in {} {})", dim.sexpr_name(), vals.join(" "))
             }
             Predicate::Gt(FieldRef::Dim(dim), value) => {
                 format!("(> {} {})", dim.sexpr_name(), dim.sexpr_value(*value))
@@ -677,15 +667,6 @@ impl RuleSpec {
                 Predicate::Eq(FieldRef::Dim(dim), val) => {
                     sorted_parts.push(format!("eq-{}-{}", *dim as u8, val));
                 }
-                Predicate::In(FieldRef::Dim(dim), vals) => {
-                    let mut sorted_vals = vals.clone();
-                    sorted_vals.sort();
-                    let vals_str = sorted_vals.iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    sorted_parts.push(format!("in-{}-{}", *dim as u8, vals_str));
-                }
                 Predicate::Gt(FieldRef::Dim(dim), val) => {
                     sorted_parts.push(format!("gt-{}-{}", *dim as u8, val));
                 }
@@ -819,13 +800,6 @@ impl RuleSpec {
                 Predicate::Eq(FieldRef::Dim(dim), val) => {
                     let (dim_name, val_str) = Self::format_dim_value(*dim, *val);
                     parts.push(format!("(= {} {})", dim_name, val_str));
-                }
-                Predicate::In(FieldRef::Dim(dim), vals) => {
-                    let dim_name = Self::dim_name(*dim);
-                    let val_strs: Vec<String> = vals.iter()
-                        .map(|v| Self::format_dim_value(*dim, *v).1)
-                        .collect();
-                    parts.push(format!("(in {} {})", dim_name, val_strs.join(" ")));
                 }
                 Predicate::Gt(FieldRef::Dim(dim), val) => {
                     let (dim_name, val_str) = Self::format_dim_value(*dim, *val);

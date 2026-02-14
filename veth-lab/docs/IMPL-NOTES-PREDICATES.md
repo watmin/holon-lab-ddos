@@ -282,33 +282,18 @@ The difference from range predicates: range predicates create a RESTRICTED
 path (only some values enter). Negation creates a BROADLY PERMISSIVE path
 (most values enter, one excluded). The guard edge mechanism handles both.
 
-**Go with Approach B.** It's consistent with the established pattern.
-
-### Implementation Plan
-
-1. Add `Not(Box<Predicate>)` to `Predicate` enum (wraps any predicate)
-2. For now, only support `Not(Eq(...))` — error on `Not(In(...))` etc.
-3. Add `RANGE_OP_NEQ = 6`
-4. `as_guard_on_dim` returns `Some((RANGE_OP_NEQ, val))` for `Not(Eq(dim, val))`
-5. eBPF: add `RANGE_OP_NEQ => fv != node.range_val_0`
-6. EDN parser: `(not (= field value))` — parse the inner predicate, wrap in Not
-7. Tests: negation alone, negation vs specific, negation with other constraints
+**Design decision (2026-02-14):** Negation has been deliberately excluded
+from the rule language. Users express negation patterns via priority-based
+conflict resolution (specific-match rule at higher priority, wildcard catch-all
+at lower priority). See `PLAN-NEXT.md` Part II for the full rationale.
 
 ---
 
-## Summary: Implementation Order
+## Summary
 
-1. **Bitmask** — Easiest. One new `RANGE_OP_MASK` constant, one match arm in eBPF,
-   follows existing range edge infrastructure exactly.
+1. **Bitmask (MaskEq)** — ✅ Implemented. Extended far beyond original spec
+   into a three-tiered byte matching system (MaskEq guard edges, custom
+   dimension fan-out, PatternGuard for 5-64 byte matches).
 
-2. **Negation** — Slightly more complex (wrapping predicate), but same guard edge
-   mechanism. `RANGE_OP_NEQ` op code.
-
-Both reuse the existing "guard edge" slots on TreeNode (the `range_op/val/child`
-fields). No new fields needed on TreeNode. No TreeNode layout changes. The eBPF
-verifier already accepts the range check code, and adding match arms doesn't
-affect verification.
-
-The guard edge approach generalizes: the 2 slots per node can hold any combination
-of range checks, mask checks, or negation checks. If a node needs more than 2,
-the compiler should log a warning (as it does today for range edges).
+2. **Negation** — Deliberately excluded. Explicit rules with priority-based
+   conflict resolution preferred over hidden exclusion logic.

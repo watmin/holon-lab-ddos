@@ -36,11 +36,6 @@ Each line is a complete EDN map:
 (= tcp-flags 2)           ;; SYN flag
 ```
 
-**Set membership:**
-```edn
-(in src-port 53 123 5353)  ;; Match any of these ports
-```
-
 **Range predicates:**
 ```edn
 (> ttl 200)                ;; TTL greater than 200

@@ -149,12 +149,6 @@ three-tiered matching system.
 - Pre-shifted `BytePattern` eliminates runtime offset arithmetic
 - `BTreeSet` for deterministic custom dimension assignment (stable `rule_id`s)
 
-### ✅ 4c. Set Membership (In)
-
-`(in src-port 53 123 5353)` works via compile-time expansion into multiple
-Eq rules. The DAG compiler's Rc sharing ensures the shared child subtree
-is not duplicated. Zero eBPF changes.
-
 ### ✅ Per-Rule Metrics Manifest
 
 All action types support `:name` and per-rule counter attribution.
@@ -179,12 +173,9 @@ See `veth-lab/scenarios/comprehensive-predicate-test.edn`.
 | Named rate limiters | Low | None (bucket key only) | ✅ Done |
 | Compound naming | Low | None | ✅ Done |
 | Count action | Medium | New map + action type | ✅ Done |
-| `In` predicate | Low | None (compiler only) | ✅ Done |
 | Range predicates | Medium | Node annotation | ✅ Done |
 | Bitmask & byte matching | High | Custom dims + pattern map | ✅ Done |
 | Per-rule metrics manifest | Medium | TREE_COUNTERS for all actions | ✅ Done |
-| Negation (`not`) | High | Compiler complexity | Planned |
-| Disjunction (cross-field `or`) | Medium | Compiler rule duplication | Planned |
 | LPM trie prefix sets | High | New map type + predicate | Planned |
 | Bloom filters | Medium | New map type | Planned |
 | Metrics pipeline | Medium | Read-only | Planned |
@@ -194,118 +185,84 @@ See `veth-lab/scenarios/comprehensive-predicate-test.edn`.
 
 ---
 
-# Part II — Planned: Predicate Extensions
+# Part II — Design Decision: Explicit Rules Over Meta-Predicates
 
-## 5. Negation (Not)
+**Decision (2026-02-14):** The `In` (set membership), `Not` (negation), and
+`Or` (disjunction) predicates have been deliberately excluded from the rule
+language. This is an opinionated design choice, not a limitation.
 
-### Syntax
+### Rationale
 
-Following the Clojure composable form — `(not ...)` wraps any predicate:
+Each predicate must map 1:1 to a single DAG operation. "Helper" predicates
+like `IN`, `NOT`, and `OR` create a representation gap — the user writes one
+rule but the DAG gets multiple internally expanded rules with different
+`rule_id`s. This makes debugging, metrics attribution, and reasoning about
+rule behavior harder.
 
-```clojure
-;; Negate equality
-(not (= dst-port 9999))
+**What you lose:** Syntactic convenience for hand-authored rules.
 
-;; Negate set membership
-(not (in src-port 53 123))
+**What you gain:**
+- Every rule in the file maps to exactly one path in the DAG
+- Every `rule_id` in metrics corresponds to exactly one user-visible rule
+- No hidden expansion, no hidden duplication, no hidden exclusion logic
+- Simpler compiler, fewer verifier edge cases
 
-;; Negate range
-(not (> ttl 200))
+### How to Express These Patterns
+
+**Instead of `(in src-port 53 123 5353)`:** Write 3 explicit rules. The DAG
+compiler naturally shares the common subtree — same efficiency, full transparency.
+
+**Instead of `(not (= proto 6))`:** Use priority-based conflict resolution.
+A specific-match rule at higher priority with a wildcard catch-all at lower
+priority achieves the same result with unambiguous intent.
+
+**Instead of `(or (= proto 6) (= dst-port 80))`:** Write 2 rules. Each is
+independently countable and debuggable.
+
+### Shared Metric Aggregation
+
+Users can still aggregate related rules into a single counter via shared
+`:name` labels on actions:
+
+```edn
+;; Three explicit rules, one shared counter
+{:constraints [(= proto 17) (= src-port 53)]
+ :actions [(count :name ["monitor" "reflection-ports"])]}
+
+{:constraints [(= proto 17) (= src-port 123)]
+ :actions [(count :name ["monitor" "reflection-ports"])]}
+
+{:constraints [(= proto 17) (= src-port 5353)]
+ :actions [(count :name ["monitor" "reflection-ports"])]}
 ```
 
-### Use Case: The SYN Counter Example
+The "set" concept lives in the metrics/action layer via compound naming,
+not in the predicate layer. This is a cleaner separation of concerns.
 
-```clojure
-;; Count SYN packets that AREN'T hitting the game server
-{:constraints [(= proto 6)
-               (= tcp-flags 2)
-               (not (= dst-port 9999))]
- :actions [(count :name ["monitoring" "non-game-syns"])]}
+### Previously Implemented, Now Removed
 
-;; Rate-limit SYNs TO the game server
-{:constraints [(= proto 6)
-               (= tcp-flags 2)
-               (= dst-port 9999)]
- :actions [(rate-limit 100 :name ["game" "syn-limit"])]
- :priority 200}
-```
-
-### Compilation Strategy
-
-For `(not (= dst-port 9999))`:
-
-1. The rule lives in the **wildcard branch** (matches any dst-port value)
-2. But has an **exclusion**: if `dst-port == 9999`, skip this rule
-
-Implementation: add an `exclusions: Vec<u32>` to the compiler's intermediate
-representation. During flattening, a node with exclusions becomes a node that
-the DFS visits via wildcard but skips if the field value matches an exclusion.
-
-**eBPF impact:** Add an `exclude_value: u32` field to `TreeNode` (0 = no
-exclusion). In `tree_walk_step`:
-
-```rust
-if node.exclude_value != 0 && fields[node.dimension] == node.exclude_value {
-    // Skip this node — negation excludes it
-    continue;  // don't push children, don't check action
-}
-```
-
-One comparison per node. Minimal verifier impact. Supports single-value
-negation. Multi-value negation (`(not (in ...))`) would need an exclusion
-set, but single-value covers 90% of use cases.
-
-**Alternative for small-domain fields:** Expansion. `(not (= proto 6))`
-expands to `(in proto 1 17 ...)`. Only works for fields with small value
-domains. For large-domain fields (ports, IPs), negation is better handled
-by priority — a specific-match rule at higher priority with a wildcard
-catch-all at lower priority.
-
-**Recommendation:** Defer negation until needed. It's the most complex
-predicate to get right and the least common use case.
-
-**Files to change:**
-- `filter/src/lib.rs` — `Predicate` enum, add `Not` variant
-- `filter/src/tree.rs` — Compiler handles exclusion placement in wildcard branches
-- `filter-ebpf/src/main.rs` — `exclude_value` field on `TreeNode`, skip logic
+The `In` predicate was previously implemented via compile-time expansion
+into multiple Eq rules (DAG Rc sharing prevented subtree duplication). It
+was removed because the expansion created a representation gap: one user
+rule became N internal rules with different `rule_id`s, making metrics
+attribution and debugging confusing. The `expand_in_predicates` function
+and EDN parser support have been deleted.
 
 ---
 
-## 6. Disjunction (Or)
+# Part III — Planned: Prefix Lists
 
-**Same-field OR** is equivalent to set membership (already implemented):
-`(or (= proto 6) (= proto 17))` = `(in proto 6 17)`
-
-**Cross-field OR** is harder: `(or (= proto 6) (= dst-port 80))`.
-The rule must appear in multiple tree positions (one under proto=6, one
-under dst-port=80 wildcard path). The DAG compiler can handle this by
-duplicating the rule spec at compile time.
-
-**No eBPF changes needed.** Cross-field OR is purely a compiler transformation.
-
-**Recommendation:** Implement only when there's a concrete use case.
-
----
-
-# Part III — Planned: Sets & Prefix Lists
-
-## 7. IP Sets & LPM Tries
+## 5. LPM Tries for IP Prefix Sets
 
 ### Problem
 
 A common operational need: "block these 500K source IPs" or "rate-limit
-traffic from these 10K CIDRs." Currently each IP would be a separate rule.
+traffic from these 10K CIDRs." Each IP is a separate rule in the DAG.
+For very large IP sets, this is better served by a dedicated eBPF map.
 
-### Approach A: Compile-Time Expansion (Near-Term)
+### Design: LPM Trie
 
-Expand `(in-set src-addr bad-sources)` into N rules, one per IP/prefix.
-The DAG compiler deduplicates shared subtrees. Works today with zero eBPF
-changes. At 500K IPs, the tree grows by ~1M nodes — within the 2.5M slot
-budget.
-
-### Approach B: LPM Trie (Scale)
-
-For 1M+ IPs, use `BPF_MAP_TYPE_LPM_TRIE` — the kernel's native
+Use `BPF_MAP_TYPE_LPM_TRIE` — the kernel's native
 longest-prefix-match data structure. Handles CIDRs natively
 (`10.0.0.0/8` is a single entry, not 16M entries).
 
@@ -347,8 +304,8 @@ Usage: Userspace inserts IPs into bloom filter map. eBPF checks
 `bloom_filter.contains(src_ip)`. Best for rate-limiting (not hard DROP)
 where false positives are tolerable.
 
-**Recommendation:** Start with compile-time expansion. Graduate to LPM tries
-for prefix sets. Bloom filters are the escape hatch for extreme scale.
+**Recommendation:** Start with LPM tries for prefix sets. Bloom filters
+are the escape hatch for extreme scale if needed.
 
 **Files to change:**
 - `filter-ebpf/src/main.rs` — New LPM trie map, set-check logic in DFS
@@ -358,7 +315,7 @@ for prefix sets. Bloom filters are the escape hatch for extreme scale.
 
 ---
 
-## 8. Dynamic Prefix Lists (Lazy Accumulation)
+## 6. Dynamic Prefix Lists (Lazy Accumulation)
 
 ### Problem
 
@@ -413,7 +370,7 @@ This is the **separation of policy (tree rule) from data (prefix list).**
 
 ---
 
-## 9. Blue/Green Prefix Lists
+## 7. Blue/Green Prefix Lists
 
 ### Design
 
@@ -448,7 +405,7 @@ for periodic bulk loads from external sources.
 
 ---
 
-## 10. ipset-Style Features
+## 8. ipset-Style Features
 
 ### netfilter ipset Features Worth Emulating
 
@@ -509,7 +466,7 @@ struct PrefixEntry {
 
 # Part IV — Planned: Observability
 
-## 11. Metrics Collection & Emission Pipeline
+## 9. Metrics Collection & Emission Pipeline
 
 ### Problem
 
@@ -569,7 +526,7 @@ cycle). For high-fidelity: per-CPU counter map (same as STATS today).
 
 ---
 
-## 12. HyperLogLog for Cardinality Estimation
+## 10. HyperLogLog for Cardinality Estimation
 
 ### What It Does
 
@@ -642,7 +599,7 @@ powerful anomaly signal that complements Holon's drift detection.
 
 # Part V — Planned: Holon Primitive Integration
 
-## 13. Vector-Native Cardinality & Field Diversity
+## 11. Vector-Native Cardinality & Field Diversity
 
 ### The Core Insight: Magnitude Encodes Diversity
 
@@ -769,7 +726,7 @@ These techniques appear novel in the VSA/HDC literature:
 
 ---
 
-## 14. Holon Primitive Applications
+## 12. Holon Primitive Applications
 
 These are holon-rs primitives we're not using that have direct applications
 in the detection loop. No eBPF changes for any of them.
@@ -942,6 +899,4 @@ Attack onset shows up sooner (first anomalous packets get high weight).
 11. HyperLogLog in `veth_filter` (ground-truth cardinality for dashboards)
 
 **Later:**
-12. Negation predicate (exclusion field on TreeNode)
-13. Cross-field OR (compiler rule duplication)
-14. Bloom filters (if needed)
+12. Bloom filters (if needed for extreme-scale prefix sets)

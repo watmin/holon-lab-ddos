@@ -1033,21 +1033,6 @@ fn parse_edn_predicate(edn: &Edn) -> Result<Option<Predicate>> {
             let value = parse_field_value(&list[2], dim)?;
             Ok(Some(Predicate::eq(dim, value)))
         }
-        "in" => {
-            // (in field val1 val2 ...)
-            if list.len() < 3 {
-                anyhow::bail!("in predicate requires at least 3 elements (op field value...)");
-            }
-            let mut values = Vec::new();
-            for i in 2..list.len() {
-                let val = parse_field_value(&list[i], dim)?;
-                values.push(val);
-            }
-            if values.is_empty() {
-                anyhow::bail!("in predicate must have at least one value");
-            }
-            Ok(Some(Predicate::In(veth_filter::FieldRef::Dim(dim), values)))
-        }
         ">" => {
             // (> field value)
             if list.len() != 3 {
@@ -1490,11 +1475,8 @@ async fn main() -> Result<()> {
             let mut rate_map = rate_limiter_names.write().await;
             let mut bucket_map = bucket_key_to_spec.write().await;
             
-            // Expand In predicates before populating maps
-            let expanded = veth_filter::tree::expand_in_predicates(&preloaded);
-            
             // Build rate limiter name map and bucket_key→spec map for logging
-            for spec in &expanded {
+            for spec in &preloaded {
                 // Store rules with rate limiters or counters in bucket_map
                 for action in &spec.actions {
                     match action {

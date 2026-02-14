@@ -127,26 +127,27 @@ The eBPF DFS walker handles wildcards by exploring both the specific-value branc
 
 ## Predicates
 
-### Currently Implemented
+### Implemented Predicates
 
 | Form | Name | Description |
 |---|---|---|
 | `(= field value)` | Eq | Exact equality match |
-
-### Designed for Extension (Not Yet Implemented)
-
-The `Predicate` enum is explicitly designed for these future variants:
-
-| Form | Name | Description |
-|---|---|---|
 | `(> field value)` | Gt | Greater than |
 | `(< field value)` | Lt | Less than |
 | `(>= field value)` | Gte | Greater than or equal |
 | `(<= field value)` | Lte | Less than or equal |
-| `(mask field bitmask)` | Mask | Bitmask test: `(field & bitmask) != 0` |
-| `(in field val1 val2 ...)` | In | Set membership / disjunction |
-| `(not pred)` | Not | Negation of a predicate |
-| `(or pred1 pred2 ...)` | Or | Disjunction of predicates |
+| `(mask-eq field mask expected)` | MaskEq | `(field & mask) == expected` |
+| `(protocol-match match mask)` | MaskEq | Sugar for mask-eq on protocol |
+| `(tcp-flags-match match mask)` | MaskEq | Sugar for mask-eq on TCP flags |
+| `(l4-match offset "hex-match" "hex-mask")` | L4Match | Arbitrary L4 byte matching |
+
+### Design Philosophy
+
+Each predicate maps 1:1 to a single DAG operation. There are no set-expansion,
+negation, or disjunction predicates — users express these as explicit individual
+rules. The DAG compiler naturally shares common subtrees across rules, providing
+the same efficiency without hidden expansion. Shared metric aggregation is
+achieved via compound `:name` labels on actions, not predicate-level grouping.
 
 #### Range Example (Future)
 
