@@ -19,9 +19,9 @@ use aya::Ebpf;
 use tracing::info;
 
 use crate::{
-    EdgeKey, FieldDim, Predicate, RuleSpec, TokenBucket, TreeNode,
+    EdgeKey, FieldDim, FieldRef, Predicate, RuleSpec, TokenBucket, TreeNode,
     ACT_PASS, ACT_RATE_LIMIT, DIM_LEAF, NUM_DIMENSIONS, TREE_SLOT_SIZE,
-    RANGE_OP_NONE, RANGE_OP_MASK,
+    RANGE_OP_NONE,
 };
 
 // =============================================================================
@@ -51,7 +51,7 @@ const DIM_ORDER: [FieldDim; NUM_DIMENSIONS] = [
 /// Children are Rc-wrapped so that compile-level memoization shares
 /// subtrees by reference count instead of deep-copying.
 #[derive(Debug, Clone)]
-struct ShadowNode {
+pub(crate) struct ShadowNode {
     /// Which dimension this node branches on (index into DIM_ORDER)
     dim_index: usize,
     /// Optional action at this node (from the highest-priority terminating rule)
@@ -87,15 +87,416 @@ struct ShadowAction {
 // Tree compiler
 // =============================================================================
 
+/// Result of L4Byte resolution: maps (offset, length) -> CustomN dim
+#[derive(Debug, Clone, Default)]
+pub struct CustomDimMapping {
+    /// Maps (offset, length) to custom dim index (0-6)
+    pub entries: Vec<(u16, u8, FieldDim)>,
+}
+
+impl CustomDimMapping {
+    /// Look up the custom dim for a given (offset, length) pair
+    pub fn get(&self, offset: u16, length: u8) -> Option<FieldDim> {
+        self.entries.iter()
+            .find(|(o, l, _)| *o == offset && *l == length)
+            .map(|(_, _, dim)| *dim)
+    }
+
+    /// Get the CustomDimEntry for a custom dim index
+    pub fn config_entry(&self, index: usize) -> Option<crate::CustomDimEntry> {
+        self.entries.iter()
+            .find(|(_, _, dim)| dim.custom_index() == Some(index))
+            .map(|(offset, length, _)| crate::CustomDimEntry {
+                offset: *offset,
+                length: *length,
+                _pad: 0,
+            })
+    }
+
+    /// Number of custom dims in use
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// Compiles a set of RuleSpecs into a shadow DAG (no replication).
 /// Wildcard rules live only in the wildcard_child branch.
 /// The eBPF walker explores specific, range-guarded, and wildcard paths via DFS.
+#[cfg(test)]
 fn compile_tree(rules: &[RuleSpec]) -> Rc<ShadowNode> {
+    let (tree, _, _, _) = compile_tree_full(rules);
+    tree
+}
+
+/// Full compilation: returns the shadow tree, custom dim mapping, dimension order,
+/// and rule manifest (post-compilation rule_id → action/label mapping).
+/// Also populates byte_patterns on the returned PatternAlloc for pattern guard edges.
+pub(crate) fn compile_tree_full(rules: &[RuleSpec]) -> (Rc<ShadowNode>, CustomDimMapping, Vec<FieldDim>, Vec<crate::RuleManifestEntry>) {
     // Expand In predicates into multiple Eq-based rules.
     // Range predicates are NOT expanded — they become range edges in the tree,
     // evaluated at runtime by the eBPF walker.
-    let expanded = expand_in_predicates(rules);
-    compile_recursive(&expanded, 0)
+    let mut expanded = expand_in_predicates(rules);
+
+    // Save pre-transformation labels (before resolve/allocate modify predicates)
+    let pre_labels: Vec<String> = expanded.iter().map(|r| r.display_label()).collect();
+
+    // Phase 2a: Resolve 1-4 byte L4Byte references to custom dimensions
+    let mapping = resolve_l4byte_refs(&mut expanded);
+
+    // Phase 2b: Convert remaining L4Byte predicates (5-64 bytes) to pattern guard predicates
+    // This allocates BytePattern entries and converts L4Byte to guard edges on dim 0 (Proto).
+    let pattern_alloc = allocate_patterns(&mut expanded);
+    
+    // Store patterns in thread-local for flatten to pick up
+    PATTERN_ALLOC.with(|pa| {
+        *pa.borrow_mut() = pattern_alloc;
+    });
+
+    // Build rule manifest: post-compilation rule_id paired with labels.
+    // This is the authoritative mapping for TREE_COUNTERS observability.
+    // Prefer the action's :name for the label (if set), otherwise fall back to
+    // the rule-level display_label (which uses :label or constraint-based system label).
+    let mut manifest_map: std::collections::HashMap<u32, crate::RuleManifestEntry> = std::collections::HashMap::new();
+    for (spec, label) in expanded.iter().zip(pre_labels.iter()) {
+        let rule_id = spec.bucket_key().unwrap_or_else(|| spec.canonical_hash());
+        if let Some(action) = spec.actions.first() {
+            let effective_label = if let Some((ns, name)) = action.name() {
+                format!("[{} {}]", ns, name)
+            } else {
+                label.clone()
+            };
+            manifest_map.entry(rule_id).or_insert_with(|| crate::RuleManifestEntry {
+                rule_id,
+                action: action.clone(),
+                label: effective_label,
+            });
+        }
+    }
+    let manifest: Vec<crate::RuleManifestEntry> = manifest_map.into_values().collect();
+
+    // Build dimension order: static dims + active custom dims
+    let mut dim_order: Vec<FieldDim> = DIM_ORDER.to_vec();
+    for &(_, _, dim) in &mapping.entries {
+        dim_order.push(dim);
+    }
+
+    let tree = compile_recursive_dynamic(&expanded, 0, &dim_order);
+    (tree, mapping, dim_order, manifest)
+}
+
+/// Thread-local storage for pattern allocations (passed from compile to flatten)
+use std::cell::RefCell;
+thread_local! {
+    static PATTERN_ALLOC: RefCell<Vec<crate::BytePattern>> = RefCell::new(Vec::new());
+}
+
+/// Choose a dimension for guard edge placement that doesn't conflict with
+/// the rule's existing Eq/In constraints. Pattern guard byte-comparison is
+/// dimension-agnostic, so any dimension works — we just need one whose
+/// tree node the walker will visit.
+fn pick_guard_dim(rule: &RuleSpec) -> FieldDim {
+    let used_dims: Vec<FieldDim> = rule.constraints.iter()
+        .filter_map(|p| match p {
+            Predicate::Eq(FieldRef::Dim(d), _) | Predicate::In(FieldRef::Dim(d), _) => Some(*d),
+            _ => None,
+        })
+        .collect();
+    // Find the first static dimension not used by a specific (Eq/In) constraint
+    for &dim in &DIM_ORDER {
+        if !used_dims.contains(&dim) {
+            return dim;
+        }
+    }
+    // Fallback (shouldn't happen with 9 static dims)
+    FieldDim::Proto
+}
+
+/// Allocate BytePattern entries for unresolved L4Byte predicates.
+/// Converts `Eq/MaskEq(L4Byte{...}, ...)` and `RawByteMatch` to
+/// `PatternGuard(dim, pattern_idx)`. The guard dimension is chosen to not
+/// conflict with existing Eq/In constraints in the rule.
+fn allocate_patterns(rules: &mut Vec<RuleSpec>) -> Vec<crate::BytePattern> {
+    let mut patterns: Vec<crate::BytePattern> = Vec::new();
+    
+    for rule in rules.iter_mut() {
+        // Pick a guard dimension for this rule (before modifying constraints)
+        let guard_dim = pick_guard_dim(rule);
+        
+        let mut new_constraints = Vec::with_capacity(rule.constraints.len());
+        for pred in &rule.constraints {
+            let resolved = match pred {
+                Predicate::Eq(FieldRef::L4Byte { offset, length }, value) => {
+                    // Create a pattern for exact match — pre-shifted so
+                    // match/mask_bytes[i] corresponds to pattern_data[i] directly.
+                    let mut pat = crate::BytePattern::default();
+                    pat.offset = *offset;
+                    pat.length = *length;
+                    let off = *offset as usize;
+                    let len = *length as usize;
+                    if len <= 4 && off + len <= crate::MAX_PATTERN_LEN {
+                        let val_bytes = value.to_be_bytes();
+                        let start = 4 - len;
+                        for i in 0..len {
+                            pat.match_bytes[off + i] = val_bytes[start + i];
+                            pat.mask_bytes[off + i] = 0xFF;
+                        }
+                    }
+                    let pattern_idx = patterns.len() as u32;
+                    patterns.push(pat);
+                    Predicate::PatternGuard(guard_dim, pattern_idx)
+                }
+                Predicate::MaskEq(FieldRef::L4Byte { offset, length }, _mask, _expected) => {
+                    let off = *offset as usize;
+                    let len = *length as usize;
+                    let mut pat = crate::BytePattern::default();
+                    pat.offset = *offset;
+                    pat.length = *length;
+                    
+                    if len <= 4 && off + len <= crate::MAX_PATTERN_LEN {
+                        let exp_bytes = _expected.to_be_bytes();
+                        let mask_bytes_val = _mask.to_be_bytes();
+                        let start = 4 - len;
+                        for i in 0..len {
+                            pat.match_bytes[off + i] = exp_bytes[start + i] & mask_bytes_val[start + i];
+                            pat.mask_bytes[off + i] = mask_bytes_val[start + i];
+                        }
+                    }
+                    
+                    let pattern_idx = patterns.len() as u32;
+                    patterns.push(pat);
+                    Predicate::PatternGuard(guard_dim, pattern_idx)
+                }
+                Predicate::RawByteMatch(raw_pat) => {
+                    // Pre-built BytePattern from sidecar parsing (>4 byte matches).
+                    // Pre-shift bytes to position `offset` within the 64-byte arrays
+                    // so match/mask_bytes[i] corresponds to pattern_data[i] directly.
+                    let off = raw_pat.offset as usize;
+                    let len = raw_pat.length as usize;
+                    let mut shifted = crate::BytePattern::default();
+                    shifted.offset = raw_pat.offset;
+                    shifted.length = raw_pat.length;
+                    for i in 0..len {
+                        if off + i < crate::MAX_PATTERN_LEN {
+                            shifted.match_bytes[off + i] = raw_pat.match_bytes[i];
+                            shifted.mask_bytes[off + i] = raw_pat.mask_bytes[i];
+                        }
+                    }
+                    let pattern_idx = patterns.len() as u32;
+                    patterns.push(shifted);
+                    Predicate::PatternGuard(guard_dim, pattern_idx)
+                }
+                other => other.clone(),
+            };
+            new_constraints.push(resolved);
+        }
+        rule.constraints = new_constraints;
+    }
+    
+    if !patterns.is_empty() {
+        info!("Allocated {} byte pattern(s) for pattern guard edges", patterns.len());
+    }
+    
+    patterns
+}
+
+/// Scan all rules for L4Byte field refs, assign custom dim slots (for 1-4 byte),
+/// and resolve them to Dim(CustomN) predicates. Long patterns (5-64 bytes) and
+/// patterns that can't pack into custom dims are left as L4Byte refs for later
+/// conversion to pattern guard edges.
+///
+/// For 1-4 byte exact matches (mask = all-FF), auto-promotes MaskEq to Eq
+/// for specific-edge fan-out.
+fn resolve_l4byte_refs(rules: &mut Vec<RuleSpec>) -> CustomDimMapping {
+    use std::collections::BTreeSet;
+    use std::collections::BTreeMap;
+    
+    // Pass 1: Collect unique (offset, length) combinations (order-independent)
+    let mut seen: BTreeSet<(u16, u8)> = BTreeSet::new();
+    for rule in rules.iter() {
+        for pred in &rule.constraints {
+            match pred.field_ref() {
+                FieldRef::L4Byte { offset, length } if *length <= 4 => {
+                    seen.insert((*offset, *length));
+                }
+                FieldRef::L4Byte { offset, length } if *length > 4 => {
+                    info!("L4Byte offset={} length={} -> pattern guard (too long for custom dim)", offset, length);
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    // Pass 2: Assign custom dims in deterministic sorted order (by offset, then length)
+    let mut unique_combos: BTreeMap<(u16, u8), FieldDim> = BTreeMap::new();
+    let mut next_custom = 0usize;
+    for key in &seen {
+        if next_custom >= crate::NUM_CUSTOM_DIMS {
+            tracing::warn!(
+                "Too many unique L4Byte combos (>{}), ignoring offset={} length={}",
+                crate::NUM_CUSTOM_DIMS, key.0, key.1
+            );
+            continue;
+        }
+        let dim = FieldDim::from_custom_index(next_custom).unwrap();
+        unique_combos.insert(*key, dim);
+        next_custom += 1;
+    }
+    
+    // Build the mapping
+    let mapping = CustomDimMapping {
+        entries: unique_combos.iter()
+            .map(|((offset, length), dim)| (*offset, *length, *dim))
+            .collect(),
+    };
+    
+    if !mapping.entries.is_empty() {
+        info!("Custom dim mapping: {} entries", mapping.entries.len());
+        for (offset, length, dim) in &mapping.entries {
+            info!("  offset={}, length={} -> {:?}", offset, length, dim);
+        }
+    }
+    
+    // Resolve 1-4 byte L4Byte refs in rules to their assigned custom dims.
+    // Leave 5+ byte L4Byte refs unresolved for pattern guard handling.
+    for rule in rules.iter_mut() {
+        let mut new_constraints = Vec::with_capacity(rule.constraints.len());
+        for pred in &rule.constraints {
+            let resolved = match pred {
+                Predicate::Eq(FieldRef::L4Byte { offset, length }, value) if *length <= 4 => {
+                    if let Some(dim) = unique_combos.get(&(*offset, *length)) {
+                        Predicate::Eq(FieldRef::Dim(*dim), *value)
+                    } else {
+                        pred.clone()
+                    }
+                }
+                Predicate::MaskEq(FieldRef::L4Byte { offset, length }, mask, expected) if *length <= 4 => {
+                    if let Some(dim) = unique_combos.get(&(*offset, *length)) {
+                        let all_ff = match length {
+                            1 => *mask == 0xFF,
+                            2 => *mask == 0xFFFF,
+                            4 => *mask == 0xFFFFFFFF,
+                            _ => false,
+                        };
+                        if all_ff {
+                            Predicate::Eq(FieldRef::Dim(*dim), *expected)
+                        } else {
+                            Predicate::MaskEq(FieldRef::Dim(*dim), *mask, *expected)
+                        }
+                    } else {
+                        pred.clone()
+                    }
+                }
+                // 5-64 byte patterns: leave as L4Byte for pattern guard allocation
+                other => other.clone(),
+            };
+            new_constraints.push(resolved);
+        }
+        rule.constraints = new_constraints;
+    }
+    
+    mapping
+}
+
+/// compile_recursive with dynamic dimension order (supports custom dims)
+fn compile_recursive_dynamic(rules: &[RuleSpec], dim_idx: usize, dim_order: &[FieldDim]) -> Rc<ShadowNode> {
+    // Base case: no more dimensions to branch on
+    if dim_idx >= dim_order.len() || rules.is_empty() {
+        let mut node = ShadowNode {
+            dim_index: dim_idx,
+            action: None,
+            children: StdHashMap::new(),
+            wildcard: None,
+            range_children: Vec::new(),
+        };
+        if let Some(best) = rules.iter().max_by_key(|r| r.priority) {
+            if let Some(first_action) = best.actions.first() {
+                node.action = Some(ShadowAction {
+                    action: first_action.action_type(),
+                    priority: best.priority,
+                    rate_pps: first_action.rate_pps().unwrap_or(0),
+                    rule_id: best.bucket_key().unwrap_or_else(|| best.canonical_hash()),
+                });
+            }
+        }
+        return Rc::new(node);
+    }
+
+    let dim = dim_order[dim_idx];
+
+    // Check if ANY rule constrains this dimension
+    let any_constrains = rules.iter().any(|r| {
+        r.constraints.iter().any(|p| p.constrains_dim(dim))
+    });
+
+    if !any_constrains {
+        return compile_recursive_dynamic(rules, dim_idx + 1, dim_order);
+    }
+
+    // Three-way partition
+    let mut specific: StdHashMap<u32, Vec<&RuleSpec>> = StdHashMap::new();
+    let mut range_guarded: Vec<(RangeEdge, &RuleSpec)> = Vec::new();
+    let mut wildcard: Vec<&RuleSpec> = Vec::new();
+
+    for rule in rules {
+        let eq_value = rule.constraints.iter()
+            .find_map(|p| p.as_eq_dim().filter(|(d, _)| *d == dim).map(|(_, v)| v));
+        if let Some(value) = eq_value {
+            specific.entry(value).or_default().push(rule);
+        } else if let Some((op, val)) = rule.constraints.iter()
+            .find_map(|p| p.as_guard_on_dim(dim))
+        {
+            range_guarded.push((RangeEdge { op, value: val }, rule));
+        } else {
+            wildcard.push(rule);
+        }
+    }
+
+    let mut node = ShadowNode {
+        dim_index: dim_idx,
+        action: None,
+        children: StdHashMap::new(),
+        wildcard: None,
+        range_children: Vec::new(),
+    };
+
+    let remaining_dims: Vec<FieldDim> = dim_order[dim_idx..].to_vec();
+    let terminating: Vec<&RuleSpec> = rules.iter()
+        .filter(|r| !r.constraints.iter().any(|p| {
+            p.field_dim().map_or(false, |d| remaining_dims.contains(&d))
+        }))
+        .collect();
+    if let Some(best) = terminating.iter().max_by_key(|r| r.priority) {
+        if let Some(first_action) = best.actions.first() {
+            node.action = Some(ShadowAction {
+                action: first_action.action_type(),
+                priority: best.priority,
+                rate_pps: first_action.rate_pps().unwrap_or(0),
+                rule_id: best.bucket_key().unwrap_or_else(|| best.canonical_hash()),
+            });
+        }
+    }
+
+    for (value, specific_rules) in &specific {
+        let owned: Vec<RuleSpec> = specific_rules.iter().map(|r| (*r).clone()).collect();
+        node.children.insert(*value, compile_recursive_dynamic(&owned, dim_idx + 1, dim_order));
+    }
+
+    let mut range_groups: StdHashMap<RangeEdge, Vec<&RuleSpec>> = StdHashMap::new();
+    for (edge, rule) in &range_guarded {
+        range_groups.entry(edge.clone()).or_default().push(rule);
+    }
+    for (edge, range_rules) in &range_groups {
+        let owned: Vec<RuleSpec> = range_rules.iter().map(|r| (*r).clone()).collect();
+        let child = compile_recursive_dynamic(&owned, dim_idx + 1, dim_order);
+        node.range_children.push((edge.clone(), child));
+    }
+
+    if !wildcard.is_empty() {
+        let owned: Vec<RuleSpec> = wildcard.iter().map(|r| (*r).clone()).collect();
+        node.wildcard = Some(compile_recursive_dynamic(&owned, dim_idx + 1, dim_order));
+    }
+
+    Rc::new(node)
 }
 
 /// Expand In predicates into multiple Eq-based rules.
@@ -141,121 +542,7 @@ pub fn expand_in_predicates(rules: &[RuleSpec]) -> Vec<RuleSpec> {
 }
 
 
-fn compile_recursive(rules: &[RuleSpec], dim_idx: usize) -> Rc<ShadowNode> {
-    // Base case: no more dimensions to branch on
-    if dim_idx >= NUM_DIMENSIONS || rules.is_empty() {
-        let mut node = ShadowNode {
-            dim_index: dim_idx,
-            action: None,
-            children: StdHashMap::new(),
-            wildcard: None,
-            range_children: Vec::new(),
-        };
-        // Pick the highest-priority rule as this leaf's action
-        if let Some(best) = rules.iter().max_by_key(|r| r.priority) {
-            // Use first action for tree node
-            if let Some(first_action) = best.actions.first() {
-                node.action = Some(ShadowAction {
-                    action: first_action.action_type(),
-                    priority: best.priority,
-                    rate_pps: first_action.rate_pps().unwrap_or(0),
-                    rule_id: best.bucket_key().unwrap_or_else(|| best.canonical_hash()),
-                });
-            }
-        }
-        return Rc::new(node);
-    }
-
-    let dim = DIM_ORDER[dim_idx];
-
-    // Check if ANY rule constrains this dimension (Eq, In, or range predicates)
-    let any_constrains = rules.iter().any(|r| {
-        r.constraints.iter().any(|p| p.constrains_dim(dim))
-    });
-
-    // If no rule constrains this dimension, skip it entirely
-    if !any_constrains {
-        return compile_recursive(rules, dim_idx + 1);
-    }
-
-    // Three-way partition:
-    //   specific:      Eq on this dimension → create specific edges
-    //   range_guarded: range predicate (>, <, >=, <=) on this dim → range edges
-    //   wildcard:      no constraint on this dimension → wildcard child
-    let mut specific: StdHashMap<u32, Vec<&RuleSpec>> = StdHashMap::new();
-    let mut range_guarded: Vec<(RangeEdge, &RuleSpec)> = Vec::new();
-    let mut wildcard: Vec<&RuleSpec> = Vec::new();
-
-    for rule in rules {
-        // Check for Eq constraint on this dimension first
-        let eq_value = rule.constraints.iter()
-            .find_map(|p| p.as_eq_dim().filter(|(d, _)| *d == dim).map(|(_, v)| v));
-        if let Some(value) = eq_value {
-            specific.entry(value).or_default().push(rule);
-        } else if let Some((op, val)) = rule.constraints.iter()
-            .find_map(|p| p.as_guard_on_dim(dim))
-        {
-            // Guard predicate (range or mask) on this dimension
-            range_guarded.push((RangeEdge { op, value: val }, rule));
-        } else {
-            wildcard.push(rule);
-        }
-    }
-
-    let mut node = ShadowNode {
-        dim_index: dim_idx,
-        action: None,
-        children: StdHashMap::new(),
-        wildcard: None,
-        range_children: Vec::new(),
-    };
-
-    // Rules that terminate at or above this level (don't constrain this dim or any below)
-    let remaining_dims: Vec<FieldDim> = DIM_ORDER[dim_idx..].to_vec();
-    let terminating: Vec<&RuleSpec> = rules.iter()
-        .filter(|r| !r.constraints.iter().any(|p| {
-            p.field_dim().map_or(false, |d| remaining_dims.contains(&d))
-        }))
-        .collect();
-    if let Some(best) = terminating.iter().max_by_key(|r| r.priority) {
-        // Use first action for tree node
-        if let Some(first_action) = best.actions.first() {
-            node.action = Some(ShadowAction {
-                action: first_action.action_type(),
-                priority: best.priority,
-                rate_pps: first_action.rate_pps().unwrap_or(0),
-                rule_id: best.bucket_key().unwrap_or_else(|| best.canonical_hash()),
-            });
-        }
-    }
-
-    // Build specific children: ONLY their own rules (no replication here).
-    // Replication happens during flatten via merge_flatten.
-    for (value, specific_rules) in &specific {
-        let owned: Vec<RuleSpec> = specific_rules.iter().map(|r| (*r).clone()).collect();
-        node.children.insert(*value, compile_recursive(&owned, dim_idx + 1));
-    }
-
-    // Build range children: group by identical range predicate, compile each group.
-    // Rules with the same (op, threshold) share a subtree.
-    let mut range_groups: StdHashMap<RangeEdge, Vec<&RuleSpec>> = StdHashMap::new();
-    for (edge, rule) in &range_guarded {
-        range_groups.entry(edge.clone()).or_default().push(rule);
-    }
-    for (edge, range_rules) in &range_groups {
-        let owned: Vec<RuleSpec> = range_rules.iter().map(|r| (*r).clone()).collect();
-        let child = compile_recursive(&owned, dim_idx + 1);
-        node.range_children.push((edge.clone(), child));
-    }
-
-    // Build wildcard child: only wildcard rules
-    if !wildcard.is_empty() {
-        let owned: Vec<RuleSpec> = wildcard.iter().map(|r| (*r).clone()).collect();
-        node.wildcard = Some(compile_recursive(&owned, dim_idx + 1));
-    }
-
-    Rc::new(node)
-}
+// (compile_recursive removed — replaced by compile_recursive_dynamic)
 
 // =============================================================================
 // Flatten shadow DAG into eBPF map entries (with lazy replication)
@@ -266,6 +553,7 @@ pub struct FlatTree {
     pub nodes: Vec<(u32, TreeNode)>,       // (node_id, node)
     pub edges: Vec<(EdgeKey, u32)>,         // (edge_key, child_id)
     pub rate_buckets: Vec<(u32, TokenBucket)>, // (rule_id, bucket)
+    pub byte_patterns: Vec<(u32, crate::BytePattern)>, // (pattern_idx, pattern)
     pub root_id: u32,
 }
 
@@ -273,17 +561,32 @@ pub struct FlatTree {
 /// The DAG is walked once, and each unique Rc node gets a unique flat ID.
 /// Wildcard rules are NOT replicated into specific subtrees; the eBPF
 /// walker's stack-based DFS explores both specific and wildcard paths.
+#[cfg(test)]
 fn flatten_tree(shadow: &Rc<ShadowNode>, base_id: u32) -> FlatTree {
+    // Use the static DIM_ORDER for non-custom-dim trees (tests without custom dims)
+    flatten_tree_with_dims(shadow, base_id, &DIM_ORDER)
+}
+
+fn flatten_tree_with_dims(shadow: &Rc<ShadowNode>, base_id: u32, dim_order: &[FieldDim]) -> FlatTree {
     let mut alloc = NodeAllocator::new(base_id);
+    // Collect byte patterns from the thread-local pattern allocator
+    let byte_patterns = PATTERN_ALLOC.with(|pa| {
+        let patterns = pa.borrow();
+        patterns.iter().enumerate()
+            .map(|(i, p)| (i as u32, *p))
+            .collect::<Vec<_>>()
+    });
+
     let mut flat = FlatTree {
         nodes: Vec::new(),
         edges: Vec::new(),
         rate_buckets: Vec::new(),
+        byte_patterns,
         root_id: 0,
     };
     let mut dedup: StdHashMap<usize, u32> = StdHashMap::new(); // Rc ptr -> flat node_id
 
-    flat.root_id = flatten_recursive(shadow, &mut alloc, &mut flat, &mut dedup);
+    flat.root_id = flatten_recursive(shadow, &mut alloc, &mut flat, &mut dedup, dim_order);
     flat
 }
 
@@ -308,6 +611,7 @@ fn flatten_recursive(
     alloc: &mut NodeAllocator,
     flat: &mut FlatTree,
     dedup: &mut StdHashMap<usize, u32>,
+    dim_order: &[FieldDim],
 ) -> u32 {
     let ptr = Rc::as_ptr(shadow) as usize;
     if let Some(&existing) = dedup.get(&ptr) {
@@ -319,14 +623,14 @@ fn flatten_recursive(
 
     // Flatten wildcard child
     let wildcard_child = if let Some(wc) = &shadow.wildcard {
-        flatten_recursive(wc, alloc, flat, dedup)
+        flatten_recursive(wc, alloc, flat, dedup, dim_order)
     } else {
         0
     };
 
     // Flatten specific children
     for (&value, child) in &shadow.children {
-        let child_id = flatten_recursive(child, alloc, flat, dedup);
+        let child_id = flatten_recursive(child, alloc, flat, dedup, dim_order);
         flat.edges.push((EdgeKey { parent: my_id, value }, child_id));
     }
 
@@ -345,7 +649,7 @@ fn flatten_recursive(
     // First, flatten all guard edge children to get their node IDs
     let guard_children: Vec<(RangeEdge, u32)> = shadow.range_children.iter()
         .map(|(edge, child)| {
-            let child_id = flatten_recursive(child, alloc, flat, dedup);
+            let child_id = flatten_recursive(child, alloc, flat, dedup, dim_order);
             (edge.clone(), child_id)
         })
         .collect();
@@ -355,8 +659,8 @@ fn flatten_recursive(
         || !guard_children.is_empty();
     let dimension = if !has_children {
         DIM_LEAF
-    } else if shadow.dim_index < NUM_DIMENSIONS {
-        DIM_ORDER[shadow.dim_index] as u8
+    } else if shadow.dim_index < dim_order.len() {
+        dim_order[shadow.dim_index] as u8
     } else {
         DIM_LEAF
     };
@@ -533,14 +837,14 @@ impl TreeManager {
         &mut self,
         rules: &[RuleSpec],
         bpf: &mut Ebpf,
-    ) -> Result<usize> {
+    ) -> Result<(usize, Vec<crate::RuleManifestEntry>)> {
         let base = self.staging_base();
 
-        // 1. Compile the tree
-        let shadow = compile_tree(rules);
+        // 1. Compile the tree (with L4Byte resolution)
+        let (shadow, custom_dim_mapping, dim_order, manifest) = compile_tree_full(rules);
 
-        // 2. Flatten into map entries
-        let flat = flatten_tree(&shadow, base);
+        // 2. Flatten into map entries (using full dim_order including custom dims)
+        let flat = flatten_tree_with_dims(&shadow, base, &dim_order);
         let node_count = flat.nodes.len();
         let edge_count = flat.edges.len();
 
@@ -557,7 +861,7 @@ impl TreeManager {
                 .try_into()?;
             root_map.set(0, 0u32, 0)?;
             self.active_slot = 1 - self.active_slot;
-            return Ok(0);
+            return Ok((0, manifest));
         }
 
         // 3. Write nodes to TREE_NODES array
@@ -628,7 +932,36 @@ impl TreeManager {
             }
         }
 
-        // 6. ATOMIC FLIP: update TREE_ROOT to point to new tree's root
+        // 6. Write CUSTOM_DIM_CONFIG for l4-match byte extraction
+        {
+            let mut dim_config: Array<_, u32> = bpf
+                .map_mut("CUSTOM_DIM_CONFIG").context("CUSTOM_DIM_CONFIG not found")?
+                .try_into()?;
+            for i in 0..crate::NUM_CUSTOM_DIMS {
+                let packed = if let Some(entry) = custom_dim_mapping.config_entry(i) {
+                    (entry.offset as u32) | ((entry.length as u32) << 16)
+                } else {
+                    0u32  // inactive slot
+                };
+                dim_config.set(i as u32, packed, 0)?;
+            }
+            if custom_dim_mapping.len() > 0 {
+                info!("CUSTOM_DIM_CONFIG: {} active slot(s)", custom_dim_mapping.len());
+            }
+        }
+
+        // 7. Write BYTE_PATTERNS for pattern guard edges
+        if !flat.byte_patterns.is_empty() {
+            let mut pat_map: Array<_, crate::BytePattern> = bpf
+                .map_mut("BYTE_PATTERNS").context("BYTE_PATTERNS not found")?
+                .try_into()?;
+            for &(idx, ref pattern) in &flat.byte_patterns {
+                pat_map.set(idx, *pattern, 0)?;
+            }
+            info!("BYTE_PATTERNS: wrote {} pattern(s)", flat.byte_patterns.len());
+        }
+
+        // 8. ATOMIC FLIP: update TREE_ROOT to point to new tree's root
         {
             let mut root_map: Array<_, u32> = bpf
                 .map_mut("TREE_ROOT").context("TREE_ROOT not found")?
@@ -639,7 +972,7 @@ impl TreeManager {
         info!("Tree flip complete: root={} (slot {})", flat.root_id, 1 - self.active_slot);
         self.active_slot = 1 - self.active_slot;
 
-        Ok(node_count)
+        Ok((node_count, manifest))
     }
 
     /// Clean up the old (now-inactive) slot's entries from the edge HashMap.
@@ -707,6 +1040,25 @@ mod tests {
     use super::*;
     use crate::{FieldDim, Predicate, RuleAction, RuleSpec};
 
+    /// Simulate a byte pattern check for userspace tests.
+    /// `pkt_bytes` is a flat byte array representing the "transport payload"
+    /// (offset 0 = first byte of transport header).
+    fn sim_check_pattern(flat: &FlatTree, pkt_bytes: &[u8], pattern_idx: u32) -> bool {
+        if let Some((_, pat)) = flat.byte_patterns.iter().find(|(idx, _)| *idx == pattern_idx) {
+            // Pre-shifted layout: match/mask_bytes[i] corresponds to pkt_bytes[i]
+            // directly. Bytes outside the pattern range have mask=0 (always pass).
+            for j in 0..crate::MAX_PATTERN_LEN {
+                let byte = if j < pkt_bytes.len() { pkt_bytes[j] } else { 0 };
+                if (byte & pat.mask_bytes[j]) != pat.match_bytes[j] {
+                    return false;
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     #[test]
     fn test_empty_rules() {
         let tree = compile_tree(&[]);
@@ -738,11 +1090,11 @@ mod tests {
         let rules = vec![
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ),
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 123)],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ),
         ];
         let tree = compile_tree(&rules);
@@ -764,7 +1116,7 @@ mod tests {
             RuleSpec::rate_limit_field(FieldDim::Proto, 17, 1000).with_priority(5),
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(10),
         ];
         let tree = compile_tree(&rules);
@@ -833,12 +1185,12 @@ mod tests {
     fn test_canonical_hash_idempotent() {
         let spec1 = RuleSpec::compound(
             vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-            RuleAction::Drop,
+            RuleAction::drop(),
         );
         let spec2 = RuleSpec::compound(
             // Same constraints in different order
             vec![Predicate::eq(FieldDim::L4Word0, 53), Predicate::eq(FieldDim::Proto, 17)],
-            RuleAction::Drop,
+            RuleAction::drop(),
         );
         assert_eq!(spec1.canonical_hash(), spec2.canonical_hash());
     }
@@ -869,6 +1221,16 @@ mod tests {
         packet: &[(FieldDim, u32)],
         trace: bool,
     ) -> (bool, u8, u8, u32) {
+        let pkt_bytes: &[u8] = &[]; // No raw bytes for non-pattern tests
+        simulate_walk_inner_with_bytes(flat, packet, pkt_bytes, trace)
+    }
+
+    fn simulate_walk_inner_with_bytes(
+        flat: &FlatTree,
+        packet: &[(FieldDim, u32)],
+        pkt_bytes: &[u8],
+        trace: bool,
+    ) -> (bool, u8, u8, u32) {
         use std::collections::HashMap as Map;
 
         // Build lookup structures from the flat tree
@@ -886,7 +1248,7 @@ mod tests {
         // Multi-cursor state: unbounded for correctness proof
         let mut cursors: Vec<u32> = vec![flat.root_id];
 
-        for level in 0..NUM_DIMENSIONS {
+        for level in 0..(crate::MAX_DIM as usize) {
             if cursors.is_empty() { break; }
 
             if trace {
@@ -915,7 +1277,7 @@ mod tests {
                 }
 
                 // If leaf, cursor dies
-                if node.dimension == DIM_LEAF || node.dimension >= NUM_DIMENSIONS as u8 {
+                if node.dimension == DIM_LEAF || node.dimension >= crate::MAX_DIM {
                     if trace { eprintln!("    cid={}: LEAF (dim={})", cid, node.dimension); }
                     continue;
                 }
@@ -955,7 +1317,12 @@ mod tests {
                         crate::RANGE_OP_LT  => fv < node.range_val_0,
                         crate::RANGE_OP_GTE => fv >= node.range_val_0,
                         crate::RANGE_OP_LTE => fv <= node.range_val_0,
-                        crate::RANGE_OP_MASK => (fv & node.range_val_0) != 0,
+                        crate::RANGE_OP_MASK_EQ => {
+                            let mask = node.range_val_0 >> 16;
+                            let expected = node.range_val_0 & 0xFFFF;
+                            (fv & mask) == expected
+                        }
+                        crate::RANGE_OP_PATTERN => sim_check_pattern(flat, pkt_bytes, node.range_val_0),
                         _ => false,
                     };
                     if passes {
@@ -968,7 +1335,12 @@ mod tests {
                         crate::RANGE_OP_LT  => fv < node.range_val_1,
                         crate::RANGE_OP_GTE => fv >= node.range_val_1,
                         crate::RANGE_OP_LTE => fv <= node.range_val_1,
-                        crate::RANGE_OP_MASK => (fv & node.range_val_1) != 0,
+                        crate::RANGE_OP_MASK_EQ => {
+                            let mask = node.range_val_1 >> 16;
+                            let expected = node.range_val_1 & 0xFFFF;
+                            (fv & mask) == expected
+                        }
+                        crate::RANGE_OP_PATTERN => sim_check_pattern(flat, pkt_bytes, node.range_val_1),
                         _ => false,
                     };
                     if passes {
@@ -1027,6 +1399,16 @@ mod tests {
         packet: &[(FieldDim, u32)],
         trace: bool,
     ) -> (bool, u8, u8, u32) {
+        let pkt_bytes: &[u8] = &[];
+        simulate_single_walk_inner_with_bytes(flat, packet, pkt_bytes, trace)
+    }
+
+    fn simulate_single_walk_inner_with_bytes(
+        flat: &FlatTree,
+        packet: &[(FieldDim, u32)],
+        pkt_bytes: &[u8],
+        trace: bool,
+    ) -> (bool, u8, u8, u32) {
         use std::collections::HashMap as Map;
 
         let nodes: Map<u32, &TreeNode> = flat.nodes.iter().map(|(id, n)| (*id, n)).collect();
@@ -1074,7 +1456,7 @@ mod tests {
             }
 
             // Leaf node — no children to explore
-            if node.dimension == DIM_LEAF || node.dimension >= NUM_DIMENSIONS as u8 {
+            if node.dimension == DIM_LEAF || node.dimension >= crate::MAX_DIM {
                 if trace { eprintln!("  iter={}: nid={} LEAF", _iter, nid); }
                 continue;
             }
@@ -1098,7 +1480,12 @@ mod tests {
                     crate::RANGE_OP_LT  => fv < node.range_val_1,
                     crate::RANGE_OP_GTE => fv >= node.range_val_1,
                     crate::RANGE_OP_LTE => fv <= node.range_val_1,
-                    crate::RANGE_OP_MASK => (fv & node.range_val_1) != 0,
+                    crate::RANGE_OP_MASK_EQ => {
+                        let mask = node.range_val_1 >> 16;
+                        let expected = node.range_val_1 & 0xFFFF;
+                        (fv & mask) == expected
+                    }
+                    crate::RANGE_OP_PATTERN => sim_check_pattern(flat, pkt_bytes, node.range_val_1),
                     _ => false,
                 };
                 if passes && top < 16 {
@@ -1116,7 +1503,12 @@ mod tests {
                     crate::RANGE_OP_LT  => fv < node.range_val_0,
                     crate::RANGE_OP_GTE => fv >= node.range_val_0,
                     crate::RANGE_OP_LTE => fv <= node.range_val_0,
-                    crate::RANGE_OP_MASK => (fv & node.range_val_0) != 0,
+                    crate::RANGE_OP_MASK_EQ => {
+                        let mask = node.range_val_0 >> 16;
+                        let expected = node.range_val_0 & 0xFFFF;
+                        (fv & mask) == expected
+                    }
+                    crate::RANGE_OP_PATTERN => sim_check_pattern(flat, pkt_bytes, node.range_val_0),
                     _ => false,
                 };
                 if passes && top < 16 {
@@ -1163,7 +1555,7 @@ mod tests {
         let rules = vec![
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(10),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -1197,7 +1589,7 @@ mod tests {
             RuleSpec::rate_limit_field(FieldDim::Proto, 17, 1000).with_priority(20),
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(5),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -1219,7 +1611,7 @@ mod tests {
             RuleSpec::rate_limit_field(FieldDim::Proto, 17, 1000).with_priority(5),
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(10),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -1242,7 +1634,7 @@ mod tests {
             RuleSpec::rate_limit_field(FieldDim::Proto, 17, 1000).with_priority(5),
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(10),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -1260,7 +1652,7 @@ mod tests {
         let rules = vec![
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(10),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -1311,7 +1703,7 @@ mod tests {
                     Predicate::eq(FieldDim::SrcIp, ip),
                     Predicate::eq(FieldDim::L4Word1, 8000 + i),
                 ],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(100));
         }
 
@@ -1382,7 +1774,7 @@ mod tests {
         let mut rules = vec![
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::L4Word1, 7)],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(21),
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::TcpWindow, 11)],
@@ -1397,7 +1789,7 @@ mod tests {
                     Predicate::eq(FieldDim::SrcIp, i),
                     Predicate::eq(FieldDim::DstIp, i + 100),
                 ],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(10));
         }
 
@@ -1439,7 +1831,7 @@ mod tests {
         let rules = vec![
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::TcpFlags, 2)],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(150),
             RuleSpec::compound(
                 vec![
@@ -1490,7 +1882,7 @@ mod tests {
                         Predicate::eq(FieldDim::SrcIp, make_ip(i)),
                         Predicate::eq(FieldDim::L4Word1, 8000 + i),
                     ],
-                    RuleAction::Drop,
+                    RuleAction::drop(),
                 ).with_priority(100)
             );
         }
@@ -1559,9 +1951,10 @@ mod tests {
                     Predicate::Lte(crate::FieldRef::Dim(dim), value) => {
                         pkt.get(dim).map_or(false, |v| v <= value)
                     }
-                    Predicate::Mask(crate::FieldRef::Dim(dim), mask) => {
-                        pkt.get(dim).map_or(false, |v| (v & mask) != 0)
+                    Predicate::MaskEq(crate::FieldRef::Dim(dim), mask, expected) => {
+                        pkt.get(dim).map_or(false, |v| (v & mask) == *expected)
                     }
+                    _ => false,
                 }
             });
             if all_match && rule.priority >= best_prio {
@@ -1585,7 +1978,7 @@ mod tests {
             FieldDim::TcpFlags, FieldDim::Ttl, FieldDim::DfBit, FieldDim::TcpWindow,
         ];
         let actions = [
-            RuleAction::Drop, 
+            RuleAction::drop(), 
             RuleAction::RateLimit { pps: 1000, name: None }, 
             RuleAction::Pass
         ];
@@ -1655,7 +2048,8 @@ mod tests {
                                 Predicate::Lt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v < val),
                                 Predicate::Gte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v >= val),
                                 Predicate::Lte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v <= val),
-                                Predicate::Mask(crate::FieldRef::Dim(dim), mask) => pkt_map.get(dim).map_or(false, |v| (v & mask) != 0),
+                                Predicate::MaskEq(crate::FieldRef::Dim(dim), mask, expected) => pkt_map.get(dim).map_or(false, |v| (v & mask) == *expected),
+                                _ => false,
                             })
                         }).collect();
                         eprintln!("FAIL iter={}, packet={:?}", iter, packet);
@@ -1679,7 +2073,8 @@ mod tests {
                             Predicate::Lt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v < val),
                             Predicate::Gte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v >= val),
                             Predicate::Lte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v <= val),
-                            Predicate::Mask(crate::FieldRef::Dim(dim), mask) => pkt_map.get(dim).map_or(false, |v| (v & mask) != 0),
+                            Predicate::MaskEq(crate::FieldRef::Dim(dim), mask, expected) => pkt_map.get(dim).map_or(false, |v| (v & mask) == *expected),
+                                _ => false,
                         })
                     }).count();
                     if top_prio_count == 1 {
@@ -1706,7 +2101,7 @@ mod tests {
             FieldDim::TcpFlags, FieldDim::Ttl, FieldDim::DfBit, FieldDim::TcpWindow,
         ];
         let actions = [
-            RuleAction::Drop, 
+            RuleAction::drop(), 
             RuleAction::RateLimit { pps: 1000, name: None }, 
             RuleAction::Pass
         ];
@@ -1771,7 +2166,8 @@ mod tests {
                                 Predicate::Lt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v < val),
                                 Predicate::Gte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v >= val),
                                 Predicate::Lte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v <= val),
-                                Predicate::Mask(crate::FieldRef::Dim(dim), mask) => pkt_map.get(dim).map_or(false, |v| (v & mask) != 0),
+                                Predicate::MaskEq(crate::FieldRef::Dim(dim), mask, expected) => pkt_map.get(dim).map_or(false, |v| (v & mask) == *expected),
+                                _ => false,
                             })
                         }).collect();
                         eprintln!("FAIL iter={}, packet={:?}", iter, packet);
@@ -1794,7 +2190,8 @@ mod tests {
                             Predicate::Lt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v < val),
                             Predicate::Gte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v >= val),
                             Predicate::Lte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v <= val),
-                            Predicate::Mask(crate::FieldRef::Dim(dim), mask) => pkt_map.get(dim).map_or(false, |v| (v & mask) != 0),
+                            Predicate::MaskEq(crate::FieldRef::Dim(dim), mask, expected) => pkt_map.get(dim).map_or(false, |v| (v & mask) == *expected),
+                                _ => false,
                         })
                     }).count();
                     if top_prio_count == 1 {
@@ -1944,7 +2341,7 @@ mod tests {
                         Predicate::eq(FieldDim::Proto, 17),
                         Predicate::eq(FieldDim::SrcIp, make_ip(i)),
                     ],
-                    RuleAction::Drop,
+                    RuleAction::drop(),
                 ).with_priority((100 + i) as u8)
             );
         }
@@ -1968,7 +2365,7 @@ mod tests {
                     Predicate::eq(FieldDim::DfBit, 1),
                     Predicate::eq(FieldDim::TcpWindow, 65535),
                 ],
-                RuleAction::Drop,
+                RuleAction::drop(),
             )
         }).collect();
         let flat = stress_compile("full_depth_100", &rules);
@@ -2003,7 +2400,7 @@ mod tests {
                             Predicate::eq(FieldDim::TcpFlags, 0x02),
                             Predicate::eq(FieldDim::L4Word1, 80 + (i % 50)),
                         ],
-                        RuleAction::Drop,
+                        RuleAction::drop(),
                     ).with_priority(prio)
                 }
                 2 => {
@@ -2013,7 +2410,7 @@ mod tests {
                             Predicate::eq(FieldDim::SrcIp, make_ip(i)),
                             Predicate::eq(FieldDim::L4Word1, 9999),
                         ],
-                        RuleAction::Drop,
+                        RuleAction::drop(),
                     ).with_priority(prio)
                 }
                 3 => {
@@ -2052,7 +2449,7 @@ mod tests {
         let rules = vec![
             RuleSpec::compound(
                 vec![Predicate::Gt(crate::FieldRef::Dim(FieldDim::L4Word1), 1000)],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(100),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -2090,7 +2487,7 @@ mod tests {
         let rules = vec![
             RuleSpec::compound(
                 vec![Predicate::Lt(crate::FieldRef::Dim(FieldDim::Ttl), 5)],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(100),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -2138,7 +2535,7 @@ mod tests {
                     Predicate::eq(FieldDim::Proto, 17),
                     Predicate::Gt(crate::FieldRef::Dim(FieldDim::L4Word1), 1000),
                 ],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(100),
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17)],
@@ -2176,7 +2573,7 @@ mod tests {
         let rules = vec![
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word1, 8080)],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(200),
             RuleSpec::compound(
                 vec![
@@ -2227,7 +2624,7 @@ mod tests {
         let rules = vec![
             RuleSpec::compound(
                 vec![Predicate::Gt(crate::FieldRef::Dim(FieldDim::L4Word1), 1000)],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(100),
             RuleSpec::compound(
                 vec![Predicate::Lt(crate::FieldRef::Dim(FieldDim::L4Word1), 100)],
@@ -2260,8 +2657,8 @@ mod tests {
         // Packet with tcp-flags=1 (FIN only): does NOT match
         let rules = vec![
             RuleSpec::compound(
-                vec![Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02)],
-                RuleAction::Drop,
+                vec![Predicate::MaskEq(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02, 0x02)],
+                RuleAction::drop(),
             ).with_priority(100),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -2288,9 +2685,9 @@ mod tests {
             RuleSpec::compound(
                 vec![
                     Predicate::Eq(crate::FieldRef::Dim(FieldDim::Proto), 6),
-                    Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02),
+                    Predicate::MaskEq(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02, 0x02),
                 ],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(100),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -2314,8 +2711,8 @@ mod tests {
         // Packet flags=1: B wins (only matches B)
         let rules = vec![
             RuleSpec::compound(
-                vec![Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02)],
-                RuleAction::Drop,
+                vec![Predicate::MaskEq(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02, 0x02)],
+                RuleAction::drop(),
             ).with_priority(100),
             RuleSpec::compound(vec![], RuleAction::Pass).with_priority(50),
         ];
@@ -2341,11 +2738,11 @@ mod tests {
         // Packet flags=0x12 (SYN+ACK): both match, but DFS order/priority tie breaks
         let rules = vec![
             RuleSpec::compound(
-                vec![Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02)],
-                RuleAction::Drop,
+                vec![Predicate::MaskEq(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02, 0x02)],
+                RuleAction::drop(),
             ).with_priority(100),
             RuleSpec::compound(
-                vec![Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x10)],
+                vec![Predicate::MaskEq(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x10, 0x10)],
                 RuleAction::RateLimit { pps: 5000, name: None },
             ).with_priority(100),
         ];
@@ -2380,30 +2777,30 @@ mod tests {
             RuleSpec::compound(
                 vec![
                     Predicate::Eq(crate::FieldRef::Dim(FieldDim::Proto), 6),
-                    Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02),
+                    Predicate::MaskEq(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02, 0x02),
                 ],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(200),
             RuleSpec::compound(
                 vec![
                     Predicate::Eq(crate::FieldRef::Dim(FieldDim::Proto), 6),
-                    Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x10),
+                    Predicate::MaskEq(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x10, 0x10),
                 ],
                 RuleAction::RateLimit { pps: 500, name: None },
             ).with_priority(150),
             RuleSpec::compound(
                 vec![
                     Predicate::Eq(crate::FieldRef::Dim(FieldDim::Proto), 6),
-                    Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x04),
+                    Predicate::MaskEq(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x04, 0x04),
                 ],
                 RuleAction::Pass,
             ).with_priority(100),
             RuleSpec::compound(
                 vec![
                     Predicate::Eq(crate::FieldRef::Dim(FieldDim::Proto), 6),
-                    Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x01),
+                    Predicate::MaskEq(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x01, 0x01),
                 ],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(50),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -2472,14 +2869,14 @@ mod tests {
         let rules = vec![
             RuleSpec::compound(
                 vec![Predicate::Gt(crate::FieldRef::Dim(FieldDim::L4Word1), 50000)],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(200),
             RuleSpec::compound(
                 vec![Predicate::Lt(crate::FieldRef::Dim(FieldDim::L4Word1), 100)],
-                RuleAction::Drop,
+                RuleAction::drop(),
             ).with_priority(150),
             RuleSpec::compound(
-                vec![Predicate::Mask(crate::FieldRef::Dim(FieldDim::L4Word1), 0x8000)],
+                vec![Predicate::MaskEq(crate::FieldRef::Dim(FieldDim::L4Word1), 0x8000, 0x8000)],
                 RuleAction::Pass,
             ).with_priority(100),
             RuleSpec::compound(
@@ -2487,8 +2884,8 @@ mod tests {
                 RuleAction::RateLimit { pps: 1000, name: None },
             ).with_priority(80),
             RuleSpec::compound(
-                vec![Predicate::Mask(crate::FieldRef::Dim(FieldDim::L4Word1), 0x0001)],
-                RuleAction::Drop,
+                vec![Predicate::MaskEq(crate::FieldRef::Dim(FieldDim::L4Word1), 0x0001, 0x0001)],
+                RuleAction::drop(),
             ).with_priority(50),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -2574,7 +2971,7 @@ mod tests {
                 )
             }).collect();
 
-            let nodes = filter.compile_and_flip_tree(&rules_100).await
+            let (nodes, _manifest) = filter.compile_and_flip_tree(&rules_100).await
                 .expect("compile_and_flip failed for 100 rules");
             eprintln!("eBPF integration: 100 rules -> {} nodes", nodes);
             assert!(nodes > 0, "Expected nodes > 0 for 100 rules");
@@ -2590,13 +2987,13 @@ mod tests {
                 )
             }).collect();
 
-            let nodes = filter.compile_and_flip_tree(&rules_1k).await
+            let (nodes, _) = filter.compile_and_flip_tree(&rules_1k).await
                 .expect("compile_and_flip failed for 1000 rules (second flip)");
             eprintln!("eBPF integration: 1000 rules -> {} nodes (blue/green flip)", nodes);
             assert!(nodes > 0, "Expected nodes > 0 for 1000 rules");
 
             // === Third flip: back to smaller set (verifies second slot cleanup) ===
-            let nodes = filter.compile_and_flip_tree(&rules_100).await
+            let (nodes, _) = filter.compile_and_flip_tree(&rules_100).await
                 .expect("compile_and_flip failed on third flip");
             eprintln!("eBPF integration: back to 100 rules -> {} nodes (third flip)", nodes);
             assert!(nodes > 0);
@@ -2607,5 +3004,491 @@ mod tests {
 
             eprintln!("eBPF integration stress test PASSED");
         });
+    }
+
+    // =========================================================================
+    // Phase 2a Tests: Short (1-4 byte) L4Byte fan-out via custom dimensions
+    // =========================================================================
+
+    #[test]
+    fn test_l4byte_single_byte_fanout() {
+        // Simulate a game protocol: 1-byte message type at transport offset 0.
+        // 80 message types, each mapped to a different action.
+        // The compiler should assign this to a single CustomN dimension,
+        // enabling O(1) fan-out via specific edges.
+        let mut rules = Vec::new();
+        for msg_type in 0u32..80 {
+            rules.push(RuleSpec::compound(
+                vec![
+                    Predicate::Eq(FieldRef::Dim(FieldDim::Proto), 6), // TCP
+                    Predicate::Eq(FieldRef::L4Byte { offset: 0, length: 1 }, msg_type),
+                ],
+                RuleAction::drop(),
+            ).with_priority(100));
+        }
+
+        let (shadow, mapping, dim_order, _) = compile_tree_full(&rules);
+        let flat = flatten_tree_with_dims(&shadow, 1, &dim_order);
+
+        // The mapping should have 1 custom dim for offset=0, len=1
+        assert_eq!(mapping.len(), 1, "Should have exactly 1 custom dimension");
+
+        // Dim order should have 9 static + 1 custom = 10
+        assert_eq!(dim_order.len(), 10, "Dim order should have 10 entries");
+
+        // Find which custom dim was assigned
+        let custom_dim = mapping.entries[0].2;
+        assert!(custom_dim.is_custom(), "Should be a custom dim");
+
+        // Test: TCP packet with message type 42 should match
+        let (matched, action, _, _) = simulate_single_walk(&flat, &[
+            (FieldDim::Proto, 6),
+            (custom_dim, 42),
+        ]);
+        assert!(matched, "Message type 42 should match");
+        assert_eq!(action, crate::ACT_DROP);
+
+        // Test: TCP packet with message type 79 should match
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[
+            (FieldDim::Proto, 6),
+            (custom_dim, 79),
+        ]);
+        assert!(matched, "Message type 79 should match");
+
+        // Test: TCP packet with message type 80 should NOT match (out of range)
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[
+            (FieldDim::Proto, 6),
+            (custom_dim, 80),
+        ]);
+        assert!(!matched, "Message type 80 should NOT match");
+
+        // Test: UDP packet with message type 42 should NOT match (wrong proto)
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[
+            (FieldDim::Proto, 17),
+            (custom_dim, 42),
+        ]);
+        assert!(!matched, "UDP packet should NOT match");
+
+        eprintln!("l4byte_single_byte_fanout: {} nodes, {} edges (80 msg types)",
+            flat.nodes.len(), flat.edges.len());
+    }
+
+    #[test]
+    fn test_l4byte_two_byte_fanout() {
+        // 2-byte value at offset 4 (e.g., a game opcode)
+        let rules = vec![
+            RuleSpec::compound(
+                vec![Predicate::Eq(FieldRef::L4Byte { offset: 4, length: 2 }, 0x0100)],
+                RuleAction::drop(),
+            ).with_priority(100),
+            RuleSpec::compound(
+                vec![Predicate::Eq(FieldRef::L4Byte { offset: 4, length: 2 }, 0x0200)],
+                RuleAction::Pass,
+            ).with_priority(50),
+        ];
+
+        let (shadow, mapping, dim_order, _) = compile_tree_full(&rules);
+        let flat = flatten_tree_with_dims(&shadow, 1, &dim_order);
+
+        assert_eq!(mapping.len(), 1, "Should have 1 custom dim for offset=4, len=2");
+        let custom_dim = mapping.entries[0].2;
+
+        let (matched, action, _, _) = simulate_single_walk(&flat, &[(custom_dim, 0x0100)]);
+        assert!(matched);
+        assert_eq!(action, crate::ACT_DROP);
+
+        let (matched, action, _, _) = simulate_single_walk(&flat, &[(custom_dim, 0x0200)]);
+        assert!(matched);
+        assert_eq!(action, crate::ACT_PASS);
+
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[(custom_dim, 0x0300)]);
+        assert!(!matched, "Unmatched opcode should NOT match");
+    }
+
+    #[test]
+    fn test_l4byte_four_byte_fanout() {
+        // 4-byte value at offset 8 (e.g., a session ID prefix)
+        let rules = vec![
+            RuleSpec::compound(
+                vec![Predicate::Eq(FieldRef::L4Byte { offset: 8, length: 4 }, 0xDEADBEEF)],
+                RuleAction::drop(),
+            ).with_priority(100),
+        ];
+
+        let (shadow, mapping, dim_order, _) = compile_tree_full(&rules);
+        let flat = flatten_tree_with_dims(&shadow, 1, &dim_order);
+
+        assert_eq!(mapping.len(), 1);
+        let custom_dim = mapping.entries[0].2;
+
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[(custom_dim, 0xDEADBEEF)]);
+        assert!(matched, "0xDEADBEEF should match");
+
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[(custom_dim, 0xDEADBEE0)]);
+        assert!(!matched, "0xDEADBEE0 should NOT match");
+    }
+
+    #[test]
+    fn test_l4byte_masked_short_match() {
+        // Masked 1-byte match: check only the upper 4 bits of a byte at offset 0
+        // mask = 0xF0, match = 0x30 -> matches 0x30-0x3F
+        let rules = vec![
+            RuleSpec::compound(
+                vec![Predicate::MaskEq(FieldRef::L4Byte { offset: 0, length: 1 }, 0xF0, 0x30)],
+                RuleAction::drop(),
+            ).with_priority(100),
+        ];
+
+        let (shadow, mapping, dim_order, _) = compile_tree_full(&rules);
+        let flat = flatten_tree_with_dims(&shadow, 1, &dim_order);
+
+        // MaskEq on short L4Byte should still get a custom dim, but as a guard edge
+        // (since the mask isn't full-width, it can't be a specific edge)
+        assert!(mapping.len() <= 1, "Should use at most 1 custom dim");
+
+        if mapping.len() == 1 {
+            let custom_dim = mapping.entries[0].2;
+            // Value 0x35 should match (0x35 & 0xF0 == 0x30)
+            let (matched, _, _, _) = simulate_single_walk(&flat, &[(custom_dim, 0x35)]);
+            assert!(matched, "0x35 should match (upper nibble = 0x3)");
+
+            // Value 0x45 should NOT match (0x45 & 0xF0 == 0x40)
+            let (matched, _, _, _) = simulate_single_walk(&flat, &[(custom_dim, 0x45)]);
+            assert!(!matched, "0x45 should NOT match (upper nibble = 0x4)");
+        }
+    }
+
+    #[test]
+    fn test_l4byte_multiple_custom_dims() {
+        // Use two different L4Byte locations (different offsets)
+        // This should allocate two custom dimensions.
+        let rules = vec![
+            RuleSpec::compound(
+                vec![
+                    Predicate::Eq(FieldRef::L4Byte { offset: 0, length: 1 }, 0x01),
+                    Predicate::Eq(FieldRef::L4Byte { offset: 2, length: 2 }, 0x1234),
+                ],
+                RuleAction::drop(),
+            ).with_priority(100),
+        ];
+
+        let (shadow, mapping, dim_order, _) = compile_tree_full(&rules);
+        let flat = flatten_tree_with_dims(&shadow, 1, &dim_order);
+
+        assert_eq!(mapping.len(), 2, "Should have 2 custom dimensions");
+        assert_eq!(dim_order.len(), 11, "Dim order: 9 static + 2 custom");
+
+        let dim_a = mapping.entries[0].2; // offset=0,len=1
+        let dim_b = mapping.entries[1].2; // offset=2,len=2
+
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[
+            (dim_a, 0x01),
+            (dim_b, 0x1234),
+        ]);
+        assert!(matched, "Both custom dims matched should hit");
+
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[
+            (dim_a, 0x01),
+            (dim_b, 0x5678),
+        ]);
+        assert!(!matched, "Second custom dim mismatch should NOT hit");
+    }
+
+    #[test]
+    fn test_l4byte_mixed_with_existing_fields() {
+        // Combine L4Byte with traditional fields (proto, src-port)
+        let rules = vec![
+            RuleSpec::compound(
+                vec![
+                    Predicate::Eq(FieldRef::Dim(FieldDim::Proto), 6),      // TCP
+                    Predicate::Eq(FieldRef::Dim(FieldDim::L4Word1), 8080), // dst-port
+                    Predicate::Eq(FieldRef::L4Byte { offset: 20, length: 1 }, 0x42), // payload byte
+                ],
+                RuleAction::drop(),
+            ).with_priority(100),
+        ];
+
+        let (shadow, mapping, dim_order, _) = compile_tree_full(&rules);
+        let flat = flatten_tree_with_dims(&shadow, 1, &dim_order);
+
+        assert_eq!(mapping.len(), 1, "One custom dim for the payload byte");
+        let custom_dim = mapping.entries[0].2;
+
+        // Full match
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[
+            (FieldDim::Proto, 6),
+            (FieldDim::L4Word1, 8080),
+            (custom_dim, 0x42),
+        ]);
+        assert!(matched, "Full match should hit");
+
+        // Wrong proto
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[
+            (FieldDim::Proto, 17),
+            (FieldDim::L4Word1, 8080),
+            (custom_dim, 0x42),
+        ]);
+        assert!(!matched, "Wrong proto should NOT match");
+
+        // Wrong payload byte
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[
+            (FieldDim::Proto, 6),
+            (FieldDim::L4Word1, 8080),
+            (custom_dim, 0x43),
+        ]);
+        assert!(!matched, "Wrong payload byte should NOT match");
+    }
+
+    // =========================================================================
+    // Phase 2b Tests: Long pattern guard edges (5-64 byte patterns)
+    // =========================================================================
+
+    #[test]
+    fn test_pattern_guard_8byte() {
+        // 8-byte exact match at offset 0 via RawByteMatch
+        let mut pat = crate::BytePattern::default();
+        pat.offset = 0;
+        pat.length = 8;
+        pat.match_bytes[..8].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE]);
+        for i in 0..8 { pat.mask_bytes[i] = 0xFF; }
+
+        let rules = vec![
+            RuleSpec::compound(
+                vec![
+                    Predicate::Eq(FieldRef::Dim(FieldDim::Proto), 6),
+                    Predicate::RawByteMatch(Box::new(pat)),
+                ],
+                RuleAction::drop(),
+            ).with_priority(100),
+        ];
+
+        let (shadow, _, dim_order, _) = compile_tree_full(&rules);
+        let flat = flatten_tree_with_dims(&shadow, 1, &dim_order);
+
+        // The pattern should have been allocated
+        assert_eq!(flat.byte_patterns.len(), 1, "Should have 1 byte pattern");
+
+        // Matching packet bytes (transport payload starts at offset 0)
+        let pkt_bytes = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
+        let (matched, action, _, _) = simulate_walk_inner_with_bytes(
+            &flat,
+            &[(FieldDim::Proto, 6)],
+            &pkt_bytes,
+            false,
+        );
+        assert!(matched, "8-byte pattern should match");
+        assert_eq!(action, crate::ACT_DROP);
+
+        // Non-matching packet bytes (last byte differs)
+        let pkt_bytes_bad = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0x00];
+        let (matched, _, _, _) = simulate_walk_inner_with_bytes(
+            &flat,
+            &[(FieldDim::Proto, 6)],
+            &pkt_bytes_bad,
+            false,
+        );
+        assert!(!matched, "Mismatched 8-byte pattern should NOT match");
+
+        // Wrong proto: guard is on Proto dim, so if proto doesn't match,
+        // the specific edge for proto won't be taken (no cursor reaches the pattern node)
+        let (matched, _, _, _) = simulate_walk_inner_with_bytes(
+            &flat,
+            &[(FieldDim::Proto, 17)],
+            &pkt_bytes,
+            false,
+        );
+        assert!(!matched, "Wrong proto should NOT match even with matching bytes");
+    }
+
+    #[test]
+    fn test_pattern_guard_32byte_masked() {
+        // 32-byte match with mask: only first 4 bytes must be exact, rest ignored
+        let mut pat = crate::BytePattern::default();
+        pat.offset = 10;
+        pat.length = 32;
+        // First 4 bytes: exact match
+        pat.match_bytes[..4].copy_from_slice(&[0x47, 0x45, 0x54, 0x20]); // "GET "
+        for i in 0..4 { pat.mask_bytes[i] = 0xFF; }
+        // Remaining 28 bytes: mask = 0x00 (don't care)
+        for i in 4..32 { pat.mask_bytes[i] = 0x00; pat.match_bytes[i] = 0x00; }
+
+        let rules = vec![
+            RuleSpec::compound(
+                vec![Predicate::RawByteMatch(Box::new(pat))],
+                RuleAction::drop(),
+            ).with_priority(100),
+        ];
+
+        let (shadow, _, dim_order, _) = compile_tree_full(&rules);
+        let flat = flatten_tree_with_dims(&shadow, 1, &dim_order);
+        assert_eq!(flat.byte_patterns.len(), 1);
+
+        // Build a packet: some prefix bytes, then at offset 10: "GET " followed by random
+        let mut pkt = vec![0u8; 50];
+        pkt[10] = 0x47; pkt[11] = 0x45; pkt[12] = 0x54; pkt[13] = 0x20; // "GET "
+        // Rest can be anything
+        for i in 14..42 { pkt[i] = 0xAB; }
+
+        let (matched, _, _, _) = simulate_walk_inner_with_bytes(&flat, &[], &pkt, false);
+        assert!(matched, "GET prefix at offset 10 should match");
+
+        // Wrong first byte
+        pkt[10] = 0x48; // 'H' instead of 'G'
+        let (matched, _, _, _) = simulate_walk_inner_with_bytes(&flat, &[], &pkt, false);
+        assert!(!matched, "Wrong prefix should NOT match");
+    }
+
+    #[test]
+    fn test_pattern_guard_64byte_exact() {
+        // Maximum pattern length: 64-byte exact match
+        let mut pat = crate::BytePattern::default();
+        pat.offset = 0;
+        pat.length = 64;
+        for i in 0..64 {
+            pat.match_bytes[i] = i as u8;
+            pat.mask_bytes[i] = 0xFF;
+        }
+
+        let rules = vec![
+            RuleSpec::compound(
+                vec![Predicate::RawByteMatch(Box::new(pat))],
+                RuleAction::drop(),
+            ).with_priority(100),
+        ];
+
+        let (shadow, _, dim_order, _) = compile_tree_full(&rules);
+        let flat = flatten_tree_with_dims(&shadow, 1, &dim_order);
+        assert_eq!(flat.byte_patterns.len(), 1);
+
+        // Matching: bytes 0-63 at offset 0
+        let pkt: Vec<u8> = (0..64).collect();
+        let (matched, _, _, _) = simulate_walk_inner_with_bytes(&flat, &[], &pkt, false);
+        assert!(matched, "64-byte exact match should match");
+
+        // Mismatched at byte 63
+        let mut pkt_bad = pkt.clone();
+        pkt_bad[63] = 0xFF;
+        let (matched, _, _, _) = simulate_walk_inner_with_bytes(&flat, &[], &pkt_bad, false);
+        assert!(!matched, "64-byte mismatch at last byte should NOT match");
+
+        // Too short packet
+        let pkt_short: Vec<u8> = (0..60).collect();
+        let (matched, _, _, _) = simulate_walk_inner_with_bytes(&flat, &[], &pkt_short, false);
+        assert!(!matched, "Packet too short for 64-byte pattern should NOT match");
+    }
+
+    #[test]
+    fn test_pattern_guard_mixed_with_short_match() {
+        // Rule 1: 1-byte fan-out at offset 0 (msg_type = 0x01) + 8-byte pattern at offset 4
+        // Rule 2: Same msg_type, different 8-byte pattern -> different action
+        let mut pat1 = crate::BytePattern::default();
+        pat1.offset = 4;
+        pat1.length = 8;
+        pat1.match_bytes[..8].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        for i in 0..8 { pat1.mask_bytes[i] = 0xFF; }
+
+        let mut pat2 = crate::BytePattern::default();
+        pat2.offset = 4;
+        pat2.length = 8;
+        pat2.match_bytes[..8].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11]);
+        for i in 0..8 { pat2.mask_bytes[i] = 0xFF; }
+
+        let rules = vec![
+            RuleSpec::compound(
+                vec![
+                    Predicate::Eq(FieldRef::L4Byte { offset: 0, length: 1 }, 0x01),
+                    Predicate::RawByteMatch(Box::new(pat1)),
+                ],
+                RuleAction::drop(),
+            ).with_priority(100),
+            RuleSpec::compound(
+                vec![
+                    Predicate::Eq(FieldRef::L4Byte { offset: 0, length: 1 }, 0x01),
+                    Predicate::RawByteMatch(Box::new(pat2)),
+                ],
+                RuleAction::Pass,
+            ).with_priority(50),
+        ];
+
+        let (shadow, mapping, dim_order, _) = compile_tree_full(&rules);
+        let flat = flatten_tree_with_dims(&shadow, 1, &dim_order);
+
+        assert_eq!(mapping.len(), 1, "1 custom dim for msg_type");
+        assert_eq!(flat.byte_patterns.len(), 2, "2 byte patterns");
+
+        let custom_dim = mapping.entries[0].2;
+
+        // Packet: msg_type=0x01, then pat1 bytes at offset 4
+        let mut pkt = vec![0u8; 20];
+        pkt[4..12].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        let (matched, action, _, _) = simulate_walk_inner_with_bytes(
+            &flat,
+            &[(custom_dim, 0x01)],
+            &pkt,
+            false,
+        );
+        assert!(matched, "pat1 should match");
+        assert_eq!(action, crate::ACT_DROP, "pat1 is higher priority -> DROP");
+
+        // Packet: msg_type=0x01, then pat2 bytes at offset 4
+        pkt[4..12].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11]);
+        let (matched, action, _, _) = simulate_walk_inner_with_bytes(
+            &flat,
+            &[(custom_dim, 0x01)],
+            &pkt,
+            false,
+        );
+        assert!(matched, "pat2 should match");
+        assert_eq!(action, crate::ACT_PASS, "pat2 only match -> PASS");
+
+        // Packet: msg_type=0x02 (no rule for this msg type)
+        let (matched, _, _, _) = simulate_walk_inner_with_bytes(
+            &flat,
+            &[(custom_dim, 0x02)],
+            &pkt,
+            false,
+        );
+        assert!(!matched, "Wrong msg_type should NOT match");
+    }
+
+    #[test]
+    fn test_multiple_pattern_guards() {
+        // 3 rules, each with a different long pattern, testing independent matching
+        let patterns: Vec<[u8; 8]> = vec![
+            [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11],
+            [0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x99, 0x88],
+        ];
+
+        let mut rules = Vec::new();
+        for (i, bytes) in patterns.iter().enumerate() {
+            let mut pat = crate::BytePattern::default();
+            pat.offset = 0;
+            pat.length = 8;
+            pat.match_bytes[..8].copy_from_slice(bytes);
+            for j in 0..8 { pat.mask_bytes[j] = 0xFF; }
+
+            rules.push(RuleSpec::compound(
+                vec![Predicate::RawByteMatch(Box::new(pat))],
+                RuleAction::drop(),
+            ).with_priority((100 - i * 10) as u8));
+        }
+
+        let (shadow, _, dim_order, _) = compile_tree_full(&rules);
+        let flat = flatten_tree_with_dims(&shadow, 1, &dim_order);
+        assert_eq!(flat.byte_patterns.len(), 3, "Should have 3 byte patterns");
+
+        // Test each pattern matches
+        for (i, bytes) in patterns.iter().enumerate() {
+            let (matched, _, _, _) = simulate_walk_inner_with_bytes(
+                &flat, &[], bytes, false,
+            );
+            assert!(matched, "Pattern {} should match", i);
+        }
+
+        // Test non-matching
+        let bad = [0x00u8; 8];
+        let (matched, _, _, _) = simulate_walk_inner_with_bytes(&flat, &[], &bad, false);
+        assert!(!matched, "Non-matching bytes should NOT match");
     }
 }

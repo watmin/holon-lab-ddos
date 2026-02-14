@@ -30,17 +30,20 @@ pub mod tree;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RuleAction {
     Pass,
-    Drop,
+    Drop { name: Option<(String, String)> },
     RateLimit { pps: u32, name: Option<(String, String)> },  // name: (namespace, name)
     Count { name: Option<(String, String)> },
 }
 
 impl RuleAction {
+    /// Convenience constructor for unnamed drop
+    pub fn drop() -> Self { RuleAction::Drop { name: None } }
+
     /// Get the action type as a u8 for eBPF (matches ACT_* constants)
     pub fn action_type(&self) -> u8 {
         match self {
             RuleAction::Pass => ACT_PASS,
-            RuleAction::Drop => ACT_DROP,
+            RuleAction::Drop { .. } => ACT_DROP,
             RuleAction::RateLimit { .. } => ACT_RATE_LIMIT,
             RuleAction::Count { .. } => ACT_COUNT,
         }
@@ -57,10 +60,37 @@ impl RuleAction {
     /// Get the name tuple (namespace, name) if this action has one
     pub fn name(&self) -> Option<&(String, String)> {
         match self {
-            RuleAction::RateLimit { name, .. } | RuleAction::Count { name } => {
+            RuleAction::Drop { name } | RuleAction::RateLimit { name, .. } | RuleAction::Count { name } => {
                 name.as_ref()
             }
             _ => None,
+        }
+    }
+}
+
+// =============================================================================
+// Rule Manifest (post-compilation metadata for observability)
+// =============================================================================
+
+/// Entry in the rule manifest returned from tree compilation.
+/// Maps post-compilation rule_id to the original rule's action and display label.
+/// This provides an authoritative mapping for all entries that may appear in
+/// TREE_COUNTERS, without relying on exclusion-based inference.
+#[derive(Debug, Clone)]
+pub struct RuleManifestEntry {
+    pub rule_id: u32,
+    pub action: RuleAction,
+    pub label: String,
+}
+
+impl RuleManifestEntry {
+    /// Human-readable action kind string for log section headers
+    pub fn action_kind(&self) -> &'static str {
+        match &self.action {
+            RuleAction::Pass => "pass",
+            RuleAction::Drop { .. } => "drop",
+            RuleAction::RateLimit { .. } => "rate-limit",
+            RuleAction::Count { .. } => "count",
         }
     }
 }
@@ -84,6 +114,14 @@ pub enum FieldDim {
     Ttl = 6,
     DfBit = 7,
     TcpWindow = 8,
+    // Dynamic custom dimensions for l4-match (1-4 byte fan-out)
+    Custom0 = 9,
+    Custom1 = 10,
+    Custom2 = 11,
+    Custom3 = 12,
+    Custom4 = 13,
+    Custom5 = 14,
+    Custom6 = 15,
 }
 
 impl FieldDim {
@@ -99,16 +137,48 @@ impl FieldDim {
             FieldDim::Ttl => "ttl",
             FieldDim::DfBit => "df_bit",
             FieldDim::TcpWindow => "tcp_window",
+            FieldDim::Custom0 => "custom0",
+            FieldDim::Custom1 => "custom1",
+            FieldDim::Custom2 => "custom2",
+            FieldDim::Custom3 => "custom3",
+            FieldDim::Custom4 => "custom4",
+            FieldDim::Custom5 => "custom5",
+            FieldDim::Custom6 => "custom6",
         }
     }
 
-    /// All dimensions
+    /// All static dimensions (does NOT include Custom0-6)
     pub fn all() -> &'static [FieldDim] {
         &[
             FieldDim::Proto, FieldDim::SrcIp, FieldDim::DstIp,
             FieldDim::L4Word0, FieldDim::L4Word1,
             FieldDim::TcpFlags, FieldDim::Ttl, FieldDim::DfBit, FieldDim::TcpWindow,
         ]
+    }
+
+    /// Check if this is a custom (dynamic) dimension
+    pub fn is_custom(&self) -> bool {
+        (*self as u8) >= 9
+    }
+
+    /// Get the custom dim slot index (0-6), or None if static
+    pub fn custom_index(&self) -> Option<usize> {
+        let idx = *self as u8;
+        if idx >= 9 && idx <= 15 { Some((idx - 9) as usize) } else { None }
+    }
+
+    /// Get a custom dim from a slot index (0-6)
+    pub fn from_custom_index(index: usize) -> Option<FieldDim> {
+        match index {
+            0 => Some(FieldDim::Custom0),
+            1 => Some(FieldDim::Custom1),
+            2 => Some(FieldDim::Custom2),
+            3 => Some(FieldDim::Custom3),
+            4 => Some(FieldDim::Custom4),
+            5 => Some(FieldDim::Custom5),
+            6 => Some(FieldDim::Custom6),
+            _ => None,
+        }
     }
 
     /// Format a value for this dimension as human-readable string
@@ -126,6 +196,7 @@ impl FieldDim {
             },
             FieldDim::TcpFlags => format!("0x{:02x}", value),
             FieldDim::DfBit => if value == 1 { "DF".to_string() } else { "!DF".to_string() },
+            d if d.is_custom() => format!("0x{:x}", value),
             _ => format!("{}", value),
         }
     }
@@ -142,6 +213,13 @@ impl FieldDim {
             FieldDim::Ttl => "ttl",
             FieldDim::DfBit => "df",
             FieldDim::TcpWindow => "tcp-window",
+            FieldDim::Custom0 => "custom0",
+            FieldDim::Custom1 => "custom1",
+            FieldDim::Custom2 => "custom2",
+            FieldDim::Custom3 => "custom3",
+            FieldDim::Custom4 => "custom4",
+            FieldDim::Custom5 => "custom5",
+            FieldDim::Custom6 => "custom6",
         }
     }
 
@@ -153,6 +231,7 @@ impl FieldDim {
                 let bytes = value.to_ne_bytes();
                 format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3])
             }
+            d if d.is_custom() => format!("0x{:x}", value),
             _ => format!("{}", value),
         }
     }
@@ -170,10 +249,9 @@ impl FieldDim {
 pub enum FieldRef {
     /// A parsed packet header field
     Dim(FieldDim),
-    // Future:
-    // ByteAt { offset: u16, len: u8 },
-    // PktLen,
-    // Dscp,
+    /// Bytes at a transport-relative offset (offset, length 1-4 bytes)
+    /// Used for l4-match predicates. Resolved to Dim(CustomN) during compilation.
+    L4Byte { offset: u16, length: u8 },
 }
 
 /// A matching predicate for a single field constraint.
@@ -193,8 +271,18 @@ pub enum Predicate {
     Gte(FieldRef, u32),
     /// Less than or equal: field <= value
     Lte(FieldRef, u32),
-    /// Bitmask: (field_value & mask) != 0
-    Mask(FieldRef, u32),
+    /// Masked equality: (field_value & mask) == expected
+    /// Replaces the old `Mask` variant which used `!= 0` semantics.
+    MaskEq(FieldRef, u32, u32),  // (field, mask, expected)
+    /// Pattern guard: byte pattern match at transport offset.
+    /// Compiled form — the u32 is the pattern index into BYTE_PATTERNS map.
+    /// Treated as a guard edge (RANGE_OP_PATTERN) on the specified dimension.
+    PatternGuard(FieldDim, u32),  // (dimension for placement, pattern_index)
+    /// Raw byte match: carries a complete BytePattern for >4 byte matches.
+    /// This is an intermediate form created by the sidecar parser and consumed by
+    /// the compiler's allocate_patterns() to produce PatternGuard entries.
+    /// Never survives compilation — always converted to PatternGuard.
+    RawByteMatch(Box<BytePattern>),
     // Future:
     // Not(Box<Predicate>),
     // Or(Vec<Predicate>),
@@ -230,7 +318,14 @@ impl Predicate {
             Predicate::Lt(FieldRef::Dim(d), val) if *d == dim => Some((RANGE_OP_LT, *val)),
             Predicate::Gte(FieldRef::Dim(d), val) if *d == dim => Some((RANGE_OP_GTE, *val)),
             Predicate::Lte(FieldRef::Dim(d), val) if *d == dim => Some((RANGE_OP_LTE, *val)),
-            Predicate::Mask(FieldRef::Dim(d), mask) if *d == dim => Some((RANGE_OP_MASK, *mask)),
+            Predicate::MaskEq(FieldRef::Dim(d), mask, expected) if *d == dim => {
+                // Pack mask in upper 16 bits, expected in lower 16 bits
+                let packed = (*mask << 16) | (*expected & 0xFFFF);
+                Some((RANGE_OP_MASK_EQ, packed))
+            }
+            Predicate::PatternGuard(d, pattern_idx) if *d == dim => {
+                Some((RANGE_OP_PATTERN, *pattern_idx))
+            }
             _ => None,
         }
     }
@@ -241,7 +336,8 @@ impl Predicate {
         self.as_guard_on_dim(dim)
     }
 
-    /// Get the field dimension this predicate tests (works for all predicate types)
+    /// Get the field dimension this predicate tests (works for all predicate types).
+    /// Returns None for unresolved L4Byte refs (must be resolved before compilation).
     pub fn field_dim(&self) -> Option<FieldDim> {
         match self {
             Predicate::Eq(FieldRef::Dim(dim), _) 
@@ -250,7 +346,27 @@ impl Predicate {
             | Predicate::Lt(FieldRef::Dim(dim), _)
             | Predicate::Gte(FieldRef::Dim(dim), _)
             | Predicate::Lte(FieldRef::Dim(dim), _)
-            | Predicate::Mask(FieldRef::Dim(dim), _) => Some(*dim),
+            | Predicate::MaskEq(FieldRef::Dim(dim), _, _) => Some(*dim),
+            Predicate::PatternGuard(dim, _) => Some(*dim),
+            Predicate::RawByteMatch(_) => None, // Pre-compilation form, no fixed dim
+            _ => None,
+        }
+    }
+    
+    /// Get the FieldRef this predicate operates on.
+    /// PatternGuard/RawByteMatch returns a static Dim ref for placement dimension.
+    pub fn field_ref(&self) -> &FieldRef {
+        // Static refs for PatternGuard/RawByteMatch
+        static PATTERN_REF: FieldRef = FieldRef::Dim(FieldDim::Proto);
+        match self {
+            Predicate::Eq(fr, _)
+            | Predicate::In(fr, _)
+            | Predicate::Gt(fr, _)
+            | Predicate::Lt(fr, _)
+            | Predicate::Gte(fr, _)
+            | Predicate::Lte(fr, _)
+            | Predicate::MaskEq(fr, _, _) => fr,
+            Predicate::PatternGuard(_, _) | Predicate::RawByteMatch(_) => &PATTERN_REF,
         }
     }
 
@@ -278,15 +394,39 @@ impl Predicate {
             Predicate::Lte(FieldRef::Dim(dim), value) => {
                 format!("(<= {} {})", dim.sexpr_name(), dim.sexpr_value(*value))
             }
-            Predicate::Mask(FieldRef::Dim(dim), mask) => {
-                format!("(mask {} 0x{:x})", dim.sexpr_name(), mask)
+            Predicate::MaskEq(FieldRef::Dim(dim), mask, expected) => {
+                format!("(mask-eq {} 0x{:x} 0x{:x})", dim.sexpr_name(), mask, expected)
             }
+            // L4Byte refs (unresolved — should be resolved before display in normal flow)
+            Predicate::Eq(FieldRef::L4Byte { offset, length }, value) => {
+                format!("(l4-match {} 0x{:0width$x} \"FF\")", offset, value, width = (*length as usize) * 2)
+            }
+            Predicate::MaskEq(FieldRef::L4Byte { offset, .. }, mask, expected) => {
+                format!("(l4-match {} 0x{:x} 0x{:x})", offset, expected, mask)
+            }
+            Predicate::PatternGuard(dim, idx) => {
+                format!("(pattern-guard {} #{})", dim.sexpr_name(), idx)
+            }
+            Predicate::RawByteMatch(pat) => {
+                let match_hex: String = pat.match_bytes[..pat.length as usize]
+                    .iter().map(|b| format!("{:02x}", b)).collect();
+                let mask_hex: String = pat.mask_bytes[..pat.length as usize]
+                    .iter().map(|b| format!("{:02x}", b)).collect();
+                format!("(l4-match {} \"{}\" \"{}\")", pat.offset, match_hex, mask_hex)
+            }
+            _ => format!("(unknown-predicate)")
         }
     }
 }
 
-/// Total number of dispatch dimensions
+/// Number of static (fixed) dispatch dimensions
 pub const NUM_DIMENSIONS: usize = 9;
+
+/// Maximum dimension index (0-15, supporting up to 7 custom dims)
+pub const MAX_DIM: u8 = 16;
+
+/// Number of custom dimension slots available for l4-match fan-out
+pub const NUM_CUSTOM_DIMS: usize = 7;
 
 /// Token bucket state (must match eBPF struct)
 #[repr(C)]
@@ -325,7 +465,8 @@ pub const RANGE_OP_GT: u8 = 1;
 pub const RANGE_OP_LT: u8 = 2;
 pub const RANGE_OP_GTE: u8 = 3;
 pub const RANGE_OP_LTE: u8 = 4;
-pub const RANGE_OP_MASK: u8 = 5;
+pub const RANGE_OP_MASK_EQ: u8 = 5;
+pub const RANGE_OP_PATTERN: u8 = 6;
 
 /// Maximum range edges per tree node
 pub const MAX_RANGE_EDGES: usize = 2;
@@ -381,6 +522,56 @@ impl Default for TreeNode {
     }
 }
 
+/// Configuration for a custom dimension slot (for CUSTOM_DIM_CONFIG BPF map).
+/// Each entry tells the eBPF extractor what to read at what offset.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CustomDimEntry {
+    /// Offset from transport pointer
+    pub offset: u16,
+    /// Number of bytes to read (1, 2, or 4)
+    pub length: u8,
+    pub _pad: u8,
+}
+
+unsafe impl aya::Pod for CustomDimEntry {}
+
+/// Maximum length of a byte pattern for l4-match
+pub const MAX_PATTERN_LEN: usize = 64;
+
+/// Maximum number of byte pattern entries in the BYTE_PATTERNS map
+pub const MAX_BYTE_PATTERNS: u32 = 4096;
+
+/// A byte pattern for multi-byte matching at a transport-relative offset.
+/// Stored in the BYTE_PATTERNS BPF map.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BytePattern {
+    /// Offset from transport pointer
+    pub offset: u16,
+    /// Number of bytes to compare (1-64)
+    pub length: u8,
+    pub _pad: u8,
+    /// Expected byte values (pre-masked: match_bytes[i] = expected[i] & mask[i])
+    pub match_bytes: [u8; MAX_PATTERN_LEN],
+    /// Mask bytes: which bits matter (1 = compare, 0 = ignore)
+    pub mask_bytes: [u8; MAX_PATTERN_LEN],
+}
+
+impl Default for BytePattern {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            length: 0,
+            _pad: 0,
+            match_bytes: [0u8; MAX_PATTERN_LEN],
+            mask_bytes: [0u8; MAX_PATTERN_LEN],
+        }
+    }
+}
+
+unsafe impl aya::Pod for BytePattern {}
+
 /// Edge key: (parent_node_id, field_value) -> child_node_id.
 /// Must match eBPF EdgeKey exactly.
 #[repr(C)]
@@ -414,7 +605,7 @@ impl RuleSpec {
     pub fn drop_field(dim: FieldDim, value: u32) -> Self {
         Self { 
             constraints: vec![Predicate::eq(dim, value)], 
-            actions: vec![RuleAction::Drop], 
+            actions: vec![RuleAction::drop()], 
             priority: 100,
             comment: None,
             label: None,
@@ -505,8 +696,29 @@ impl RuleSpec {
                 Predicate::Lte(FieldRef::Dim(dim), val) => {
                     sorted_parts.push(format!("lte-{}-{}", *dim as u8, val));
                 }
-                Predicate::Mask(FieldRef::Dim(dim), mask) => {
-                    sorted_parts.push(format!("mask-{}-{}", *dim as u8, mask));
+                Predicate::MaskEq(FieldRef::Dim(dim), mask, expected) => {
+                    sorted_parts.push(format!("maskeq-{}-{}-{}", *dim as u8, mask, expected));
+                }
+                // L4Byte predicates (may be pre-resolution)
+                Predicate::Eq(FieldRef::L4Byte { offset, length }, val) => {
+                    sorted_parts.push(format!("l4eq-{}-{}-{}", offset, length, val));
+                }
+                Predicate::MaskEq(FieldRef::L4Byte { offset, length }, mask, expected) => {
+                    sorted_parts.push(format!("l4maskeq-{}-{}-{}-{}", offset, length, mask, expected));
+                }
+                Predicate::PatternGuard(dim, idx) => {
+                    sorted_parts.push(format!("patguard-{}-{}", *dim as u8, idx));
+                }
+                Predicate::RawByteMatch(pat) => {
+                    let match_hex: String = pat.match_bytes[..pat.length as usize]
+                        .iter().map(|b| format!("{:02x}", b)).collect();
+                    let mask_hex: String = pat.mask_bytes[..pat.length as usize]
+                        .iter().map(|b| format!("{:02x}", b)).collect();
+                    sorted_parts.push(format!("rawbyte-{}-{}-{}-{}", pat.offset, pat.length, match_hex, mask_hex));
+                }
+                _ => {
+                    // Other predicate/field combos — include a generic hash
+                    sorted_parts.push(format!("{:?}", pred));
                 }
             }
         }
@@ -519,7 +731,12 @@ impl RuleSpec {
         let mut action_strs: Vec<String> = self.actions.iter().map(|a| {
             match a {
                 RuleAction::Pass => "pass".to_string(),
-                RuleAction::Drop => "drop".to_string(),
+                RuleAction::Drop { name } => {
+                    let name_str = name.as_ref()
+                        .map(|(ns, n)| format!("{}:{}", ns, n))
+                        .unwrap_or_default();
+                    format!("drop:{}", name_str)
+                }
                 RuleAction::RateLimit { pps, name } => {
                     let name_str = name.as_ref()
                         .map(|(ns, n)| format!("{}:{}", ns, n))
@@ -547,21 +764,21 @@ impl RuleSpec {
         if h == 0 { 1 } else { h }
     }
 
-    /// Compute the bucket key for this rule (for rate limiters and counters).
+    /// Compute the bucket key for this rule (for rate limiters, counters, and drops).
     /// 
-    /// Named actions (rate-limit or count with :name ["ns" "name"]) share a bucket/counter
+    /// Named actions (drop, rate-limit, or count with :name ["ns" "name"]) share a bucket/counter
     /// across all rules with the same namespace and name. Unnamed actions get a per-rule key
     /// based on the rule's canonical hash.
     /// 
-    /// Returns the key (u32) for the first rate-limit or count action, or None if neither.
+    /// Returns the key (u32) for the first drop, rate-limit, or count action, or None if neither.
     pub fn bucket_key(&self) -> Option<u32> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         
-        // Find first rate-limit or count action
+        // Find first rate-limit, count, or drop action
         for action in &self.actions {
             match action {
-                RuleAction::RateLimit { pps: _, name } | RuleAction::Count { name } => {
+                RuleAction::Drop { name } | RuleAction::RateLimit { pps: _, name } | RuleAction::Count { name } => {
                     if let Some((namespace, name)) = name {
                         // Named bucket: hash namespace + name
                         let mut hasher = DefaultHasher::new();
@@ -620,9 +837,12 @@ impl RuleSpec {
                     let (dim_name, val_str) = Self::format_dim_value(*dim, *val);
                     parts.push(format!("(<= {} {})", dim_name, val_str));
                 }
-                Predicate::Mask(FieldRef::Dim(dim), mask) => {
+                Predicate::MaskEq(FieldRef::Dim(dim), mask, expected) => {
                     let dim_name = Self::dim_name(*dim);
-                    parts.push(format!("(mask {} 0x{:x})", dim_name, mask));
+                    parts.push(format!("(mask-eq {} 0x{:x} 0x{:x})", dim_name, mask, expected));
+                }
+                _ => {
+                    parts.push(pred.to_sexpr_clause());
                 }
             }
         }
@@ -632,17 +852,7 @@ impl RuleSpec {
 
     /// Helper: format dimension name
     fn dim_name(dim: FieldDim) -> &'static str {
-        match dim {
-            FieldDim::Proto => "proto",
-            FieldDim::SrcIp => "src-ip",
-            FieldDim::DstIp => "dst-ip",
-            FieldDim::L4Word0 => "src-port",
-            FieldDim::L4Word1 => "dst-port",
-            FieldDim::TcpFlags => "tcp-flags",
-            FieldDim::Ttl => "ttl",
-            FieldDim::DfBit => "df-bit",
-            FieldDim::TcpWindow => "tcp-window",
-        }
+        dim.sexpr_name()
     }
 
     /// Helper: format dimension value (handles IP byte order, etc.)
@@ -657,6 +867,8 @@ impl RuleSpec {
             }
             FieldDim::L4Word0 | FieldDim::L4Word1 | FieldDim::TcpFlags |
             FieldDim::Ttl | FieldDim::DfBit | FieldDim::TcpWindow => val.to_string(),
+            d if d.is_custom() => format!("0x{:x}", val),
+            _ => val.to_string(),
         };
         (dim_name, val_str)
     }
@@ -757,7 +969,10 @@ impl RuleSpec {
     fn action_to_sexpr(action: &RuleAction) -> String {
         match action {
             RuleAction::Pass => "(pass)".to_string(),
-            RuleAction::Drop => "(drop)".to_string(),
+            RuleAction::Drop { name: None } => "(drop)".to_string(),
+            RuleAction::Drop { name: Some((ns, n)) } => {
+                format!("(drop :name [\"{}\", \"{}\"])", ns, n)
+            }
             RuleAction::RateLimit { pps, name: None } => {
                 format!("(rate-limit {})", pps)
             }
@@ -1221,7 +1436,7 @@ impl VethFilter {
     /// This is the primary API for the tree engine. The sidecar maintains
     /// its rule set and calls this whenever rules change.
     /// Returns the number of nodes in the compiled tree.
-    pub async fn compile_and_flip_tree(&self, rules: &[RuleSpec]) -> Result<usize> {
+    pub async fn compile_and_flip_tree(&self, rules: &[RuleSpec]) -> Result<(usize, Vec<RuleManifestEntry>)> {
         let mut bpf = self.bpf.write().await;
         let mut mgr = self.tree_manager.lock().await;
         mgr.compile_and_flip(rules, &mut bpf)
@@ -1303,7 +1518,7 @@ mod tests {
         assert_eq!(spec.constraints.len(), 1);
         assert_eq!(spec.constraints[0], Predicate::eq(FieldDim::Proto, 17));
         assert_eq!(spec.actions.len(), 1);
-        assert_eq!(spec.actions[0], RuleAction::Drop);
+        assert_eq!(spec.actions[0], RuleAction::drop());
     }
 
     #[test]
@@ -1327,7 +1542,7 @@ mod tests {
                 Predicate::eq(FieldDim::Proto, 6),
                 Predicate::eq(FieldDim::L4Word1, 80),
             ],
-            RuleAction::Drop,
+            RuleAction::drop(),
         );
         let desc = spec.describe();
         assert_eq!(desc, "((and (= proto 6) (= dst-port 80)) => (drop))");

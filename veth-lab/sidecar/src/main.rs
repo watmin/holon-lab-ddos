@@ -768,7 +768,7 @@ impl Detection {
         let action = if use_rate_limit { 
             RuleAction::RateLimit { pps: allowed_pps, name: None }
         } else { 
-            RuleAction::Drop 
+            RuleAction::drop() 
         };
         
         Some(RuleSpec { 
@@ -922,11 +922,105 @@ fn parse_edn_predicate(edn: &Edn) -> Result<Option<Predicate>> {
         _ => anyhow::bail!("Predicate must be a list or vector, got: {:?}", edn),
     };
     
+    if list.len() < 2 {
+        anyhow::bail!("Predicate must have at least 2 elements");
+    }
+    
+    let op = list[0].to_string();
+    
+    // Handle special forms that don't follow the (op field value) pattern
+    match op.as_str() {
+        "protocol-match" => {
+            // (protocol-match match mask) — sugar for (mask-eq proto mask match)
+            if list.len() != 3 {
+                anyhow::bail!("protocol-match requires exactly 3 elements, got {}", list.len());
+            }
+            let match_val = parse_field_value(&list[1], FieldDim::Proto)?;
+            let mask_val = parse_field_value(&list[2], FieldDim::Proto)?;
+            if mask_val == 0xFF {
+                return Ok(Some(Predicate::Eq(veth_filter::FieldRef::Dim(FieldDim::Proto), match_val)));
+            } else {
+                return Ok(Some(Predicate::MaskEq(veth_filter::FieldRef::Dim(FieldDim::Proto), mask_val, match_val)));
+            }
+        }
+        "tcp-flags-match" => {
+            // (tcp-flags-match match mask) — sugar for (mask-eq tcp-flags mask match)
+            if list.len() != 3 {
+                anyhow::bail!("tcp-flags-match requires exactly 3 elements, got {}", list.len());
+            }
+            let match_val = parse_field_value(&list[1], FieldDim::TcpFlags)?;
+            let mask_val = parse_field_value(&list[2], FieldDim::TcpFlags)?;
+            if mask_val == 0xFF {
+                return Ok(Some(Predicate::Eq(veth_filter::FieldRef::Dim(FieldDim::TcpFlags), match_val)));
+            } else {
+                return Ok(Some(Predicate::MaskEq(veth_filter::FieldRef::Dim(FieldDim::TcpFlags), mask_val, match_val)));
+            }
+        }
+        "l4-match" => {
+            // (l4-match <offset> "<hex-match>" "<hex-mask>")
+            // Multi-byte pattern match at transport-relative offset.
+            if list.len() != 4 {
+                anyhow::bail!("l4-match requires exactly 4 elements: (l4-match offset match-hex mask-hex), got {}", list.len());
+            }
+            let offset: u16 = list[1].to_string().parse()
+                .with_context(|| format!("l4-match offset must be a number, got: {}", list[1]))?;
+            let match_hex = edn_to_hex_string(&list[2])?;
+            let mask_hex = edn_to_hex_string(&list[3])?;
+            let match_bytes = hex_decode(&match_hex)
+                .with_context(|| format!("l4-match: invalid match hex string: {}", match_hex))?;
+            let mask_bytes = hex_decode(&mask_hex)
+                .with_context(|| format!("l4-match: invalid mask hex string: {}", mask_hex))?;
+            
+            if match_bytes.len() != mask_bytes.len() {
+                anyhow::bail!("l4-match: match and mask hex strings must be the same length ({} vs {})",
+                    match_bytes.len(), mask_bytes.len());
+            }
+            let length = match_bytes.len();
+            if length == 0 || length > veth_filter::MAX_PATTERN_LEN {
+                anyhow::bail!("l4-match: pattern length must be 1-{}, got {}", veth_filter::MAX_PATTERN_LEN, length);
+            }
+            
+            if length <= 4 {
+                // Short patterns: encode as MaskEq(L4Byte) or Eq(L4Byte)
+                // The compiler will resolve these to custom dimensions for fan-out.
+                let mut val: u32 = 0;
+                let mut mask: u32 = 0;
+                for i in 0..length {
+                    val = (val << 8) | (match_bytes[i] as u32);
+                    mask = (mask << 8) | (mask_bytes[i] as u32);
+                }
+                // Pre-mask the value
+                val &= mask;
+                let all_ff = mask_bytes.iter().all(|&b| b == 0xFF);
+                let field_ref = veth_filter::FieldRef::L4Byte { offset, length: length as u8 };
+                if all_ff {
+                    return Ok(Some(Predicate::Eq(field_ref, val)));
+                } else {
+                    return Ok(Some(Predicate::MaskEq(field_ref, mask, val)));
+                }
+            } else {
+                // Long patterns: build a RawByteMatch with the full byte arrays.
+                // Bytes are stored starting at index 0 in natural order;
+                // the compiler (allocate_patterns) pre-shifts them to the
+                // correct offset position for eBPF.
+                let mut pat = veth_filter::BytePattern::default();
+                pat.offset = offset;
+                pat.length = length as u8;
+                for i in 0..length {
+                    pat.match_bytes[i] = match_bytes[i] & mask_bytes[i]; // Pre-mask
+                    pat.mask_bytes[i] = mask_bytes[i];
+                }
+                return Ok(Some(Predicate::RawByteMatch(Box::new(pat))));
+            }
+        }
+        _ => {}
+    }
+    
+    // Standard predicates: (op field value...)
     if list.len() < 3 {
         anyhow::bail!("Predicate must have at least 3 elements: (op field value)");
     }
     
-    let op = list[0].to_string();
     let field = list[1].to_string();
     let dim = parse_field_name(&field)?;
     
@@ -987,12 +1081,22 @@ fn parse_edn_predicate(edn: &Edn) -> Result<Option<Predicate>> {
             Ok(Some(Predicate::Lte(veth_filter::FieldRef::Dim(dim), value)))
         }
         "mask" => {
-            // (mask field mask_value)
+            // Legacy: (mask field mask_value) — treated as (mask-eq field mask mask)
+            // i.e., all masked bits must be set
             if list.len() != 3 {
                 anyhow::bail!("mask predicate requires exactly 3 elements, got {}", list.len());
             }
             let value = parse_field_value(&list[2], dim)?;
-            Ok(Some(Predicate::Mask(veth_filter::FieldRef::Dim(dim), value)))
+            Ok(Some(Predicate::MaskEq(veth_filter::FieldRef::Dim(dim), value, value)))
+        }
+        "mask-eq" => {
+            // (mask-eq field mask expected) — (field_value & mask) == expected
+            if list.len() != 4 {
+                anyhow::bail!("mask-eq predicate requires exactly 4 elements, got {}", list.len());
+            }
+            let mask = parse_field_value(&list[2], dim)?;
+            let expected = parse_field_value(&list[3], dim)?;
+            Ok(Some(Predicate::MaskEq(veth_filter::FieldRef::Dim(dim), mask, expected)))
         }
         _ => anyhow::bail!("Unsupported predicate operator: {}", op),
     }
@@ -1012,6 +1116,33 @@ fn parse_field_name(name: &str) -> Result<FieldDim> {
         "tcp-window" => Ok(FieldDim::TcpWindow),
         other => anyhow::bail!("Unknown field: {}", other),
     }
+}
+
+/// Extract a hex string from an EDN value (String, Symbol, or keyword).
+/// Strips quotes, "0x" prefix, and leading ":" from keywords.
+fn edn_to_hex_string(edn: &Edn) -> Result<String> {
+    let s = match edn {
+        Edn::Str(s) => s.to_string(),
+        Edn::Symbol(s) => s.to_string(),
+        _ => edn.to_string(),
+    };
+    let s = s.trim_matches('"').trim();
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    Ok(s.to_string())
+}
+
+/// Decode a hex string into bytes. Each pair of hex chars = one byte.
+fn hex_decode(hex: &str) -> Result<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        anyhow::bail!("hex string must have even length, got {}", hex.len());
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for i in (0..hex.len()).step_by(2) {
+        let byte = u8::from_str_radix(&hex[i..i+2], 16)
+            .with_context(|| format!("invalid hex byte at position {}: '{}'", i, &hex[i..i+2]))?;
+        bytes.push(byte);
+    }
+    Ok(bytes)
 }
 
 /// Parse field value from EDN (number or IP string)
@@ -1070,7 +1201,28 @@ fn parse_edn_action(edn: &Edn) -> Result<Option<RuleAction>> {
     
     match action_type.as_str() {
         "pass" => Ok(Some(RuleAction::Pass)),
-        "drop" => Ok(Some(RuleAction::Drop)),
+        "drop" => {
+            // Check for optional :name keyword - MUST be [namespace, name] vector
+            let name = if list.len() >= 3 && list[1].to_string() == ":name" {
+                match &list[2] {
+                    Edn::Vector(vec) => {
+                        // Parse as [namespace, name]
+                        let items = vec.clone().to_vec();
+                        if items.len() != 2 {
+                            anyhow::bail!(":name must be [namespace, name] with exactly 2 elements");
+                        }
+                        let ns = items[0].to_string().trim_matches('"').to_string();
+                        let n = items[1].to_string().trim_matches('"').to_string();
+                        Some((ns, n))
+                    }
+                    _ => anyhow::bail!(":name must be a vector [namespace, name], got: {:?}", list[2]),
+                }
+            } else {
+                None
+            };
+            
+            Ok(Some(RuleAction::Drop { name }))
+        }
         "rate-limit" => {
             if list.len() < 2 {
                 anyhow::bail!("rate-limit requires PPS argument");
@@ -1151,7 +1303,7 @@ fn compile_compound_rule(
     let action = if use_rate_limit { 
         RuleAction::RateLimit { pps: allowed_pps, name: None }
     } else { 
-        RuleAction::Drop 
+        RuleAction::drop() 
     };
 
     Some(RuleSpec {
@@ -1294,8 +1446,9 @@ async fn main() -> Result<()> {
     // Whether the tree needs recompilation (set when rules change)
     let tree_dirty: Arc<std::sync::atomic::AtomicBool> = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Counter name map for printing (hash -> (namespace, name))
-    let counter_names: Arc<RwLock<std::collections::HashMap<u32, (String, String)>>> = 
+    // Unified tree counter labels from compilation manifest (rule_id -> (action_kind, label))
+    // Populated authoritatively from post-compilation rule manifest, not pre-compilation guesses.
+    let tree_counter_labels: Arc<RwLock<std::collections::HashMap<u32, (String, String)>>> =
         Arc::new(RwLock::new(std::collections::HashMap::new()));
 
     let rate_limiter_names: Arc<RwLock<std::collections::HashMap<u32, (String, String)>>> = 
@@ -1314,17 +1467,15 @@ async fn main() -> Result<()> {
 
         if !preloaded.is_empty() {
             let mut rules = active_rules.write().await;
-            let mut counter_map = counter_names.write().await;
             let mut rate_map = rate_limiter_names.write().await;
             let mut bucket_map = bucket_key_to_spec.write().await;
             
             // Expand In predicates before populating maps
             let expanded = veth_filter::tree::expand_in_predicates(&preloaded);
             
-            // Build counter, rate limiter name maps, and bucket_key→spec map for logging
+            // Build rate limiter name map and bucket_key→spec map for logging
             for spec in &expanded {
-                // Store ALL rules with rate limiters or counters in bucket_map
-                // This handles unnamed limiters whose bucket_key = canonical_hash
+                // Store rules with rate limiters or counters in bucket_map
                 for action in &spec.actions {
                     match action {
                         veth_filter::RuleAction::RateLimit { .. } | veth_filter::RuleAction::Count { .. } => {
@@ -1337,19 +1488,12 @@ async fn main() -> Result<()> {
                     }
                 }
                 
+                // Rate limiter names (for rate limiter reporting, separate from TREE_COUNTERS)
                 if let Some(key) = spec.bucket_key() {
-                    // Check if this is a count action or named rate limiter
                     for action in &spec.actions {
-                        match action {
-                            veth_filter::RuleAction::Count { name: Some((ns, n)) } => {
-                                counter_map.insert(key, (ns.clone(), n.clone()));
-                                break;
-                            }
-                            veth_filter::RuleAction::RateLimit { name: Some((ns, n)), .. } => {
-                                rate_map.insert(key, (ns.clone(), n.clone()));
-                                break;
-                            }
-                            _ => {}
+                        if let veth_filter::RuleAction::RateLimit { name: Some((ns, n)), .. } = action {
+                            rate_map.insert(key, (ns.clone(), n.clone()));
+                            break;
                         }
                     }
                 }
@@ -1362,14 +1506,6 @@ async fn main() -> Result<()> {
                 });
             }
             
-            // Log configured counters
-            if !counter_map.is_empty() {
-                info!("Configured {} count actions:", counter_map.len());
-                for (hash, (ns, name)) in counter_map.iter() {
-                    info!("  [\"{}\" \"{}\"] → key 0x{:08x}", ns, name, hash);
-                }
-            }
-
             if !rate_map.is_empty() {
                 info!("Configured {} rate limiters:", rate_map.len());
                 for (hash, (ns, name)) in rate_map.iter() {
@@ -1377,7 +1513,6 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Debug: log bucket_map contents
             if !bucket_map.is_empty() {
                 info!("Bucket map contains {} entries:", bucket_map.len());
                 for (key, spec) in bucket_map.iter() {
@@ -1388,9 +1523,24 @@ async fn main() -> Result<()> {
             if args.enforce {
                 let all_specs: Vec<RuleSpec> = rules.values().map(|r| r.spec.clone()).collect();
                 let start = Instant::now();
-                let nodes = filter.compile_and_flip_tree(&all_specs).await?;
+                let (nodes, manifest) = filter.compile_and_flip_tree(&all_specs).await?;
                 let compile_time = start.elapsed();
                 let capacity_pct = (nodes as f64 / 2_500_000.0) * 100.0;
+
+                // Populate tree_counter_labels from authoritative manifest
+                {
+                    let mut tcl = tree_counter_labels.write().await;
+                    for entry in &manifest {
+                        tcl.insert(entry.rule_id, (entry.action_kind().to_string(), entry.label.clone()));
+                    }
+                    if !tcl.is_empty() {
+                        info!("Rule manifest: {} entries", tcl.len());
+                        for (id, (kind, label)) in tcl.iter() {
+                            info!("  [{}] {} → key 0x{:08x}", kind, label, id);
+                        }
+                    }
+                }
+
                 info!("========================================");
                 info!("PRE-LOADED TREE COMPILED");
                 info!("  Rules:    {}", all_specs.len());
@@ -1552,21 +1702,49 @@ async fn main() -> Result<()> {
                     d_eval2, d_root, d_state, d_tc_try, d_tc_fail
                 );
                 
-                // Print counter stats every 10 windows
+                // Print TREE_COUNTERS stats every 10 windows, grouped by action kind
                 if windows_processed % 10 == 0 {
-                    let counter_map = counter_names.read().await;
-                    if !counter_map.is_empty() {
-                        if let Ok(counter_values) = filter.read_counters().await {
-                            if !counter_values.is_empty() {
-                                info!("=== Count Actions (window {}) ===", windows_processed);
-                                let mut sorted = counter_values.clone();
-                                sorted.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
-                                for (key, value) in sorted {
-                                    if let Some((ns, name)) = counter_map.get(&key) {
-                                        info!("  [{}  {}] {} packets", ns, name, value);
-                                    } else {
-                                        info!("  [unknown 0x{:08x}] {} packets", key, value);
+                    if let Ok(counter_values) = filter.read_counters().await {
+                        if !counter_values.is_empty() {
+                            let tcl = tree_counter_labels.read().await;
+                            
+                            // Partition entries by action kind using the manifest
+                            let mut count_entries: Vec<(u32, u64, String)> = Vec::new();
+                            let mut drop_entries: Vec<(u32, u64, String)> = Vec::new();
+                            let mut other_entries: Vec<(u32, u64, String, String)> = Vec::new();
+
+                            for &(key, value) in &counter_values {
+                                if let Some((kind, label)) = tcl.get(&key) {
+                                    match kind.as_str() {
+                                        "count" => count_entries.push((key, value, label.clone())),
+                                        "drop" => drop_entries.push((key, value, label.clone())),
+                                        other => other_entries.push((key, value, label.clone(), other.to_string())),
                                     }
+                                } else {
+                                    // Entry not in manifest — could be from a previous compilation
+                                    other_entries.push((key, value, format!("unknown-0x{:08x}", key), "?".to_string()));
+                                }
+                            }
+
+                            if !count_entries.is_empty() {
+                                info!("=== Count Actions (window {}) ===", windows_processed);
+                                count_entries.sort_by_key(|(_, v, _)| std::cmp::Reverse(*v));
+                                for (_, value, label) in &count_entries {
+                                    info!("  {} {} packets", label, value);
+                                }
+                            }
+
+                            if !drop_entries.is_empty() {
+                                info!("=== Drop Actions (window {}) ===", windows_processed);
+                                drop_entries.sort_by_key(|(_, v, _)| std::cmp::Reverse(*v));
+                                for (_, value, label) in &drop_entries {
+                                    info!("  {} {} packets dropped", label, value);
+                                }
+                            }
+
+                            if !other_entries.is_empty() {
+                                for (key, value, label, kind) in &other_entries {
+                                    info!("  [{}] {} {} packets (key 0x{:08x})", kind, label, value, key);
                                 }
                             }
                         }
@@ -1635,7 +1813,7 @@ async fn main() -> Result<()> {
                             rules.get_mut(&rule_key).unwrap().last_seen = Instant::now();
                         } else {
                             let action_str = match &spec.actions[0] {
-                                RuleAction::Drop => "DROP",
+                                RuleAction::Drop { .. } => "DROP",
                                 RuleAction::RateLimit { .. } => "RATE-LIMIT",
                                 RuleAction::Pass => "PASS",
                                 RuleAction::Count { .. } => "COUNT",
@@ -1662,7 +1840,7 @@ async fn main() -> Result<()> {
                                 let mut bmap = bucket_key_to_spec.write().await;
                                 bmap.entry(bk).or_insert_with(|| spec.clone());
                             }
-                            
+
                             tree_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
 
@@ -1672,8 +1850,14 @@ async fn main() -> Result<()> {
                                 .map(|r| r.spec.clone())
                                 .collect();
                             match filter.compile_and_flip_tree(&all_specs).await {
-                                Ok(nodes) => {
+                                Ok((nodes, manifest)) => {
                                     info!("    Tree recompiled: {} rules -> {} nodes", all_specs.len(), nodes);
+                                    // Refresh tree_counter_labels from manifest
+                                    let mut tcl = tree_counter_labels.write().await;
+                                    tcl.clear();
+                                    for entry in &manifest {
+                                        tcl.insert(entry.rule_id, (entry.action_kind().to_string(), entry.label.clone()));
+                                    }
                                     tree_dirty.store(false, std::sync::atomic::Ordering::SeqCst);
                                 }
                                 Err(e) => {
@@ -1766,8 +1950,14 @@ async fn main() -> Result<()> {
                         .map(|r| r.spec.clone())
                         .collect();
                     match filter.compile_and_flip_tree(&all_specs).await {
-                        Ok(nodes) => {
+                        Ok((nodes, manifest)) => {
                             info!("Tree recompiled after expiry: {} rules -> {} nodes", all_specs.len(), nodes);
+                            // Refresh tree_counter_labels from manifest
+                            let mut tcl = tree_counter_labels.write().await;
+                            tcl.clear();
+                            for entry in &manifest {
+                                tcl.insert(entry.rule_id, (entry.action_kind().to_string(), entry.label.clone()));
+                            }
                         }
                         Err(e) => {
                             warn!("Failed to recompile tree after expiry: {}", e);

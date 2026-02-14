@@ -1,15 +1,30 @@
-;; Test scenario for Mask predicate (bitmask matching)
-;; Tests TCP flag bit matching: SYN, ACK, RST, FIN
-;; Exercises guard edge overflow chaining (4 masks > 2 slots per node)
+;; Test scenario for new predicate types:
+;;   tcp-flags-match, l4-match (short + long), mask-eq
+;;
+;; Traffic (feature-test-traffic.json):
+;;   Normal = UDP port 8888, payload "VETH-LAB-TEST"
+;;   Attack = UDP port 9999, payload "VETH-LAB-TEST"
+;;   SYN flood = TCP SYN (flags=0x02)
+;;
+;; What to watch:
+;;   syn_flood phase  -> drops spike (Rule 1: tcp-flags-match)
+;;   udp_attack phase -> drops spike (Rule 2: l4-match short on port bytes)
+;;   all UDP phases   -> "monitor/veth-payload" count ticks (Rule 4: l4-match long)
+;;   syn_flood phase  -> "monitor/syn-l4match" count ticks (Rule 5: l4-match on flags byte)
+;;   normal phases    -> "limit/udp-normal" rate-limit (Rule 3: mask-eq)
 
-;; Rule 1: Drop all TCP SYN packets (bit 0x02 set)
-{:constraints [(= proto 6) (mask tcp-flags 0x02)] :actions [(drop)] :priority 200}
+;; Rule 1: DROP TCP SYN via tcp-flags-match (SYN bit = 0x02)
+{:constraints [(= proto 6) (tcp-flags-match 0x02 0x02)] :actions [(drop :name ["security", "drop-syn"])] :priority 250 :comment "Drop TCP SYN via tcp-flags-match"}
 
-;; Rule 2: Rate-limit TCP ACK packets (bit 0x10 set)
-{:constraints [(= proto 6) (mask tcp-flags 0x10)] :actions [(rate-limit 500 :name ["test" "tcp-ack"])] :priority 150}
+;; Rule 2: DROP UDP attack port via l4-match short (2-byte dst port at L4 offset 2, 9999=0x270F)
+{:constraints [(= proto 17) (l4-match 2 "270F" "FFFF")] :actions [(drop)] :priority 255 :comment "Drop UDP attack port 9999 via l4-match"}
 
-;; Rule 3: Count TCP RST packets (bit 0x04 set)
-{:constraints [(= proto 6) (mask tcp-flags 0x04)] :actions [(count :name ["monitor" "tcp-rst"])]}
+;; Rule 3: RATE-LIMIT normal UDP via mask-eq on protocol
+{:constraints [(mask-eq proto 0xFF 17) (= dst-port 8888)] :actions [(rate-limit 5000 :name ["limit" "udp-normal"])] :priority 150 :comment "Rate-limit normal UDP via mask-eq"}
 
-;; Rule 4: Drop TCP FIN packets (bit 0x01 set)
-{:constraints [(= proto 6) (mask tcp-flags 0x01)] :actions [(drop)] :priority 50}
+;; Rule 4: COUNT "VETH-LAB-TEST" payload via l4-match long (13 bytes at L4 offset 8)
+;; 56455448 2D4C4142 2D544553 54 = "VETH-LAB-TEST"
+{:constraints [(= proto 17) (l4-match 8 "564554482D4C41422D54455354" "FFFFFFFFFFFFFFFFFFFFFFFFFF")] :actions [(count :name ["monitor" "veth-payload"])] :priority 100 :comment "Count VETH-LAB-TEST payload"}
+
+;; Rule 5: COUNT TCP SYN via l4-match on raw flags byte (L4 offset 13, SYN=0x02)
+{:constraints [(= proto 6) (l4-match 13 "02" "02")] :actions [(count :name ["monitor" "syn-l4match"])] :priority 50 :comment "Count SYN via l4-match on flags byte"}

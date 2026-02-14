@@ -41,7 +41,8 @@ const RANGE_OP_GT: u8 = 1;
 const RANGE_OP_LT: u8 = 2;
 const RANGE_OP_GTE: u8 = 3;
 const RANGE_OP_LTE: u8 = 4;
-const RANGE_OP_MASK: u8 = 5;
+const RANGE_OP_MASK_EQ: u8 = 5;
+const RANGE_OP_PATTERN: u8 = 6;
 
 /// Token bucket state for rate limiting
 #[repr(C)]
@@ -58,8 +59,11 @@ pub struct TokenBucket {
 // Tree Rete Engine Types
 // =============================================================================
 
-/// Number of field dimensions (Proto..TcpWindow = 0..8)
+/// Number of static field dimensions (Proto..TcpWindow = 0..8)
 const NUM_DIMS: u8 = 9;
+
+/// Maximum dimension index (0-15, includes 7 custom slots)
+const MAX_DIM: u8 = 16;
 
 /// Sentinel: dimension value meaning "this is a leaf node, no more branching"
 const DIM_LEAF: u8 = 0xFF;
@@ -176,6 +180,31 @@ static TREE_RATE_STATE: HashMap<u32, TokenBucket> = HashMap::with_max_entries(2_
 #[map]
 static TREE_COUNTERS: HashMap<u32, u64> = HashMap::with_max_entries(100_000, 0);
 
+/// Maximum byte pattern length for multi-byte matching
+const MAX_PATTERN_LEN: usize = 64;
+
+/// Byte pattern for multi-byte matching at transport-relative offsets.
+/// Stored in BYTE_PATTERNS map, referenced by RANGE_OP_PATTERN guard edges.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BytePattern {
+    pub offset: u16,
+    pub length: u8,
+    pub _pad: u8,
+    pub match_bytes: [u8; MAX_PATTERN_LEN],
+    pub mask_bytes: [u8; MAX_PATTERN_LEN],
+}
+
+/// Byte patterns for multi-byte matching (l4-match 5-64 byte patterns)
+#[map]
+static BYTE_PATTERNS: Array<BytePattern> = Array::with_max_entries(4096, 0);
+
+/// Custom dimension config: 7 slots for l4-match byte extraction.
+/// Each entry is a CustomDimEntry { offset: u16, length: u8, _pad: u8 }.
+/// Stored as u32 for simplicity (offset in lower 16 bits, length in bits 16-23).
+#[map]
+static CUSTOM_DIM_CONFIG: Array<u32> = Array::with_max_entries(7, 0);
+
 // =============================================================================
 // Tree Rete Tail-Call DFS Maps
 // =============================================================================
@@ -215,7 +244,12 @@ pub struct DfsState {
     pub df_bit: u8,
     pub _pad2: u8,
     pub tcp_window: u16,
-    pub _pad3: u16,
+    /// Offset from packet start to transport (L4) header, for pattern matching
+    pub transport_offset: u16,
+    /// Pre-copied transport payload bytes for pattern matching.
+    /// Copied from the packet in veth_filter (which has verified packet access)
+    /// so tree_walk_step can compare without packet pointer issues.
+    pub pattern_data: [u8; MAX_PATTERN_LEN],
 }
 
 /// Per-CPU scratch for DFS state between tail calls.
@@ -363,7 +397,7 @@ fn try_veth_filter(ctx: XdpContext) -> Result<u32, ()> {
             // generate memset subprograms that blow up verifier state).
             state.stack[0] = root;
             state.top = 1;
-            // Fields: individual u32 writes
+            // Fields: individual u32 writes (0-8 = static dims, 9-15 = custom dims)
             state.fields[0] = fields[0];
             state.fields[1] = fields[1];
             state.fields[2] = fields[2];
@@ -373,6 +407,7 @@ fn try_veth_filter(ctx: XdpContext) -> Result<u32, ()> {
             state.fields[6] = fields[6];
             state.fields[7] = fields[7];
             state.fields[8] = fields[8];
+            // Custom dims (9-15) extracted from pattern_data below
             // Match state
             state.matched = 0;
             state.best_action = ACT_PASS;
@@ -390,11 +425,39 @@ fn try_veth_filter(ctx: XdpContext) -> Result<u32, ()> {
             state.enforce = if enforce { 1 } else { 0 };
             state._pad1 = 0;
             state._pad2 = 0;
-            state._pad3 = 0;
+            state.transport_offset = (ETH_HDR_LEN + ihl) as u16;
             state.tcp_flags = 0;
             state.ttl = 0;
             state.df_bit = 0;
             state.tcp_window = 0;
+
+            // Pre-copy up to 64 bytes of transport payload for pattern matching.
+            // tree_walk_step can't access raw packet data (verifier loses range
+            // through stack spills), so we snapshot the bytes here while we have
+            // verified packet access.
+            {
+                let tp = data + ETH_HDR_LEN + ihl;
+                let avail = if data_end > tp { data_end - tp } else { 0 };
+                let copy_len = if avail > MAX_PATTERN_LEN { MAX_PATTERN_LEN } else { avail };
+                state.pattern_data = [0u8; MAX_PATTERN_LEN];
+                let mut k = 0usize;
+                while k < MAX_PATTERN_LEN {
+                    if k >= copy_len { break; }
+                    if tp + k + 1 > data_end { break; }
+                    state.pattern_data[k] = unsafe { *((tp + k) as *const u8) };
+                    k += 1;
+                }
+            }
+
+            // Extract custom dimension values from pattern_data (not from
+            // packet pointers — variable-offset packet access fails verifier).
+            extract_custom_dim_from_data(state, 0);
+            extract_custom_dim_from_data(state, 1);
+            extract_custom_dim_from_data(state, 2);
+            extract_custom_dim_from_data(state, 3);
+            extract_custom_dim_from_data(state, 4);
+            extract_custom_dim_from_data(state, 5);
+            extract_custom_dim_from_data(state, 6);
 
             // DIAG: about to attempt tail call
             if let Some(cnt) = STATS.get_ptr_mut(11) { unsafe { *cnt += 1; } }
@@ -494,9 +557,10 @@ fn extract_phase2(data_end: usize, ip_hdr: usize, ihl: usize, proto: u8) -> PktF
 // Tree Rete Engine
 // =============================================================================
 
-/// Extract ALL packet field values into a flat array indexed by dimension.
-/// Eliminates per-iteration branching in get_field() — critical for the BPF
-/// verifier, which otherwise explores 9 if/else paths per loop iteration.
+/// Extract static packet field values into a flat array indexed by dimension.
+/// Custom dimensions (9-15) are extracted separately from pattern_data after
+/// the transport payload has been pre-copied, avoiding variable-offset packet
+/// pointer arithmetic that the verifier rejects.
 #[inline(always)]
 fn extract_all_fields(
     data_end: usize, ip_hdr: usize, ihl: usize, facts: &PktFacts,
@@ -512,8 +576,46 @@ fn extract_all_fields(
     f[6] = facts2.ttl as u32;
     f[7] = facts2.df_bit as u32;
     f[8] = facts2.tcp_window as u32;
-    // f[9..15] = 0 — padding, safe for masked access
+    // f[9..15] = custom dims, populated later from pattern_data
     f
+}
+
+/// Extract a single custom dimension value from pre-copied pattern_data.
+/// Reads from the map-value byte buffer instead of the packet, so the
+/// verifier can prove all accesses are in-bounds.
+#[inline(always)]
+fn extract_custom_dim_from_data(state: &mut DfsState, index: u32) {
+    if let Some(&cfg) = CUSTOM_DIM_CONFIG.get(index) {
+        let offset = (cfg & 0xFFFF) as usize;
+        let length = ((cfg >> 16) & 0xFF) as usize;
+        if offset > 0 && length > 0 {
+            // Mask offset to pattern_data bounds (0..63)
+            let off = offset & 0x3F;
+            let val = match length {
+                1 => {
+                    if off < MAX_PATTERN_LEN {
+                        state.pattern_data[off] as u32
+                    } else { 0 }
+                }
+                2 => {
+                    if off + 1 < MAX_PATTERN_LEN {
+                        ((state.pattern_data[off] as u32) << 8)
+                            | (state.pattern_data[off + 1] as u32)
+                    } else { 0 }
+                }
+                4 => {
+                    if off + 3 < MAX_PATTERN_LEN {
+                        ((state.pattern_data[off] as u32) << 24)
+                            | ((state.pattern_data[off + 1] as u32) << 16)
+                            | ((state.pattern_data[off + 2] as u32) << 8)
+                            | (state.pattern_data[off + 3] as u32)
+                    } else { 0 }
+                }
+                _ => 0,
+            };
+            state.fields[(9 + index as usize) & 0xF] = val;
+        }
+    }
 }
 
 /// Token bucket rate limiting for tree rules (keyed by stable rule_id).
@@ -642,7 +744,7 @@ fn try_tree_walk_step(ctx: &XdpContext) -> Result<u32, ()> {
     // ---------------------------------------------------------------
     // If this is a leaf node, skip to next iteration (no children)
     // ---------------------------------------------------------------
-    if node.dimension == DIM_LEAF || node.dimension >= NUM_DIMS {
+    if node.dimension == DIM_LEAF || node.dimension >= MAX_DIM {
         unsafe { let _ = TREE_WALK_PROG.tail_call(ctx, 0); }
         return pass_packet();
     }
@@ -667,7 +769,12 @@ fn try_tree_walk_step(ctx: &XdpContext) -> Result<u32, ()> {
             RANGE_OP_LT  => fv < node.range_val_1,
             RANGE_OP_GTE => fv >= node.range_val_1,
             RANGE_OP_LTE => fv <= node.range_val_1,
-            RANGE_OP_MASK => (fv & node.range_val_1) != 0,
+            RANGE_OP_MASK_EQ => {
+                let mask = node.range_val_1 >> 16;
+                let expected = node.range_val_1 & 0xFFFF;
+                (fv & mask) == expected
+            }
+            RANGE_OP_PATTERN => check_byte_pattern(state, node.range_val_1),
             _ => false,
         };
         if passes && state.top < 16 {
@@ -681,7 +788,12 @@ fn try_tree_walk_step(ctx: &XdpContext) -> Result<u32, ()> {
             RANGE_OP_LT  => fv < node.range_val_0,
             RANGE_OP_GTE => fv >= node.range_val_0,
             RANGE_OP_LTE => fv <= node.range_val_0,
-            RANGE_OP_MASK => (fv & node.range_val_0) != 0,
+            RANGE_OP_MASK_EQ => {
+                let mask = node.range_val_0 >> 16;
+                let expected = node.range_val_0 & 0xFFFF;
+                (fv & mask) == expected
+            }
+            RANGE_OP_PATTERN => check_byte_pattern(state, node.range_val_0),
             _ => false,
         };
         if passes && state.top < 16 {
@@ -706,6 +818,41 @@ fn try_tree_walk_step(ctx: &XdpContext) -> Result<u32, ()> {
 
     // Tail call failed (33-call limit reached) — apply what we have
     apply_dfs_result(ctx, state)
+}
+
+/// Check a byte pattern against pre-copied transport payload bytes.
+/// `pattern_idx` is the index into BYTE_PATTERNS map.
+/// Returns true if the pattern matches.
+///
+/// The actual packet bytes are pre-copied into `state.pattern_data` by
+/// `veth_filter` (which has verified packet access). This avoids packet
+/// pointer issues in tree_walk_step — the verifier loses range tracking
+/// when the compiler spills packet pointers to the stack.
+///
+/// The match/mask arrays in BytePattern are "pre-shifted" by the compiler:
+/// match_bytes[i] and mask_bytes[i] correspond to pattern_data[i] directly.
+/// Bytes outside the pattern range have mask=0 so `(any & 0) == 0` always
+/// passes. This eliminates all runtime offset arithmetic, avoiding verifier
+/// issues with unbounded map value accesses.
+#[inline(always)]
+fn check_byte_pattern(state: &DfsState, pattern_idx: u32) -> bool {
+    let pat = match BYTE_PATTERNS.get(pattern_idx) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    // Straight 64-byte comparison — no offset arithmetic.
+    // The verifier tracks j ∈ [0, 63], and both pattern_data[j] (at map
+    // offset 168+j within 232-byte DfsState) and mask/match_bytes[j]
+    // (within 132-byte BytePattern) are provably in-bounds.
+    let mut j = 0usize;
+    while j < MAX_PATTERN_LEN {
+        if (state.pattern_data[j] & pat.mask_bytes[j]) != pat.match_bytes[j] {
+            return false;
+        }
+        j += 1;
+    }
+    true
 }
 
 /// Apply the final DFS result: update stats, return XDP action.
@@ -746,6 +893,11 @@ fn apply_dfs_result(_ctx: &XdpContext, state: &mut DfsState) -> Result<u32, ()> 
         if action == ACT_DROP {
             if let Some(dropped) = STATS.get_ptr_mut(2) {
                 unsafe { *dropped += 1; }
+            }
+            // Per-rule drop counter (same map as COUNT actions)
+            match TREE_COUNTERS.get_ptr_mut(&rule_id) {
+                Some(ptr) => { unsafe { *ptr += 1; } }
+                None => { let _ = TREE_COUNTERS.insert(&rule_id, &1, 0); }
             }
         } else if action == ACT_RATE_LIMIT {
             if let Some(rate_limited) = STATS.get_ptr_mut(5) {

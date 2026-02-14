@@ -1,50 +1,50 @@
 {
-  "name": "Feature Test - Named Buckets & Count Actions",
-  "description": "Test named rate limiter buckets and non-terminating count actions at scale",
-  "baseline_pps": 50000,
-  "attack_pps": 500000,
+  "name": "Mask Predicate Feature Test",
+  "description": "Tests tcp-flags-match, l4-match (short+long), mask-eq predicates. Phases: warmup → UDP attack → calm → SYN flood → calm → UDP attack → final",
+  "baseline_pps": 5000,
+  "attack_pps": 50000,
   "phases": [
     {
       "name": "warmup",
       "duration_secs": 20,
       "type": "normal",
-      "description": "Baseline 50k pps UDP traffic - triggers count actions"
+      "description": "Baseline UDP (port 8888) - l4-match counts VETH-LAB-TEST payloads"
     },
     {
-      "name": "dns_amp_attack",
+      "name": "udp_attack",
       "duration_secs": 15,
       "type": "attack",
-      "description": "500k pps UDP amplification - triggers named buckets + counts"
+      "description": "UDP flood to port 9999 - l4-match short drops on dst port bytes"
     },
     {
       "name": "calm1",
       "duration_secs": 10,
       "type": "normal",
-      "description": "Recovery at 50k pps"
+      "description": "Recovery - baseline UDP resumes"
     },
     {
-      "name": "sustained_attack",
-      "duration_secs": 20,
-      "type": "attack",
-      "description": "Sustained 500k pps - test shared bucket exhaustion"
+      "name": "syn_flood",
+      "duration_secs": 15,
+      "type": "syn_flood",
+      "description": "TCP SYN flood - tcp-flags-match drops + l4-match counts on flags byte"
     },
     {
       "name": "calm2",
       "duration_secs": 10,
       "type": "normal",
-      "description": "Recovery at 50k pps"
+      "description": "Recovery - baseline UDP resumes"
     },
     {
-      "name": "extreme_attack",
+      "name": "udp_attack2",
       "duration_secs": 15,
       "type": "attack",
-      "description": "Final push at 500k pps"
+      "description": "Final UDP flood to port 9999 - confirms l4-match drop consistency"
     },
     {
-      "name": "final",
-      "duration_secs": 15,
+      "name": "final_calm",
+      "duration_secs": 10,
       "type": "normal",
-      "description": "Final baseline at 50k pps"
+      "description": "Final baseline - all counters should show accumulated matches"
     }
   ]
 }
