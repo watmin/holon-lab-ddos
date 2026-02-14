@@ -19,7 +19,7 @@ use aya::Ebpf;
 use tracing::info;
 
 use crate::{
-    EdgeKey, FieldDim, FieldRef, Predicate, RuleSpec, TokenBucket, TreeNode,
+    EdgeKey, FieldDim, Predicate, RuleSpec, TokenBucket, TreeNode,
     ACT_PASS, ACT_RATE_LIMIT, DIM_LEAF, NUM_DIMENSIONS, TREE_SLOT_SIZE,
 };
 
@@ -634,7 +634,7 @@ mod tests {
             action_nodes.len(), flat.nodes);
 
         // One should be DROP, another RATE_LIMIT
-        let has_drop = action_nodes.iter().any(|(_, n)| n.action == ACT_DROP);
+        let has_drop = action_nodes.iter().any(|(_, n)| n.action == crate::ACT_DROP);
         let has_rate = action_nodes.iter().any(|(_, n)| n.action == ACT_RATE_LIMIT);
         assert!(has_drop, "Expected a DROP action node");
         assert!(has_rate, "Expected a RATE_LIMIT action node");
@@ -955,7 +955,7 @@ mod tests {
             (FieldDim::Proto, 17), (FieldDim::L4Word0, 53),
         ]);
         assert!(matched, "Should match");
-        assert_eq!(action, ACT_DROP);
+        assert_eq!(action, crate::ACT_DROP);
         assert_eq!(prio, 10);
 
         // Multi-cursor walk (theoretical reference)
@@ -963,7 +963,7 @@ mod tests {
             (FieldDim::Proto, 17), (FieldDim::L4Word0, 53),
         ]);
         assert!(matched, "Should match (multi-cursor)");
-        assert_eq!(action, ACT_DROP);
+        assert_eq!(action, crate::ACT_DROP);
         assert_eq!(prio, 10);
     }
 
@@ -1009,7 +1009,7 @@ mod tests {
             (FieldDim::Proto, 17), (FieldDim::L4Word0, 53),
         ]);
         assert!(matched, "Should match");
-        assert_eq!(action, ACT_DROP, "Higher-prio specific should win");
+        assert_eq!(action, crate::ACT_DROP, "Higher-prio specific should win");
         assert_eq!(prio, 10);
     }
 
@@ -1121,7 +1121,7 @@ mod tests {
             (FieldDim::L4Word0, 999), (FieldDim::L4Word1, 8000),
         ]);
         assert!(m, "Test 2: should match background");
-        assert_eq!(a, ACT_DROP, "Test 2: background drop");
+        assert_eq!(a, crate::ACT_DROP, "Test 2: background drop");
         assert_eq!(p, 100);
 
         // Test 3: S2 matches TCP SYN flood
@@ -1239,7 +1239,7 @@ mod tests {
             (FieldDim::TcpFlags, 2),
         ]);
         assert!(m, "Should match");
-        assert_eq!(a, ACT_DROP, "Replicated wildcard (prio 150) should beat specific (prio 100)");
+        assert_eq!(a, crate::ACT_DROP, "Replicated wildcard (prio 150) should beat specific (prio 100)");
         assert_eq!(p, 150);
     }
 
@@ -1323,12 +1323,11 @@ mod tests {
             // Check if all constraints match
             let all_match = rule.constraints.iter().all(|pred| {
                 match pred {
-                    Predicate::Eq(field_ref, value) => {
-                        match field_ref {
-                            crate::FieldRef::Dim(dim) => {
-                                pkt.get(dim).copied() == Some(*value)
-                            }
-                        }
+                    Predicate::Eq(crate::FieldRef::Dim(dim), value) => {
+                        pkt.get(dim).copied() == Some(*value)
+                    }
+                    Predicate::In(crate::FieldRef::Dim(dim), values) => {
+                        pkt.get(dim).map_or(false, |v| values.contains(v))
                     }
                 }
             });
@@ -1418,6 +1417,7 @@ mod tests {
                         let matching: Vec<_> = rules.iter().enumerate().filter(|(_, r)| {
                             r.constraints.iter().all(|pred| match pred {
                                 Predicate::Eq(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).copied() == Some(*val),
+                                Predicate::In(crate::FieldRef::Dim(dim), vals) => pkt_map.get(dim).map_or(false, |v| vals.contains(v)),
                             })
                         }).collect();
                         eprintln!("FAIL iter={}, packet={:?}", iter, packet);
@@ -1436,6 +1436,7 @@ mod tests {
                     let top_prio_count = rules.iter().filter(|r| {
                         r.priority == bf_p && r.constraints.iter().all(|pred| match pred {
                             Predicate::Eq(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).copied() == Some(*val),
+                            Predicate::In(crate::FieldRef::Dim(dim), vals) => pkt_map.get(dim).map_or(false, |v| vals.contains(v)),
                         })
                     }).count();
                     if top_prio_count == 1 {
@@ -1522,6 +1523,7 @@ mod tests {
                         let matching: Vec<_> = rules.iter().enumerate().filter(|(_, r)| {
                             r.constraints.iter().all(|pred| match pred {
                                 Predicate::Eq(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).copied() == Some(*val),
+                                Predicate::In(crate::FieldRef::Dim(dim), vals) => pkt_map.get(dim).map_or(false, |v| vals.contains(v)),
                             })
                         }).collect();
                         eprintln!("FAIL iter={}, packet={:?}", iter, packet);
@@ -1539,6 +1541,7 @@ mod tests {
                     let top_prio_count = rules.iter().filter(|r| {
                         r.priority == bf_p && r.constraints.iter().all(|pred| match pred {
                             Predicate::Eq(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).copied() == Some(*val),
+                            Predicate::In(crate::FieldRef::Dim(dim), vals) => pkt_map.get(dim).map_or(false, |v| vals.contains(v)),
                         })
                     }).count();
                     if top_prio_count == 1 {

@@ -4,18 +4,16 @@
 //! Rules are managed by the userspace sidecar based on Holon detection.
 //!
 //! Architecture:
-//! - Tree Rete engine (eval_mode 2): decision tree with stack-based DFS
-//!   trie walker that explores all matching paths (specific + wildcard)
-//!   and picks the highest-priority terminal node.
-//! - Bitmask Rete engine (eval_mode 1): u64 bitmask dispatch (up to 64 rules)
-//! - Legacy flat rules (eval_mode 0): simple key-value lookup
+//! - Decision tree with stack-based DFS trie walker that explores all
+//!   matching paths (specific + wildcard) and picks the highest-priority
+//!   terminal node.
+//! - Blue/green double-buffered tree for zero-downtime rule updates.
 //!
 //! Features:
 //! - Phase 1: proto, src/dst IP, L4 ports (unconditional)
 //! - Phase 2: TCP flags, TTL, DF bit, TCP window (on-demand)
-//! - DROP/RATE_LIMIT/PASS actions with token bucket rate limiting
+//! - DROP/RATE_LIMIT/PASS/COUNT actions with token bucket rate limiting
 //! - Packet sampling to userspace for Holon analysis
-//! - Blue/green double-buffered tree for zero-downtime rule updates
 
 #![no_std]
 #![no_main]
@@ -29,47 +27,7 @@ use aya_ebpf::{
 };
 
 // =============================================================================
-// Legacy Rule Types (kept for backward compatibility)
-// =============================================================================
-
-#[repr(u8)]
-pub enum RuleType {
-    SrcIp = 0,
-    DstIp = 1,
-    SrcPort = 2,
-    DstPort = 3,
-    Protocol = 4,
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq)]
-pub enum RuleAction {
-    Pass = 0,
-    Drop = 1,
-    RateLimit = 2,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct RuleKey {
-    pub rule_type: u8,
-    pub _pad: [u8; 3],
-    pub value: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct RuleValue {
-    pub action: u8,
-    pub _pad: [u8; 3],
-    pub rate_pps: u32,
-    pub tokens: u32,
-    pub last_update_ns: u64,
-    pub match_count: u64,
-}
-
-// =============================================================================
-// Bitmask Rete Engine Types
+// Action and Rate-Limit Types
 // =============================================================================
 
 // Action constants
@@ -77,15 +35,6 @@ const ACT_PASS: u8 = 0;
 const ACT_DROP: u8 = 1;
 const ACT_RATE_LIMIT: u8 = 2;
 const ACT_COUNT: u8 = 3;
-
-/// Rule metadata: action + rate limit config. Indexed by bit position (0-63).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct RuleMeta {
-    pub action: u8,
-    pub _pad: [u8; 3],
-    pub rate_pps: u32,
-}
 
 /// Token bucket state for rate limiting
 #[repr(C)]
@@ -160,70 +109,19 @@ struct PktFacts2 {
 // BPF Maps
 // =============================================================================
 
-/// Legacy rules map
-#[map]
-static RULES: HashMap<RuleKey, RuleValue> = HashMap::with_max_entries(1024, 0);
-
 /// Stats counters (per-CPU)
 /// 0: total, 1: passed, 2: dropped, 3: matched, 4: sampled, 5: rate_limited
 #[map]
 static STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
 
 /// Configuration
-/// 0: sample_rate, 1: enforce_mode, 2: eval_mode (0=legacy, 1=bitmask rete)
+/// 0: sample_rate, 1: enforce_mode
 #[map]
 static CONFIG: PerCpuArray<u32> = PerCpuArray::with_max_entries(4, 0);
 
 /// Perf event array for packet samples
 #[map]
 static SAMPLES: PerfEventArray<PacketSample> = PerfEventArray::new(0);
-
-// =============================================================================
-// Bitmask Rete Engine Maps
-// =============================================================================
-
-// Phase 1 dispatch maps: HashMap<u32, u64> - key is field value, value is rule bitmask
-#[map]
-static DISPATCH_PROTO: HashMap<u32, u64> = HashMap::with_max_entries(256, 0);
-#[map]
-static DISPATCH_SRC_IP: HashMap<u32, u64> = HashMap::with_max_entries(131072, 0);
-#[map]
-static DISPATCH_DST_IP: HashMap<u32, u64> = HashMap::with_max_entries(131072, 0);
-#[map]
-static DISPATCH_L4W0: HashMap<u32, u64> = HashMap::with_max_entries(65536, 0);
-#[map]
-static DISPATCH_L4W1: HashMap<u32, u64> = HashMap::with_max_entries(65536, 0);
-
-// Phase 2 dispatch maps
-#[map]
-static DISPATCH_TCP_FLAGS: HashMap<u32, u64> = HashMap::with_max_entries(256, 0);
-#[map]
-static DISPATCH_TTL: HashMap<u32, u64> = HashMap::with_max_entries(256, 0);
-#[map]
-static DISPATCH_DF: HashMap<u32, u64> = HashMap::with_max_entries(4, 0);
-#[map]
-static DISPATCH_TCP_WIN: HashMap<u32, u64> = HashMap::with_max_entries(65536, 0);
-
-/// Don't-care masks: Array<u64> indexed by dimension (0-8).
-/// Bit set = rule does NOT constrain this dimension.
-#[map]
-static DONT_CARE: Array<u64> = Array::with_max_entries(16, 0);
-
-/// Active rules bitmask (single entry at index 0)
-#[map]
-static ACTIVE_RULES: Array<u64> = Array::with_max_entries(1, 0);
-
-/// Bitmask of rules that need Phase 2 evaluation (single entry at index 0)
-#[map]
-static NEEDS_PHASE2: Array<u64> = Array::with_max_entries(1, 0);
-
-/// Rule metadata: Array<RuleMeta> indexed by bit position (0-63)
-#[map]
-static RULE_META: Array<RuleMeta> = Array::with_max_entries(64, 0);
-
-/// Rate limit state for rules (keyed by rule bit position)
-#[map]
-static RATE_STATE: HashMap<u32, TokenBucket> = HashMap::with_max_entries(64, 0);
 
 // =============================================================================
 // Tree Rete Engine Maps (blue/green double-buffered)
@@ -397,155 +295,94 @@ fn try_veth_filter(ctx: XdpContext) -> Result<u32, ()> {
     let src_ip = unsafe { *((ip_hdr + 12) as *const u32) };
     let dst_ip = unsafe { *((ip_hdr + 16) as *const u32) };
 
-    // Dual evaluation path
-    let eval_mode = CONFIG.get(2).copied().unwrap_or(0);
-
-    // Tree Rete: early-return path.
+    // Tree Rete evaluation.
     // Sampling happens HERE (before tail call) because tree_walk_step
     // can't access raw packet data — the verifier requires bounds checks
     // that only veth_filter has established. Sidecar anomaly detection
     // uses only structured fields (IPs, ports, p0f), not matched/action.
     // tree_walk_step handles stats counters and the drop/pass decision.
-    if eval_mode == 2 {
-        // DIAG: reached eval_mode==2
-        if let Some(cnt) = STATS.get_ptr_mut(8) { unsafe { *cnt += 1; } }
 
-        let facts = extract_phase1(data_end, ip_hdr, ihl, protocol, src_ip, dst_ip);
-        let sp = if protocol == 6 || protocol == 17 { facts.l4_word0 } else { 0 };
-        let dp = if protocol == 6 || protocol == 17 { facts.l4_word1 } else { 0 };
+    // DIAG: reached tree eval
+    if let Some(cnt) = STATS.get_ptr_mut(8) { unsafe { *cnt += 1; } }
 
-        // Sample BEFORE the tail call (packet data is accessible here)
-        let sample_rate = CONFIG.get(0).copied().unwrap_or(0);
-        let total_count = STATS.get(0).copied().unwrap_or(0);
-        let should_sample = sample_rate > 0 && (total_count % sample_rate as u64 == 0);
-        if should_sample {
-            let p2 = extract_phase2(data_end, ip_hdr, ihl, protocol);
-            sample_packet(
-                &ctx, pkt_len, src_ip, dst_ip, sp, dp,
-                protocol, false, ACT_PASS, data, data_end,
-                p2.tcp_flags, p2.ttl, p2.df_bit, p2.tcp_window,
-            );
-        }
+    let facts = extract_phase1(data_end, ip_hdr, ihl, protocol, src_ip, dst_ip);
+    let sp = if protocol == 6 || protocol == 17 { facts.l4_word0 } else { 0 };
+    let dp = if protocol == 6 || protocol == 17 { facts.l4_word1 } else { 0 };
 
-        let root = TREE_ROOT.get(0).copied().unwrap_or(0);
-        if root != 0 {
-            // DIAG: root is non-zero
-            if let Some(cnt) = STATS.get_ptr_mut(9) { unsafe { *cnt += 1; } }
-
-            if let Some(state_ptr) = TREE_DFS_STATE.get_ptr_mut(0) {
-                // DIAG: got DFS state pointer
-                if let Some(cnt) = STATS.get_ptr_mut(10) { unsafe { *cnt += 1; } }
-
-                let state = unsafe { &mut *state_ptr };
-                let fields = extract_all_fields(data_end, ip_hdr, ihl, &facts);
-                let enforce = CONFIG.get(1).copied().unwrap_or(0) == 1;
-
-                // Write DfsState field-by-field (no bulk array ops — those
-                // generate memset subprograms that blow up verifier state).
-                state.stack[0] = root;
-                state.top = 1;
-                // Fields: individual u32 writes
-                state.fields[0] = fields[0];
-                state.fields[1] = fields[1];
-                state.fields[2] = fields[2];
-                state.fields[3] = fields[3];
-                state.fields[4] = fields[4];
-                state.fields[5] = fields[5];
-                state.fields[6] = fields[6];
-                state.fields[7] = fields[7];
-                state.fields[8] = fields[8];
-                // Match state
-                state.matched = 0;
-                state.best_action = ACT_PASS;
-                state.best_prio = 0;
-                state._pad0 = 0;
-                state.best_rule_id = 0;
-                // Packet metadata (for stats/action in tree_walk_step)
-                state.pkt_len = pkt_len;
-                state.src_ip = src_ip;
-                state.dst_ip = dst_ip;
-                state.src_port = sp;
-                state.dst_port = dp;
-                state.protocol = protocol;
-                state.should_sample = 0; // sampling already done above
-                state.enforce = if enforce { 1 } else { 0 };
-                state._pad1 = 0;
-                state._pad2 = 0;
-                state._pad3 = 0;
-                state.tcp_flags = 0;
-                state.ttl = 0;
-                state.df_bit = 0;
-                state.tcp_window = 0;
-
-                // DIAG: about to attempt tail call
-                if let Some(cnt) = STATS.get_ptr_mut(11) { unsafe { *cnt += 1; } }
-
-                // Tail-call to tree_walk_step — never returns on success
-                unsafe { let _ = TREE_WALK_PROG.tail_call(&ctx, 0); }
-
-                // DIAG: tail call FAILED (returned)
-                if let Some(cnt) = STATS.get_ptr_mut(12) { unsafe { *cnt += 1; } }
-            }
-        }
-        // Tail call failed or root == 0: pass the packet
-        return pass_packet();
-    }
-
-    let (matched, action, should_drop, src_port, dst_port) = if eval_mode == 1 {
-        // Bitmask Rete evaluation path
-        let facts = extract_phase1(data_end, ip_hdr, ihl, protocol, src_ip, dst_ip);
-        let sp = if protocol == 6 || protocol == 17 { facts.l4_word0 } else { 0 };
-        let dp = if protocol == 6 || protocol == 17 { facts.l4_word1 } else { 0 };
-        let (m, a, sd) = check_rete_rules(data_end, ip_hdr, ihl, &facts);
-        (m, a, sd, sp, dp)
-    } else {
-        // Legacy flat rules path
-        let (sp, dp) = parse_ports(data_end, ip_hdr, ihl, protocol);
-        let (m, a, sd) = check_rules_with_rate_limit(src_ip, dst_ip, sp, dp, protocol);
-        (m, a, sd, sp, dp)
-    };
-
-    // Update matched counter
-    if matched {
-        if let Some(matched_cnt) = STATS.get_ptr_mut(3) {
-            unsafe { *matched_cnt += 1; }
-        }
-    }
-
-    // Sample the packet
+    // Sample BEFORE the tail call (packet data is accessible here)
     let sample_rate = CONFIG.get(0).copied().unwrap_or(0);
     let total_count = STATS.get(0).copied().unwrap_or(0);
     let should_sample = sample_rate > 0 && (total_count % sample_rate as u64 == 0);
-
     if should_sample {
-        // Extract Phase 2 fields only for sampled packets (cheap at 1:N rate)
         let p2 = extract_phase2(data_end, ip_hdr, ihl, protocol);
         sample_packet(
-            &ctx, pkt_len, src_ip, dst_ip, src_port, dst_port,
-            protocol, matched, action, data, data_end,
+            &ctx, pkt_len, src_ip, dst_ip, sp, dp,
+            protocol, false, ACT_PASS, data, data_end,
             p2.tcp_flags, p2.ttl, p2.df_bit, p2.tcp_window,
         );
     }
 
-    // Apply action
-    let enforce = CONFIG.get(1).copied().unwrap_or(0) == 1;
+    let root = TREE_ROOT.get(0).copied().unwrap_or(0);
+    if root != 0 {
+        // DIAG: root is non-zero
+        if let Some(cnt) = STATS.get_ptr_mut(9) { unsafe { *cnt += 1; } }
 
-    if matched && should_drop && enforce {
-        if action == RuleAction::Drop as u8 {
-            if let Some(dropped) = STATS.get_ptr_mut(2) {
-                unsafe { *dropped += 1; }
-            }
-        } else if action == RuleAction::RateLimit as u8 {
-            if let Some(rate_limited) = STATS.get_ptr_mut(5) {
-                unsafe { *rate_limited += 1; }
-            }
-            if let Some(dropped) = STATS.get_ptr_mut(2) {
-                unsafe { *dropped += 1; }
-            }
+        if let Some(state_ptr) = TREE_DFS_STATE.get_ptr_mut(0) {
+            // DIAG: got DFS state pointer
+            if let Some(cnt) = STATS.get_ptr_mut(10) { unsafe { *cnt += 1; } }
+
+            let state = unsafe { &mut *state_ptr };
+            let fields = extract_all_fields(data_end, ip_hdr, ihl, &facts);
+            let enforce = CONFIG.get(1).copied().unwrap_or(0) == 1;
+
+            // Write DfsState field-by-field (no bulk array ops — those
+            // generate memset subprograms that blow up verifier state).
+            state.stack[0] = root;
+            state.top = 1;
+            // Fields: individual u32 writes
+            state.fields[0] = fields[0];
+            state.fields[1] = fields[1];
+            state.fields[2] = fields[2];
+            state.fields[3] = fields[3];
+            state.fields[4] = fields[4];
+            state.fields[5] = fields[5];
+            state.fields[6] = fields[6];
+            state.fields[7] = fields[7];
+            state.fields[8] = fields[8];
+            // Match state
+            state.matched = 0;
+            state.best_action = ACT_PASS;
+            state.best_prio = 0;
+            state._pad0 = 0;
+            state.best_rule_id = 0;
+            // Packet metadata (for stats/action in tree_walk_step)
+            state.pkt_len = pkt_len;
+            state.src_ip = src_ip;
+            state.dst_ip = dst_ip;
+            state.src_port = sp;
+            state.dst_port = dp;
+            state.protocol = protocol;
+            state.should_sample = 0; // sampling already done above
+            state.enforce = if enforce { 1 } else { 0 };
+            state._pad1 = 0;
+            state._pad2 = 0;
+            state._pad3 = 0;
+            state.tcp_flags = 0;
+            state.ttl = 0;
+            state.df_bit = 0;
+            state.tcp_window = 0;
+
+            // DIAG: about to attempt tail call
+            if let Some(cnt) = STATS.get_ptr_mut(11) { unsafe { *cnt += 1; } }
+
+            // Tail-call to tree_walk_step — never returns on success
+            unsafe { let _ = TREE_WALK_PROG.tail_call(&ctx, 0); }
+
+            // DIAG: tail call FAILED (returned)
+            if let Some(cnt) = STATS.get_ptr_mut(12) { unsafe { *cnt += 1; } }
         }
-        return Ok(xdp_action::XDP_DROP);
     }
-
+    // Tail call failed or root == 0: pass the packet
     pass_packet()
 }
 
@@ -557,98 +394,8 @@ fn pass_packet() -> Result<u32, ()> {
     Ok(xdp_action::XDP_PASS)
 }
 
-#[inline(always)]
-fn parse_ports(data_end: usize, ip_hdr: usize, ihl: usize, protocol: u8) -> (u16, u16) {
-    let transport = ip_hdr + ihl;
-    if (protocol == 6 || protocol == 17) && transport + 4 <= data_end {
-        let src_port = unsafe { u16::from_be(*((transport) as *const u16)) };
-        let dst_port = unsafe { u16::from_be(*((transport + 2) as *const u16)) };
-        (src_port, dst_port)
-    } else {
-        (0, 0)
-    }
-}
-
 // =============================================================================
-// Legacy flat rule evaluation (unchanged)
-// =============================================================================
-
-#[inline(always)]
-fn check_rules_with_rate_limit(
-    src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, protocol: u8,
-) -> (bool, u8, bool) {
-    let key = RuleKey { rule_type: RuleType::SrcIp as u8, _pad: [0; 3], value: src_ip };
-    if let Some(should_drop) = check_single_rule(&key) {
-        let action = unsafe { RULES.get(&key).map(|r| r.action).unwrap_or(0) };
-        return (true, action, should_drop);
-    }
-    let key = RuleKey { rule_type: RuleType::DstIp as u8, _pad: [0; 3], value: dst_ip };
-    if let Some(should_drop) = check_single_rule(&key) {
-        let action = unsafe { RULES.get(&key).map(|r| r.action).unwrap_or(0) };
-        return (true, action, should_drop);
-    }
-    if src_port != 0 {
-        let key = RuleKey { rule_type: RuleType::SrcPort as u8, _pad: [0; 3], value: src_port as u32 };
-        if let Some(should_drop) = check_single_rule(&key) {
-            let action = unsafe { RULES.get(&key).map(|r| r.action).unwrap_or(0) };
-            return (true, action, should_drop);
-        }
-    }
-    if dst_port != 0 {
-        let key = RuleKey { rule_type: RuleType::DstPort as u8, _pad: [0; 3], value: dst_port as u32 };
-        if let Some(should_drop) = check_single_rule(&key) {
-            let action = unsafe { RULES.get(&key).map(|r| r.action).unwrap_or(0) };
-            return (true, action, should_drop);
-        }
-    }
-    let key = RuleKey { rule_type: RuleType::Protocol as u8, _pad: [0; 3], value: protocol as u32 };
-    if let Some(should_drop) = check_single_rule(&key) {
-        let action = unsafe { RULES.get(&key).map(|r| r.action).unwrap_or(0) };
-        return (true, action, should_drop);
-    }
-    (false, RuleAction::Pass as u8, false)
-}
-
-#[inline(always)]
-fn check_single_rule(key: &RuleKey) -> Option<bool> {
-    match RULES.get_ptr_mut(key) {
-        Some(ptr) => {
-            let rule = unsafe { &mut *ptr };
-            rule.match_count = rule.match_count.wrapping_add(1);
-            match rule.action {
-                a if a == RuleAction::Pass as u8 => Some(false),
-                a if a == RuleAction::Drop as u8 => Some(true),
-                a if a == RuleAction::RateLimit as u8 => Some(apply_token_bucket(rule)),
-                _ => Some(false),
-            }
-        }
-        None => None,
-    }
-}
-
-#[inline(always)]
-fn apply_token_bucket(rule: &mut RuleValue) -> bool {
-    let now = unsafe { bpf_ktime_get_ns() };
-    let rate_pps = rule.rate_pps;
-    if rule.last_update_ns == 0 {
-        rule.last_update_ns = now;
-        rule.tokens = rate_pps;
-    }
-    let elapsed_ns = now.saturating_sub(rule.last_update_ns);
-    let elapsed_ms = elapsed_ns / NS_PER_MS;
-    if elapsed_ms > 0 && rate_pps > 0 {
-        let tokens_to_add = ((elapsed_ms * rate_pps as u64) / MS_PER_SEC) as u32;
-        if tokens_to_add > 0 {
-            let new_tokens = rule.tokens.saturating_add(tokens_to_add);
-            rule.tokens = if new_tokens > rate_pps { rate_pps } else { new_tokens };
-            rule.last_update_ns = now;
-        }
-    }
-    if rule.tokens > 0 { rule.tokens -= 1; false } else { true }
-}
-
-// =============================================================================
-// Sampling (unchanged)
+// Sampling
 // =============================================================================
 
 #[inline(always)]
@@ -675,7 +422,7 @@ fn sample_packet(
 }
 
 // =============================================================================
-// Bitmask Rete Engine
+// Packet Fact Extraction
 // =============================================================================
 
 /// Phase 1 fact extraction - unconditional read of L3/L4 header fields
@@ -719,191 +466,8 @@ fn extract_phase2(data_end: usize, ip_hdr: usize, ihl: usize, proto: u8) -> PktF
     PktFacts2 { tcp_flags, ttl, df_bit, tcp_window }
 }
 
-/// Helper: look up a dispatch map and return the bitmask (0 if not found)
-#[inline(always)]
-fn dispatch_lookup(map: &HashMap<u32, u64>, key: u32) -> u64 {
-    match unsafe { map.get(&key) } {
-        Some(mask) => *mask,
-        None => 0,
-    }
-}
-
-/// Helper: get a dont_care mask for a dimension (returns 0 if not found)
-#[inline(always)]
-fn get_dont_care(dim: u32) -> u64 {
-    DONT_CARE.get(dim).copied().unwrap_or(0)
-}
-
-/// Bitmask Rete evaluation: dispatch all dimensions, AND results, find match.
-/// Returns (matched, action, should_drop).
-#[inline(always)]
-fn check_rete_rules(data_end: usize, ip_hdr: usize, ihl: usize, facts: &PktFacts) -> (bool, u8, bool) {
-    // Start with all active rules
-    let mut matched = ACTIVE_RULES.get(0).copied().unwrap_or(0);
-    if matched == 0 {
-        return (false, ACT_PASS, false);
-    }
-
-    // Phase 1 dispatch: narrow by each dimension
-    // For each field: matched &= (dispatch_result | dont_care_for_this_dimension)
-    matched &= dispatch_lookup(&DISPATCH_PROTO, facts.proto as u32) | get_dont_care(0);
-    if matched == 0 { return (false, ACT_PASS, false); }
-
-    matched &= dispatch_lookup(&DISPATCH_SRC_IP, facts.src_ip) | get_dont_care(1);
-    if matched == 0 { return (false, ACT_PASS, false); }
-
-    matched &= dispatch_lookup(&DISPATCH_DST_IP, facts.dst_ip) | get_dont_care(2);
-    if matched == 0 { return (false, ACT_PASS, false); }
-
-    matched &= dispatch_lookup(&DISPATCH_L4W0, facts.l4_word0 as u32) | get_dont_care(3);
-    if matched == 0 { return (false, ACT_PASS, false); }
-
-    matched &= dispatch_lookup(&DISPATCH_L4W1, facts.l4_word1 as u32) | get_dont_care(4);
-    if matched == 0 { return (false, ACT_PASS, false); }
-
-    // Check if any remaining candidates need Phase 2
-    let needs_p2 = NEEDS_PHASE2.get(0).copied().unwrap_or(0);
-    if matched & needs_p2 != 0 {
-        // Phase 2 extraction (on-demand)
-        let facts2 = extract_phase2(data_end, ip_hdr, ihl, facts.proto);
-
-        matched &= dispatch_lookup(&DISPATCH_TCP_FLAGS, facts2.tcp_flags as u32) | get_dont_care(5);
-        if matched == 0 { return (false, ACT_PASS, false); }
-
-        matched &= dispatch_lookup(&DISPATCH_TTL, facts2.ttl as u32) | get_dont_care(6);
-        if matched == 0 { return (false, ACT_PASS, false); }
-
-        matched &= dispatch_lookup(&DISPATCH_DF, facts2.df_bit as u32) | get_dont_care(7);
-        if matched == 0 { return (false, ACT_PASS, false); }
-
-        matched &= dispatch_lookup(&DISPATCH_TCP_WIN, facts2.tcp_window as u32) | get_dont_care(8);
-        if matched == 0 { return (false, ACT_PASS, false); }
-    }
-
-    // Find first matching rule: lowest set bit
-    // In eBPF we can't use ctz() directly, so we check bits 0-7 explicitly
-    // (covers the common case of <8 active rules; for more, extend)
-    let rule_bit = find_first_set_bit(matched);
-    if rule_bit >= 64 {
-        return (false, ACT_PASS, false);
-    }
-
-    // Look up rule metadata
-    let meta = match RULE_META.get(rule_bit) {
-        Some(m) => *m,
-        None => return (false, ACT_PASS, false),
-    };
-
-    let should_drop = if meta.action == ACT_PASS {
-        false
-    } else if meta.action == ACT_DROP {
-        true
-    } else if meta.action == ACT_RATE_LIMIT {
-        apply_rete_token_bucket(rule_bit)
-    } else {
-        false
-    };
-
-    (true, meta.action, should_drop)
-}
-
-/// Find the lowest set bit in a u64. Returns 64 if no bits set.
-/// Uses cascading checks for BPF verifier compatibility.
-#[inline(always)]
-fn find_first_set_bit(v: u64) -> u32 {
-    if v == 0 { return 64; }
-    // Check byte by byte to find which byte has a set bit
-    if v & 0xFF != 0 {
-        // Bit is in byte 0 (bits 0-7)
-        if v & 1 != 0 { return 0; }
-        if v & 2 != 0 { return 1; }
-        if v & 4 != 0 { return 2; }
-        if v & 8 != 0 { return 3; }
-        if v & 16 != 0 { return 4; }
-        if v & 32 != 0 { return 5; }
-        if v & 64 != 0 { return 6; }
-        return 7;
-    }
-    if v & 0xFF00 != 0 {
-        if v & (1 << 8) != 0 { return 8; }
-        if v & (1 << 9) != 0 { return 9; }
-        if v & (1 << 10) != 0 { return 10; }
-        if v & (1 << 11) != 0 { return 11; }
-        if v & (1 << 12) != 0 { return 12; }
-        if v & (1 << 13) != 0 { return 13; }
-        if v & (1 << 14) != 0 { return 14; }
-        return 15;
-    }
-    if v & 0xFF_0000 != 0 {
-        if v & (1 << 16) != 0 { return 16; }
-        if v & (1 << 17) != 0 { return 17; }
-        if v & (1 << 18) != 0 { return 18; }
-        if v & (1 << 19) != 0 { return 19; }
-        if v & (1 << 20) != 0 { return 20; }
-        if v & (1 << 21) != 0 { return 21; }
-        if v & (1 << 22) != 0 { return 22; }
-        return 23;
-    }
-    if v & 0xFF00_0000 != 0 {
-        if v & (1 << 24) != 0 { return 24; }
-        if v & (1 << 25) != 0 { return 25; }
-        if v & (1 << 26) != 0 { return 26; }
-        if v & (1 << 27) != 0 { return 27; }
-        if v & (1 << 28) != 0 { return 28; }
-        if v & (1 << 29) != 0 { return 29; }
-        if v & (1 << 30) != 0 { return 30; }
-        return 31;
-    }
-    // Bits 32-63 (extend as needed)
-    if v & 0xFF_0000_0000 != 0 {
-        if v & (1u64 << 32) != 0 { return 32; }
-        if v & (1u64 << 33) != 0 { return 33; }
-        if v & (1u64 << 34) != 0 { return 34; }
-        if v & (1u64 << 35) != 0 { return 35; }
-        if v & (1u64 << 36) != 0 { return 36; }
-        if v & (1u64 << 37) != 0 { return 37; }
-        if v & (1u64 << 38) != 0 { return 38; }
-        return 39;
-    }
-    // For simplicity, handle up to bit 63 with a fallback
-    // In practice, we'll rarely have >40 rules active
-    let mut bit = 40u32;
-    while bit < 64 {
-        if v & (1u64 << bit) != 0 { return bit; }
-        bit += 1;
-    }
-    64
-}
-
-/// Token bucket rate limiting for Rete rules
-#[inline(always)]
-fn apply_rete_token_bucket(rule_bit: u32) -> bool {
-    match RATE_STATE.get_ptr_mut(&rule_bit) {
-        Some(ptr) => {
-            let bucket = unsafe { &mut *ptr };
-            let now = unsafe { bpf_ktime_get_ns() };
-            if bucket.last_update_ns == 0 {
-                bucket.last_update_ns = now;
-                bucket.tokens = bucket.rate_pps;
-            }
-            let elapsed_ns = now.saturating_sub(bucket.last_update_ns);
-            let elapsed_ms = elapsed_ns / NS_PER_MS;
-            if elapsed_ms > 0 && bucket.rate_pps > 0 {
-                let tokens_to_add = ((elapsed_ms * bucket.rate_pps as u64) / MS_PER_SEC) as u32;
-                if tokens_to_add > 0 {
-                    let new_tokens = bucket.tokens.saturating_add(tokens_to_add);
-                    bucket.tokens = if new_tokens > bucket.rate_pps { bucket.rate_pps } else { new_tokens };
-                    bucket.last_update_ns = now;
-                }
-            }
-            if bucket.tokens > 0 { bucket.tokens -= 1; false } else { true }
-        }
-        None => false,
-    }
-}
-
 // =============================================================================
-// Tree Rete Engine (eval_mode == 2)
+// Tree Rete Engine
 // =============================================================================
 
 /// Extract ALL packet field values into a flat array indexed by dimension.
@@ -1132,9 +696,6 @@ fn apply_dfs_result(_ctx: &XdpContext, state: &mut DfsState) -> Result<u32, ()> 
         } else if action == ACT_RATE_LIMIT {
             if let Some(rate_limited) = STATS.get_ptr_mut(5) {
                 unsafe { *rate_limited += 1; }
-            }
-            if let Some(dropped) = STATS.get_ptr_mut(2) {
-                unsafe { *dropped += 1; }
             }
         }
         return Ok(xdp_action::XDP_DROP);

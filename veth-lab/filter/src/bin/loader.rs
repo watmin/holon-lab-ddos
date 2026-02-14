@@ -1,6 +1,7 @@
 //! XDP Filter Loader CLI
 //!
-//! Loads the XDP program and provides interactive rule management
+//! Loads the XDP program and provides monitoring.
+//! Rule management is handled by the sidecar via the tree Rete engine.
 
 use anyhow::Result;
 use aya::programs::XdpFlags;
@@ -8,11 +9,11 @@ use clap::{Parser, Subcommand};
 use std::time::Duration;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
-use veth_filter::{Rule, RuleAction, RuleType, VethFilter, PacketSample};
+use veth_filter::{VethFilter, PacketSample};
 
 #[derive(Parser, Debug)]
 #[command(name = "veth-loader")]
-#[command(about = "Load XDP filter and manage rules")]
+#[command(about = "Load XDP filter and monitor traffic")]
 struct Args {
     /// Interface to attach XDP filter to
     #[arg(short, long, default_value = "veth-filter")]
@@ -42,34 +43,12 @@ enum Command {
         #[arg(short, long, default_value = "1")]
         interval: u64,
     },
-    /// Add a drop rule
-    Drop {
-        /// Rule type: src-ip, dst-ip, src-port, dst-port, protocol
-        #[arg(short = 't', long)]
-        rule_type: String,
-        /// Value (IP address or port number)
-        #[arg(short, long)]
-        value: String,
-    },
-    /// Remove a rule
-    Remove {
-        #[arg(short = 't', long)]
-        rule_type: String,
-        #[arg(short, long)]
-        value: String,
-    },
-    /// List all rules
-    List,
-    /// Clear all rules
-    Clear,
     /// Watch packet samples
     Watch {
         /// Maximum samples to show (0 = unlimited)
         #[arg(short, long, default_value = "100")]
         max: usize,
     },
-    /// Demo: add some test rules and watch
-    Demo,
 }
 
 #[tokio::main]
@@ -101,42 +80,8 @@ async fn main() -> Result<()> {
         Some(Command::Stats { interval }) => {
             run_stats_loop(&filter, interval).await?;
         }
-        Some(Command::Drop { rule_type, value }) => {
-            let rule = parse_rule(&rule_type, &value, RuleAction::Drop)?;
-            filter.add_rule(&rule).await?;
-            println!("Added drop rule: {:?} = {}", rule.rule_type, rule.value);
-        }
-        Some(Command::Remove { rule_type, value }) => {
-            let rule = parse_rule(&rule_type, &value, RuleAction::Pass)?;
-            filter.remove_rule(&rule).await?;
-            println!("Removed rule: {:?} = {}", rule.rule_type, rule.value);
-        }
-        Some(Command::List) => {
-            let rules = filter.list_rules().await?;
-            if rules.is_empty() {
-                println!("No rules configured");
-            } else {
-                println!("{:<12} {:<20} {:<10} {:<10}", "TYPE", "VALUE", "ACTION", "MATCHES");
-                for (rule, count) in rules {
-                    println!(
-                        "{:<12} {:<20} {:<10} {:<10}",
-                        format!("{:?}", rule.rule_type),
-                        rule.value,
-                        format!("{:?}", rule.action),
-                        count
-                    );
-                }
-            }
-        }
-        Some(Command::Clear) => {
-            filter.clear_rules().await?;
-            println!("All rules cleared");
-        }
         Some(Command::Watch { max }) => {
             run_watch_loop(&filter, max).await?;
-        }
-        Some(Command::Demo) => {
-            run_demo(&filter).await?;
         }
         None => {
             // Default: show stats
@@ -145,24 +90,6 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-fn parse_rule(rule_type: &str, value: &str, action: RuleAction) -> Result<Rule> {
-    let rt = match rule_type.to_lowercase().as_str() {
-        "src-ip" | "srcip" | "src_ip" => RuleType::SrcIp,
-        "dst-ip" | "dstip" | "dst_ip" => RuleType::DstIp,
-        "src-port" | "srcport" | "src_port" => RuleType::SrcPort,
-        "dst-port" | "dstport" | "dst_port" => RuleType::DstPort,
-        "protocol" | "proto" => RuleType::Protocol,
-        _ => anyhow::bail!("Unknown rule type: {}. Use: src-ip, dst-ip, src-port, dst-port, protocol", rule_type),
-    };
-
-    Ok(Rule {
-        rule_type: rt,
-        value: value.to_string(),
-        action,
-        rate_pps: None,
-    })
 }
 
 async fn run_stats_loop(filter: &VethFilter, interval: u64) -> Result<()> {
@@ -179,17 +106,19 @@ async fn run_stats_loop(filter: &VethFilter, interval: u64) -> Result<()> {
         
         // Calculate rates
         let pps = stats.total_packets.saturating_sub(last_stats.total_packets) / interval;
-        let drops_ps = stats.dropped_packets.saturating_sub(last_stats.dropped_packets) / interval;
+        let drops_ps = (stats.dropped_packets + stats.rate_limited_packets)
+            .saturating_sub(last_stats.dropped_packets + last_stats.rate_limited_packets) / interval;
 
         if iteration % 10 == 0 {
-            println!("{:<12} {:<12} {:<12} {:<12} {:<12} {:<12}",
-                "TOTAL", "PASSED", "DROPPED", "SAMPLED", "PPS", "DROPS/S");
+            println!("{:<12} {:<12} {:<12} {:<12} {:<12} {:<12} {:<12}",
+                "TOTAL", "PASSED", "DROPPED", "RATE_LIM", "SAMPLED", "PPS", "DROPS/S");
         }
         
-        println!("{:<12} {:<12} {:<12} {:<12} {:<12} {:<12}",
+        println!("{:<12} {:<12} {:<12} {:<12} {:<12} {:<12} {:<12}",
             stats.total_packets,
             stats.passed_packets,
             stats.dropped_packets,
+            stats.rate_limited_packets,
             stats.sampled_packets,
             pps,
             drops_ps,
@@ -246,7 +175,7 @@ async fn run_watch_loop(filter: &VethFilter, max: usize) -> Result<()> {
         });
     }
 
-    drop(tx);  // Drop sender so rx knows when all tasks are done
+    drop(tx);
 
     let mut count = 0;
     println!("{:<16} {:<16} {:<8} {:<8} {:<8} {:<8}",
@@ -268,43 +197,6 @@ async fn run_watch_loop(filter: &VethFilter, max: usize) -> Result<()> {
             return Ok(());
         }
     }
-
-    Ok(())
-}
-
-async fn run_demo(filter: &VethFilter) -> Result<()> {
-    println!("Running demo...");
-    println!();
-
-    // Enable enforcement
-    filter.set_enforce_mode(true).await?;
-    filter.set_sample_rate(1).await?;  // Sample all packets
-
-    // Add some demo rules
-    println!("Adding demo rules:");
-    
-    // Drop traffic from 10.0.0.0/8 (simulated attack range)
-    // We'll add a few specific IPs as examples
-    let rules = vec![
-        Rule::drop_src_ip("10.0.0.1".parse()?),
-        Rule::drop_src_ip("10.0.0.2".parse()?),
-        Rule::drop_dst_port(9999),  // Block port 9999
-    ];
-
-    for rule in &rules {
-        filter.add_rule(rule).await?;
-        println!("  + {:?} = {} -> {:?}", rule.rule_type, rule.value, rule.action);
-    }
-
-    println!();
-    println!("Demo rules active. Send traffic to test:");
-    println!("  - From 10.0.0.1 or 10.0.0.2 -> DROPPED");
-    println!("  - To port 9999 -> DROPPED");
-    println!("  - Other traffic -> PASSED");
-    println!();
-    
-    // Show stats until interrupted
-    run_stats_loop(filter, 1).await?;
 
     Ok(())
 }

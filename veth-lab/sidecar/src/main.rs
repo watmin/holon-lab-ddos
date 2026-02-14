@@ -28,7 +28,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use veth_filter::{
-    FieldDim, PacketSample, Predicate, RuleAction, RuleSpec, RuleType, VethFilter,
+    FieldDim, PacketSample, Predicate, RuleAction, RuleSpec, VethFilter,
 };
 
 #[derive(Parser, Debug)]
@@ -1187,10 +1187,6 @@ async fn main() -> Result<()> {
     filter.set_sample_rate(args.sample_rate).await?;
     filter.set_enforce_mode(args.enforce).await?;
 
-    // Enable tree Rete evaluation engine (blue/green decision tree)
-    filter.set_eval_mode(2).await?;
-    info!("Tree Rete rule engine enabled (blue/green)");
-
     // Initialize Holon
     let holon = Arc::new(Holon::new(args.dimensions));
     info!("Holon initialized with {} dimensions", args.dimensions);
@@ -1400,8 +1396,8 @@ async fn main() -> Result<()> {
                         got_sample = true;
 
                         if sample.matched_rule != 0 {
-                            matched_rule_keys.push(format!("{:?}:{}", RuleType::SrcIp, sample.src_ip_addr()));
-                            matched_rule_keys.push(format!("{:?}:{}", RuleType::DstPort, sample.dst_port));
+                            matched_rule_keys.push(format!("src_ip:{}", sample.src_ip_addr()));
+                            matched_rule_keys.push(format!("dst_port:{}", sample.dst_port));
                         }
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,

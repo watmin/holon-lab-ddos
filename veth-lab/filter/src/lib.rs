@@ -1,39 +1,28 @@
 //! Veth Filter - Userspace loader and rule management
 //!
 //! Loads the XDP filter and provides an API for:
-//! - Managing drop/rate-limit rules via bitmask Rete engine
-//! - Reading statistics
+//! - Compiling rules into the tree Rete decision engine
+//! - Reading statistics, counters, and rate limiter state
 //! - Receiving packet samples via ring buffer
 
 use anyhow::{Context, Result};
 use aya::{
     include_bytes_aligned,
-    maps::{Array, HashMap, MapData, PerCpuArray, PerCpuValues, AsyncPerfEventArray, ProgramArray},
+    maps::{MapData, PerCpuArray, PerCpuValues, AsyncPerfEventArray, ProgramArray},
     programs::{Xdp, XdpFlags},
     Ebpf,
 };
 use holon::{ScalarValue, WalkType, Walkable, WalkableRef, WalkableValue, ScalarRef};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 pub mod tree;
 
 // =============================================================================
-// Legacy Rule Types (kept for backward compatibility)
+// Rule Action Types
 // =============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[repr(u8)]
-pub enum RuleType {
-    SrcIp = 0,
-    DstIp = 1,
-    SrcPort = 2,
-    DstPort = 3,
-    Protocol = 4,
-}
 
 /// Action to take when a rule matches.
 /// Note: The repr(u8) discriminants are used in eBPF for simple actions.
@@ -76,34 +65,11 @@ impl RuleAction {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RuleKey {
-    pub rule_type: u8,
-    pub _pad: [u8; 3],
-    pub value: u32,
-}
-
-unsafe impl aya::Pod for RuleKey {}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct RuleValue {
-    pub action: u8,
-    pub _pad: [u8; 3],
-    pub rate_pps: u32,
-    pub tokens: u32,
-    pub last_update_ns: u64,
-    pub match_count: u64,
-}
-
-unsafe impl aya::Pod for RuleValue {}
-
 // =============================================================================
-// Bitmask Rete Engine Types
+// Field Dimension Types
 // =============================================================================
 
-/// Dispatch dimension identifiers (must match eBPF DONT_CARE array indices)
+/// Dispatch dimension identifiers
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum FieldDim {
@@ -121,26 +87,6 @@ pub enum FieldDim {
 }
 
 impl FieldDim {
-    /// Map name for this dimension's dispatch map
-    pub fn map_name(&self) -> &'static str {
-        match self {
-            FieldDim::Proto => "DISPATCH_PROTO",
-            FieldDim::SrcIp => "DISPATCH_SRC_IP",
-            FieldDim::DstIp => "DISPATCH_DST_IP",
-            FieldDim::L4Word0 => "DISPATCH_L4W0",
-            FieldDim::L4Word1 => "DISPATCH_L4W1",
-            FieldDim::TcpFlags => "DISPATCH_TCP_FLAGS",
-            FieldDim::Ttl => "DISPATCH_TTL",
-            FieldDim::DfBit => "DISPATCH_DF",
-            FieldDim::TcpWindow => "DISPATCH_TCP_WIN",
-        }
-    }
-
-    /// Whether this is a Phase 2 dimension
-    pub fn is_phase2(&self) -> bool {
-        (*self as u8) >= 5
-    }
-
     /// Human-readable name for display
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -290,20 +236,6 @@ impl Predicate {
 /// Total number of dispatch dimensions
 pub const NUM_DIMENSIONS: usize = 9;
 
-/// Maximum number of concurrent rules (u64 bitmask)
-pub const MAX_RULES: usize = 64;
-
-/// Rule metadata (must match eBPF RuleMeta struct)
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct RuleMeta {
-    pub action: u8,
-    pub _pad: [u8; 3],
-    pub rate_pps: u32,
-}
-
-unsafe impl aya::Pod for RuleMeta {}
-
 /// Token bucket state (must match eBPF struct)
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -376,8 +308,8 @@ pub struct EdgeKey {
 unsafe impl aya::Pod for EdgeKey {}
 
 /// A rule specification: set of constraints + actions.
-/// Each constraint is a `Predicate` (currently only `Eq`).
-/// Unconstrained dimensions get dont_care bits set (bitmask rete) or wildcard (tree rete).
+/// Each constraint is a `Predicate` (Eq or In).
+/// Unconstrained dimensions get wildcard traversal in the tree.
 #[derive(Debug, Clone)]
 pub struct RuleSpec {
     /// Constraints: each predicate must match for the rule to fire.
@@ -621,14 +553,7 @@ impl RuleSpec {
         }
     }
 
-    /// Whether this rule needs Phase 2 fields
-    pub fn needs_phase2(&self) -> bool {
-        self.constraints.iter().any(|p| {
-            p.as_eq_dim().map_or(false, |(dim, _)| dim.is_phase2())
-        })
-    }
-
-    /// Human-readable description (legacy format)
+    /// Human-readable description
     pub fn describe(&self) -> String {
         self.to_sexpr()
     }
@@ -996,7 +921,7 @@ impl Walkable for PacketSample {
 }
 
 // =============================================================================
-// Legacy Rule type (kept for backward compat)
+// Statistics
 // =============================================================================
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -1010,7 +935,7 @@ pub struct FilterStats {
     pub dfs_completions: u64,
     /// Diagnostic: tail-call entries (STATS[7])
     pub tail_call_entries: u64,
-    /// Diagnostic: eval_mode==2 entered (STATS[8])
+    /// Diagnostic: tree eval entered (STATS[8])
     pub diag_eval2: u64,
     /// Diagnostic: root non-zero (STATS[9])
     pub diag_root_ok: u64,
@@ -1022,77 +947,6 @@ pub struct FilterStats {
     pub diag_tc_fail: u64,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Rule {
-    pub rule_type: RuleType,
-    pub value: String,
-    pub action: RuleAction,
-    pub rate_pps: Option<u32>,
-}
-
-impl Rule {
-    pub fn drop_src_ip(ip: Ipv4Addr) -> Self {
-        Self { rule_type: RuleType::SrcIp, value: ip.to_string(), action: RuleAction::Drop, rate_pps: None }
-    }
-    pub fn drop_dst_port(port: u16) -> Self {
-        Self { rule_type: RuleType::DstPort, value: port.to_string(), action: RuleAction::Drop, rate_pps: None }
-    }
-    pub fn drop_src_port(port: u16) -> Self {
-        Self { rule_type: RuleType::SrcPort, value: port.to_string(), action: RuleAction::Drop, rate_pps: None }
-    }
-    pub fn to_key(&self) -> Result<RuleKey> {
-        let value = match self.rule_type {
-            RuleType::SrcIp | RuleType::DstIp => {
-                let ip: Ipv4Addr = self.value.parse().context("Invalid IP address")?;
-                u32::from_ne_bytes(ip.octets())
-            }
-            RuleType::SrcPort | RuleType::DstPort => {
-                let port: u16 = self.value.parse().context("Invalid port number")?;
-                port as u32
-            }
-            RuleType::Protocol => {
-                let proto: u8 = self.value.parse().context("Invalid protocol number")?;
-                proto as u32
-            }
-        };
-        Ok(RuleKey { rule_type: self.rule_type as u8, _pad: [0; 3], value })
-    }
-    pub fn to_value(&self) -> RuleValue {
-        RuleValue {
-            action: self.action.action_type(),
-            _pad: [0; 3],
-            rate_pps: self.rate_pps.unwrap_or(0),
-            tokens: self.rate_pps.unwrap_or(0),
-            last_update_ns: 0,
-            match_count: 0,
-        }
-    }
-    pub fn rate_limit_src_ip(ip: Ipv4Addr, pps: u32) -> Self {
-        Self { 
-            rule_type: RuleType::SrcIp, 
-            value: ip.to_string(), 
-            action: RuleAction::RateLimit { pps, name: None }, 
-            rate_pps: Some(pps) 
-        }
-    }
-    pub fn rate_limit_dst_port(port: u16, pps: u32) -> Self {
-        Self { 
-            rule_type: RuleType::DstPort, 
-            value: port.to_string(), 
-            action: RuleAction::RateLimit { pps, name: None }, 
-            rate_pps: Some(pps) 
-        }
-    }
-    pub fn rate_limit_src_port(port: u16, pps: u32) -> Self {
-        Self { 
-            rule_type: RuleType::SrcPort, 
-            value: port.to_string(), 
-            action: RuleAction::RateLimit { pps, name: None }, 
-            rate_pps: Some(pps) 
-        }
-    }
-}
-
 // =============================================================================
 // VethFilter - Main API
 // =============================================================================
@@ -1100,8 +954,6 @@ impl Rule {
 pub struct VethFilter {
     bpf: Arc<RwLock<Ebpf>>,
     interface: String,
-    /// Bitmask of allocated rule bit positions (bitmask rete engine)
-    allocated_bits: AtomicU64,
     /// Tree rete engine manager (blue/green)
     tree_manager: tokio::sync::Mutex<tree::TreeManager>,
     /// Keep the prog_array alive so the tail-call entry persists.
@@ -1188,7 +1040,6 @@ impl VethFilter {
         Ok(Self {
             bpf: Arc::new(RwLock::new(bpf)),
             interface: interface.to_string(),
-            allocated_bits: AtomicU64::new(0),
             tree_manager: tokio::sync::Mutex::new(tree::TreeManager::new()),
             _prog_array: Some(prog_array),
         })
@@ -1234,72 +1085,6 @@ impl VethFilter {
         Ok(())
     }
 
-    pub async fn set_eval_mode(&self, mode: u32) -> Result<()> {
-        let mut bpf = self.bpf.write().await;
-        let mut config: PerCpuArray<_, u32> = bpf.map_mut("CONFIG").context("CONFIG not found")?.try_into()?;
-        let num_cpus = aya::util::nr_cpus().map_err(|(msg, e)| anyhow::anyhow!("{}: {}", msg, e))?;
-        config.set(2, PerCpuValues::try_from(vec![mode; num_cpus])?, 0)?;
-        info!("Eval mode set to {} ({})", mode, match mode {
-            1 => "bitmask rete",
-            2 => "tree rete",
-            _ => "legacy",
-        });
-        Ok(())
-    }
-
-    // Legacy rule management (unchanged)
-    pub async fn add_rule(&self, rule: &Rule) -> Result<()> {
-        let key = rule.to_key()?;
-        let value = rule.to_value();
-        let mut bpf = self.bpf.write().await;
-        let mut rules: HashMap<_, RuleKey, RuleValue> = bpf.map_mut("RULES").context("RULES not found")?.try_into()?;
-        rules.insert(key, value, 0)?;
-        info!("Added legacy rule: {:?} -> {:?}", rule.rule_type, rule.action);
-        Ok(())
-    }
-
-    pub async fn remove_rule(&self, rule: &Rule) -> Result<()> {
-        let key = rule.to_key()?;
-        let mut bpf = self.bpf.write().await;
-        let mut rules: HashMap<_, RuleKey, RuleValue> = bpf.map_mut("RULES").context("RULES not found")?.try_into()?;
-        rules.remove(&key)?;
-        Ok(())
-    }
-
-    pub async fn list_rules(&self) -> Result<Vec<(Rule, u64)>> {
-        let bpf = self.bpf.read().await;
-        let rules: HashMap<_, RuleKey, RuleValue> = bpf.map("RULES").context("RULES not found")?.try_into()?;
-        let mut result = Vec::new();
-        for item in rules.iter() {
-            if let Ok((key, value)) = item {
-                let rule_type = match key.rule_type {
-                    0 => RuleType::SrcIp, 1 => RuleType::DstIp, 2 => RuleType::SrcPort,
-                    3 => RuleType::DstPort, 4 => RuleType::Protocol, _ => continue,
-                };
-                let value_str = match rule_type {
-                    RuleType::SrcIp | RuleType::DstIp => Ipv4Addr::from(key.value.to_be_bytes()).to_string(),
-                    RuleType::SrcPort | RuleType::DstPort => (key.value as u16).to_string(),
-                    RuleType::Protocol => (key.value as u8).to_string(),
-                };
-                let action = match value.action {
-                    0 => RuleAction::Pass,
-                    1 => RuleAction::Drop,
-                    2 => RuleAction::RateLimit { pps: value.rate_pps, name: None },
-                    _ => continue,
-                };
-                result.push((Rule { rule_type, value: value_str, action, rate_pps: if value.rate_pps > 0 { Some(value.rate_pps) } else { None } }, value.match_count));
-            }
-        }
-        Ok(result)
-    }
-
-    pub async fn clear_rules(&self) -> Result<()> {
-        let rules = self.list_rules().await?;
-        for (rule, _) in rules { self.remove_rule(&rule).await?; }
-        info!("All legacy rules cleared");
-        Ok(())
-    }
-
     pub async fn take_perf_array(&self) -> Result<AsyncPerfEventArray<MapData>> {
         let mut bpf = self.bpf.write().await;
         let samples = bpf.take_map("SAMPLES").context("SAMPLES not found")?;
@@ -1309,7 +1094,7 @@ impl VethFilter {
     pub fn bpf(&self) -> Arc<RwLock<Ebpf>> { self.bpf.clone() }
 
     // =========================================================================
-    // Tree Rete Engine Methods (eval_mode == 2)
+    // Tree Rete Engine Methods
     // =========================================================================
 
     /// Compile a set of rules into the tree engine and atomically flip.
@@ -1372,238 +1157,6 @@ impl VethFilter {
         mgr.clear_all(&mut bpf)
     }
 
-    // =========================================================================
-    // Bitmask Rete Engine Methods
-    // =========================================================================
-
-    /// Allocate a free bit position for a new rule. Returns None if all 64 are used.
-    fn allocate_bit(&self) -> Option<u32> {
-        loop {
-            let current = self.allocated_bits.load(Ordering::SeqCst);
-            if current == u64::MAX { return None; } // All bits used
-            // Find first zero bit
-            let bit = (!current).trailing_zeros();
-            if bit >= 64 { return None; }
-            let new = current | (1u64 << bit);
-            if self.allocated_bits.compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                return Some(bit);
-            }
-        }
-    }
-
-    /// Free a bit position
-    fn free_bit(&self, bit: u32) {
-        if bit < 64 {
-            self.allocated_bits.fetch_and(!(1u64 << bit), Ordering::SeqCst);
-        }
-    }
-
-    /// Add a rule to the bitmask Rete engine.
-    /// Returns the allocated bit position (rule_id).
-    pub async fn add_rete_rule(&self, spec: &RuleSpec) -> Result<u32> {
-        let bit = self.allocate_bit()
-            .ok_or_else(|| anyhow::anyhow!("All 64 rule slots are in use"))?;
-
-        let rule_bit: u64 = 1u64 << bit;
-
-        let mut bpf = self.bpf.write().await;
-
-        // 1. Write RULE_META
-        {
-            let mut meta_map: Array<_, RuleMeta> = bpf
-                .map_mut("RULE_META").context("RULE_META not found")?.try_into()?;
-            
-            // Use first action for legacy rete engine
-            let first_action = spec.actions.first().unwrap_or(&RuleAction::Pass);
-            meta_map.set(bit, RuleMeta {
-                action: first_action.action_type(),
-                _pad: [0; 3],
-                rate_pps: first_action.rate_pps().unwrap_or(0),
-            }, 0)?;
-        }
-
-        // 2. For each constraint, set the bit in the corresponding dispatch map
-        for pred in &spec.constraints {
-            let (dim, value) = pred.as_eq_dim().expect("bitmask rete requires Eq predicates");
-            let map_name = dim.map_name();
-            let mut dispatch: HashMap<_, u32, u64> = bpf
-                .map_mut(map_name)
-                .with_context(|| format!("{} not found", map_name))?
-                .try_into()?;
-
-            let existing = dispatch.get(&value, 0).unwrap_or(0u64);
-            dispatch.insert(value, existing | rule_bit, 0)?;
-        }
-
-        // 3. For unconstrained dimensions, set dont_care bit
-        {
-            let constrained_dims: Vec<u8> = spec.constraints.iter()
-                .filter_map(|p| p.as_eq_dim())
-                .map(|(d, _)| d as u8)
-                .collect();
-            let mut dont_care_map: Array<_, u64> = bpf
-                .map_mut("DONT_CARE").context("DONT_CARE not found")?.try_into()?;
-
-            for dim in FieldDim::all() {
-                if !constrained_dims.contains(&(*dim as u8)) {
-                    let existing = dont_care_map.get(&(*dim as u32), 0).unwrap_or(0u64);
-                    dont_care_map.set(*dim as u32, existing | rule_bit, 0)?;
-                }
-            }
-        }
-
-        // 4. Update ACTIVE_RULES bitmask
-        {
-            let mut active: Array<_, u64> = bpf
-                .map_mut("ACTIVE_RULES").context("ACTIVE_RULES not found")?.try_into()?;
-            let existing = active.get(&0, 0).unwrap_or(0u64);
-            active.set(0, existing | rule_bit, 0)?;
-        }
-
-        // 5. Update NEEDS_PHASE2 if rule has Phase 2 constraints
-        if spec.needs_phase2() {
-            let mut needs_p2: Array<_, u64> = bpf
-                .map_mut("NEEDS_PHASE2").context("NEEDS_PHASE2 not found")?.try_into()?;
-            let existing = needs_p2.get(&0, 0).unwrap_or(0u64);
-            needs_p2.set(0, existing | rule_bit, 0)?;
-        }
-
-        // 6. Create rate state if needed
-        if let Some(first_action) = spec.actions.first() {
-            if let Some(pps) = first_action.rate_pps() {
-                let mut rate_state: HashMap<_, u32, TokenBucket> = bpf
-                    .map_mut("RATE_STATE").context("RATE_STATE not found")?.try_into()?;
-                rate_state.insert(bit, TokenBucket { 
-                    rate_pps: pps, 
-                    tokens: pps, 
-                    last_update_ns: 0,
-                    allowed_count: 0,
-                    dropped_count: 0,
-                }, 0)?;
-            }
-        }
-
-        info!("Added rete rule bit={}: {}", bit, spec.describe());
-        Ok(bit)
-    }
-
-    /// Remove a rule by its bit position
-    pub async fn remove_rete_rule(&self, bit: u32, spec: &RuleSpec) -> Result<()> {
-        if bit >= 64 {
-            return Err(anyhow::anyhow!("Invalid rule bit: {}", bit));
-        }
-        let rule_bit: u64 = 1u64 << bit;
-        let clear_mask: u64 = !rule_bit;
-
-        let mut bpf = self.bpf.write().await;
-
-        // 1. Clear bit from all dispatch maps that have constraints
-        for pred in &spec.constraints {
-            let (dim, value) = pred.as_eq_dim().expect("bitmask rete requires Eq predicates");
-            let map_name = dim.map_name();
-            let mut dispatch: HashMap<_, u32, u64> = bpf
-                .map_mut(map_name)
-                .with_context(|| format!("{} not found", map_name))?
-                .try_into()?;
-
-            if let Ok(existing) = dispatch.get(&value, 0) {
-                let new_val = existing & clear_mask;
-                if new_val == 0 {
-                    let _ = dispatch.remove(&value);
-                } else {
-                    dispatch.insert(value, new_val, 0)?;
-                }
-            }
-        }
-
-        // 2. Clear dont_care bits
-        {
-            let mut dont_care_map: Array<_, u64> = bpf
-                .map_mut("DONT_CARE").context("DONT_CARE not found")?.try_into()?;
-            for dim in FieldDim::all() {
-                let existing = dont_care_map.get(&(*dim as u32), 0).unwrap_or(0);
-                dont_care_map.set(*dim as u32, existing & clear_mask, 0)?;
-            }
-        }
-
-        // 3. Clear ACTIVE_RULES bit
-        {
-            let mut active: Array<_, u64> = bpf
-                .map_mut("ACTIVE_RULES").context("ACTIVE_RULES not found")?.try_into()?;
-            let existing = active.get(&0, 0).unwrap_or(0);
-            active.set(0, existing & clear_mask, 0)?;
-        }
-
-        // 4. Clear NEEDS_PHASE2 bit
-        {
-            let mut needs_p2: Array<_, u64> = bpf
-                .map_mut("NEEDS_PHASE2").context("NEEDS_PHASE2 not found")?.try_into()?;
-            let existing = needs_p2.get(&0, 0).unwrap_or(0);
-            needs_p2.set(0, existing & clear_mask, 0)?;
-        }
-
-        // 5. Remove rate state
-        {
-            let mut rate_state: HashMap<_, u32, TokenBucket> = bpf
-                .map_mut("RATE_STATE").context("RATE_STATE not found")?.try_into()?;
-            let _ = rate_state.remove(&bit);
-        }
-
-        // 6. Free the bit
-        self.free_bit(bit);
-
-        info!("Removed rete rule bit={}", bit);
-        Ok(())
-    }
-
-    /// Clear all rete rules
-    pub async fn clear_rete_rules(&self) -> Result<()> {
-        self.allocated_bits.store(0, Ordering::SeqCst);
-
-        let mut bpf = self.bpf.write().await;
-
-        // Clear all dispatch maps
-        let dispatch_map_names = [
-            "DISPATCH_PROTO", "DISPATCH_SRC_IP", "DISPATCH_DST_IP",
-            "DISPATCH_L4W0", "DISPATCH_L4W1",
-            "DISPATCH_TCP_FLAGS", "DISPATCH_TTL", "DISPATCH_DF", "DISPATCH_TCP_WIN",
-        ];
-        for map_name in dispatch_map_names {
-            if let Some(m) = bpf.map_mut(map_name) {
-                let mut map: HashMap<_, u32, u64> = match m.try_into() { Ok(hm) => hm, Err(_) => continue };
-                let keys: Vec<u32> = map.keys().filter_map(|k| k.ok()).collect();
-                for key in keys { let _ = map.remove(&key); }
-            }
-        }
-
-        // Clear DONT_CARE
-        {
-            let mut dc: Array<_, u64> = bpf.map_mut("DONT_CARE").context("DONT_CARE not found")?.try_into()?;
-            for i in 0..NUM_DIMENSIONS as u32 { dc.set(i, 0u64, 0)?; }
-        }
-
-        // Clear ACTIVE_RULES
-        {
-            let mut ar: Array<_, u64> = bpf.map_mut("ACTIVE_RULES").context("ACTIVE_RULES not found")?.try_into()?;
-            ar.set(0, 0u64, 0)?;
-        }
-
-        // Clear NEEDS_PHASE2
-        {
-            let mut np: Array<_, u64> = bpf.map_mut("NEEDS_PHASE2").context("NEEDS_PHASE2 not found")?.try_into()?;
-            np.set(0, 0u64, 0)?;
-        }
-
-        // Clear RATE_STATE
-        {
-            let mut rs: HashMap<_, u32, TokenBucket> = bpf.map_mut("RATE_STATE").context("RATE_STATE not found")?.try_into()?;
-            let keys: Vec<u32> = rs.keys().filter_map(|k| k.ok()).collect();
-            for key in keys { let _ = rs.remove(&key); }
-        }
-
-        info!("All rete rules cleared");
-        Ok(())
-    }
 }
 
 impl Drop for VethFilter {
@@ -1625,33 +1178,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_rule_key_conversion() {
-        let rule = Rule::drop_src_ip(Ipv4Addr::new(10, 0, 0, 1));
-        let key = rule.to_key().unwrap();
-        assert_eq!(key.rule_type, RuleType::SrcIp as u8);
-        assert_eq!(key.value, u32::from_ne_bytes([10, 0, 0, 1]));
-    }
-
-    #[test]
-    fn test_port_rule() {
-        let rule = Rule::drop_dst_port(53);
-        let key = rule.to_key().unwrap();
-        assert_eq!(key.rule_type, RuleType::DstPort as u8);
-        assert_eq!(key.value, 53);
-    }
-
-    // =========================================================================
-    // Bitmask Rete Engine Tests
-    // =========================================================================
-
-    #[test]
     fn test_rule_spec_simple() {
         let spec = RuleSpec::drop_field(FieldDim::Proto, 17);
         assert_eq!(spec.constraints.len(), 1);
         assert_eq!(spec.constraints[0], Predicate::eq(FieldDim::Proto, 17));
         assert_eq!(spec.actions.len(), 1);
         assert_eq!(spec.actions[0], RuleAction::Drop);
-        assert!(!spec.needs_phase2());
     }
 
     #[test]
@@ -1664,21 +1196,8 @@ mod tests {
             RuleAction::RateLimit { pps: 5000, name: None },
         );
         assert_eq!(spec.constraints.len(), 2);
-        assert!(!spec.needs_phase2());
         assert_eq!(spec.actions.len(), 1);
         assert_eq!(spec.actions[0], RuleAction::RateLimit { pps: 5000, name: None });
-    }
-
-    #[test]
-    fn test_rule_spec_phase2() {
-        let spec = RuleSpec::compound(
-            vec![
-                Predicate::eq(FieldDim::SrcIp, 0x0A000001),
-                Predicate::eq(FieldDim::TcpFlags, 0x02), // SYN
-            ],
-            RuleAction::Drop,
-        );
-        assert!(spec.needs_phase2());
     }
 
     #[test]
@@ -1762,16 +1281,6 @@ mod tests {
             "((= proto 17)\n\
              \x20=>\n\
              \x20(drop))");
-    }
-
-    #[test]
-    fn test_field_dim_properties() {
-        assert!(!FieldDim::Proto.is_phase2());
-        assert!(!FieldDim::SrcIp.is_phase2());
-        assert!(FieldDim::TcpFlags.is_phase2());
-        assert!(FieldDim::Ttl.is_phase2());
-        assert!(FieldDim::DfBit.is_phase2());
-        assert!(FieldDim::TcpWindow.is_phase2());
     }
 
     #[test]
