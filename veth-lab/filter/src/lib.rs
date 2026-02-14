@@ -193,8 +193,9 @@ pub enum Predicate {
     Gte(FieldRef, u32),
     /// Less than or equal: field <= value
     Lte(FieldRef, u32),
+    /// Bitmask: (field_value & mask) != 0
+    Mask(FieldRef, u32),
     // Future:
-    // Mask(FieldRef, u32),
     // Not(Box<Predicate>),
     // Or(Vec<Predicate>),
 }
@@ -219,16 +220,25 @@ impl Predicate {
         self.field_dim() == Some(dim)
     }
 
-    /// If this is a range predicate on the given dimension, return (range_op, threshold).
+    /// If this is a guard predicate (range or mask) on the given dimension,
+    /// return (guard_op, threshold/mask).
     /// Returns None for Eq, In, or predicates on other dimensions.
-    pub fn as_range_on_dim(&self, dim: FieldDim) -> Option<(u8, u32)> {
+    /// Renamed from `as_range_on_dim` to reflect that it covers both ranges and masks.
+    pub fn as_guard_on_dim(&self, dim: FieldDim) -> Option<(u8, u32)> {
         match self {
             Predicate::Gt(FieldRef::Dim(d), val) if *d == dim => Some((RANGE_OP_GT, *val)),
             Predicate::Lt(FieldRef::Dim(d), val) if *d == dim => Some((RANGE_OP_LT, *val)),
             Predicate::Gte(FieldRef::Dim(d), val) if *d == dim => Some((RANGE_OP_GTE, *val)),
             Predicate::Lte(FieldRef::Dim(d), val) if *d == dim => Some((RANGE_OP_LTE, *val)),
+            Predicate::Mask(FieldRef::Dim(d), mask) if *d == dim => Some((RANGE_OP_MASK, *mask)),
             _ => None,
         }
+    }
+
+    /// Legacy alias for as_guard_on_dim (for backwards compatibility)
+    #[deprecated(note = "use as_guard_on_dim instead")]
+    pub fn as_range_on_dim(&self, dim: FieldDim) -> Option<(u8, u32)> {
+        self.as_guard_on_dim(dim)
     }
 
     /// Get the field dimension this predicate tests (works for all predicate types)
@@ -239,7 +249,8 @@ impl Predicate {
             | Predicate::Gt(FieldRef::Dim(dim), _)
             | Predicate::Lt(FieldRef::Dim(dim), _)
             | Predicate::Gte(FieldRef::Dim(dim), _)
-            | Predicate::Lte(FieldRef::Dim(dim), _) => Some(*dim),
+            | Predicate::Lte(FieldRef::Dim(dim), _)
+            | Predicate::Mask(FieldRef::Dim(dim), _) => Some(*dim),
         }
     }
 
@@ -266,6 +277,9 @@ impl Predicate {
             }
             Predicate::Lte(FieldRef::Dim(dim), value) => {
                 format!("(<= {} {})", dim.sexpr_name(), dim.sexpr_value(*value))
+            }
+            Predicate::Mask(FieldRef::Dim(dim), mask) => {
+                format!("(mask {} 0x{:x})", dim.sexpr_name(), mask)
             }
         }
     }
@@ -311,6 +325,7 @@ pub const RANGE_OP_GT: u8 = 1;
 pub const RANGE_OP_LT: u8 = 2;
 pub const RANGE_OP_GTE: u8 = 3;
 pub const RANGE_OP_LTE: u8 = 4;
+pub const RANGE_OP_MASK: u8 = 5;
 
 /// Maximum range edges per tree node
 pub const MAX_RANGE_EDGES: usize = 2;
@@ -490,6 +505,9 @@ impl RuleSpec {
                 Predicate::Lte(FieldRef::Dim(dim), val) => {
                     sorted_parts.push(format!("lte-{}-{}", *dim as u8, val));
                 }
+                Predicate::Mask(FieldRef::Dim(dim), mask) => {
+                    sorted_parts.push(format!("mask-{}-{}", *dim as u8, mask));
+                }
             }
         }
         sorted_parts.sort();
@@ -601,6 +619,10 @@ impl RuleSpec {
                 Predicate::Lte(FieldRef::Dim(dim), val) => {
                     let (dim_name, val_str) = Self::format_dim_value(*dim, *val);
                     parts.push(format!("(<= {} {})", dim_name, val_str));
+                }
+                Predicate::Mask(FieldRef::Dim(dim), mask) => {
+                    let dim_name = Self::dim_name(*dim);
+                    parts.push(format!("(mask {} 0x{:x})", dim_name, mask));
                 }
             }
         }

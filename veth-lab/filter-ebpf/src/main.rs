@@ -41,6 +41,7 @@ const RANGE_OP_GT: u8 = 1;
 const RANGE_OP_LT: u8 = 2;
 const RANGE_OP_GTE: u8 = 3;
 const RANGE_OP_LTE: u8 = 4;
+const RANGE_OP_MASK: u8 = 5;
 
 /// Token bucket state for rate limiting
 #[repr(C)]
@@ -666,6 +667,7 @@ fn try_tree_walk_step(ctx: &XdpContext) -> Result<u32, ()> {
             RANGE_OP_LT  => fv < node.range_val_1,
             RANGE_OP_GTE => fv >= node.range_val_1,
             RANGE_OP_LTE => fv <= node.range_val_1,
+            RANGE_OP_MASK => (fv & node.range_val_1) != 0,
             _ => false,
         };
         if passes && state.top < 16 {
@@ -679,6 +681,7 @@ fn try_tree_walk_step(ctx: &XdpContext) -> Result<u32, ()> {
             RANGE_OP_LT  => fv < node.range_val_0,
             RANGE_OP_GTE => fv >= node.range_val_0,
             RANGE_OP_LTE => fv <= node.range_val_0,
+            RANGE_OP_MASK => (fv & node.range_val_0) != 0,
             _ => false,
         };
         if passes && state.top < 16 {

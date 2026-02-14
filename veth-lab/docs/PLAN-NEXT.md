@@ -396,40 +396,24 @@ The `Predicate` enum already has placeholder comments for all planned variants.
 The tree architecture supports them — each is a new way to test a field value
 at a tree node.
 
-### 4a. Range Predicates (Gt, Lt, Gte, Lte)
+### ✅ 4a. Range Predicates (Gt, Lt, Gte, Lte) [COMPLETED 2026-02-14]
 
-**Example:** `(> ttl 200)` — match packets with TTL > 200.
+**Status:** ✅ Implemented with eBPF runtime evaluation (Approach B: node annotation).
 
-**Tree compilation strategy:** Ranges can't be direct edge lookups (we'd need
-an edge for every value in the range). Two approaches:
+**Implementation:** Range predicates are a third type of edge in the decision tree,
+alongside specific edges and wildcard children. Each `TreeNode` has up to 2 range
+edge slots (`range_op_0/1`, `range_val_0/1`, `range_child_0/1`). The eBPF DFS
+walker evaluates `packet_value OP threshold` at runtime and pushes matching range
+children onto the stack. Priority competition is handled naturally by the existing
+best-match DFS logic.
 
-**Approach A — Expansion at compile time:**
-Convert `(> ttl 200)` into 55 rules with `(= ttl 201)`, `(= ttl 202)`, ...,
-`(= ttl 255)`. Simple, correct, but inflates rule count.
+Key design: `compile_recursive` does 3-way partitioning at each dimension:
+- Eq predicates → specific edges (HashMap lookup)
+- Range predicates → range edges (runtime comparison)
+- No constraint → wildcard child
 
-**Approach B — Range annotation on nodes (recommended):**
-Add a `range_check` field to `TreeNode`:
-
-```rust
-struct TreeNode {
-    // ... existing fields ...
-    range_min: u32,   // 0 = no range check
-    range_max: u32,   // 0 = no range check
-}
-```
-
-When the DFS visits a node with `range_min > 0 || range_max > 0`, it checks
-`field_value >= range_min && field_value <= range_max` instead of doing an
-edge lookup. This handles `>`, `<`, `>=`, `<=` by setting min/max
-appropriately (`> 200` → min=201, max=u32::MAX).
-
-**eBPF impact:** Adds one or two comparisons per node that has a range. No
-map lookup needed. Verifier should handle this easily.
-
-**Recommendation:** Start with Approach A (expansion) for correctness, then
-optimize to Approach B if expansion inflates node count unacceptably. For TTL
-(256 values max), expansion is fine. For port ranges (0–65535), Approach B is
-necessary.
+No expansion needed — `(> dst-port 1000)` is a single range edge, not 64K rules.
+Verified with eBPF verifier, 42 tests pass, live tested with ~27M packets.
 
 ### 4b. Bitmask Predicate
 
@@ -446,20 +430,11 @@ necessary.
 **Recommendation:** Node annotation. Bitmask checks are a single AND + branch
 in eBPF, much cheaper than 128 edge lookups.
 
-### 4c. Set Membership (In)
+### ✅ 4c. Set Membership (In) [COMPLETED 2026-02-13]
 
-**Example:** `(in src-port 53 123 5353)` — match if src-port is any of these.
-
-**Compilation:** This naturally maps to multiple edges from the same parent to
-the same child. At the current tree node, create edges for each value in the
-set, all pointing to the same child subtree. The DAG's `Rc` sharing handles
-this efficiently — one child subtree, N edges to it.
-
-**eBPF impact:** Zero. The edge lookup `TREE_EDGES.get(parent, value)` already
-handles this — each set member has its own edge entry. The DFS doesn't know
-or care that they share a child.
-
-**This is the easiest extension to implement.** It's purely a compiler change.
+**Status:** ✅ Implemented. `(in src-port 53 123 5353)` works via compile-time
+expansion into multiple Eq rules. The DAG compiler's Rc sharing ensures the
+shared child subtree is not duplicated. Zero eBPF changes.
 
 ### 4d. Negation (Not)
 

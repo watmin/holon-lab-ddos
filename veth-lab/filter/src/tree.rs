@@ -21,7 +21,7 @@ use tracing::info;
 use crate::{
     EdgeKey, FieldDim, Predicate, RuleSpec, TokenBucket, TreeNode,
     ACT_PASS, ACT_RATE_LIMIT, DIM_LEAF, NUM_DIMENSIONS, TREE_SLOT_SIZE,
-    RANGE_OP_NONE,
+    RANGE_OP_NONE, RANGE_OP_MASK,
 };
 
 // =============================================================================
@@ -193,9 +193,9 @@ fn compile_recursive(rules: &[RuleSpec], dim_idx: usize) -> Rc<ShadowNode> {
         if let Some(value) = eq_value {
             specific.entry(value).or_default().push(rule);
         } else if let Some((op, val)) = rule.constraints.iter()
-            .find_map(|p| p.as_range_on_dim(dim))
+            .find_map(|p| p.as_guard_on_dim(dim))
         {
-            // Range predicate on this dimension
+            // Guard predicate (range or mask) on this dimension
             range_guarded.push((RangeEdge { op, value: val }, rule));
         } else {
             wildcard.push(rule);
@@ -886,6 +886,7 @@ mod tests {
                         crate::RANGE_OP_LT  => fv < node.range_val_0,
                         crate::RANGE_OP_GTE => fv >= node.range_val_0,
                         crate::RANGE_OP_LTE => fv <= node.range_val_0,
+                        crate::RANGE_OP_MASK => (fv & node.range_val_0) != 0,
                         _ => false,
                     };
                     if passes {
@@ -898,6 +899,7 @@ mod tests {
                         crate::RANGE_OP_LT  => fv < node.range_val_1,
                         crate::RANGE_OP_GTE => fv >= node.range_val_1,
                         crate::RANGE_OP_LTE => fv <= node.range_val_1,
+                        crate::RANGE_OP_MASK => (fv & node.range_val_1) != 0,
                         _ => false,
                     };
                     if passes {
@@ -1027,6 +1029,7 @@ mod tests {
                     crate::RANGE_OP_LT  => fv < node.range_val_1,
                     crate::RANGE_OP_GTE => fv >= node.range_val_1,
                     crate::RANGE_OP_LTE => fv <= node.range_val_1,
+                    crate::RANGE_OP_MASK => (fv & node.range_val_1) != 0,
                     _ => false,
                 };
                 if passes && top < 16 {
@@ -1044,6 +1047,7 @@ mod tests {
                     crate::RANGE_OP_LT  => fv < node.range_val_0,
                     crate::RANGE_OP_GTE => fv >= node.range_val_0,
                     crate::RANGE_OP_LTE => fv <= node.range_val_0,
+                    crate::RANGE_OP_MASK => (fv & node.range_val_0) != 0,
                     _ => false,
                 };
                 if passes && top < 16 {
@@ -1486,6 +1490,9 @@ mod tests {
                     Predicate::Lte(crate::FieldRef::Dim(dim), value) => {
                         pkt.get(dim).map_or(false, |v| v <= value)
                     }
+                    Predicate::Mask(crate::FieldRef::Dim(dim), mask) => {
+                        pkt.get(dim).map_or(false, |v| (v & mask) != 0)
+                    }
                 }
             });
             if all_match && rule.priority >= best_prio {
@@ -1579,6 +1586,7 @@ mod tests {
                                 Predicate::Lt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v < val),
                                 Predicate::Gte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v >= val),
                                 Predicate::Lte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v <= val),
+                                Predicate::Mask(crate::FieldRef::Dim(dim), mask) => pkt_map.get(dim).map_or(false, |v| (v & mask) != 0),
                             })
                         }).collect();
                         eprintln!("FAIL iter={}, packet={:?}", iter, packet);
@@ -1602,6 +1610,7 @@ mod tests {
                             Predicate::Lt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v < val),
                             Predicate::Gte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v >= val),
                             Predicate::Lte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v <= val),
+                            Predicate::Mask(crate::FieldRef::Dim(dim), mask) => pkt_map.get(dim).map_or(false, |v| (v & mask) != 0),
                         })
                     }).count();
                     if top_prio_count == 1 {
@@ -1693,6 +1702,7 @@ mod tests {
                                 Predicate::Lt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v < val),
                                 Predicate::Gte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v >= val),
                                 Predicate::Lte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v <= val),
+                                Predicate::Mask(crate::FieldRef::Dim(dim), mask) => pkt_map.get(dim).map_or(false, |v| (v & mask) != 0),
                             })
                         }).collect();
                         eprintln!("FAIL iter={}, packet={:?}", iter, packet);
@@ -1715,6 +1725,7 @@ mod tests {
                             Predicate::Lt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v < val),
                             Predicate::Gte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v >= val),
                             Predicate::Lte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v <= val),
+                            Predicate::Mask(crate::FieldRef::Dim(dim), mask) => pkt_map.get(dim).map_or(false, |v| (v & mask) != 0),
                         })
                     }).count();
                     if top_prio_count == 1 {
@@ -2166,6 +2177,124 @@ mod tests {
 
         let (matched, _, _, _) = simulate_single_walk(&flat, &[(FieldDim::L4Word1, 500)]);
         assert!(!matched, "dst-port 500 should NOT match (neither range)");
+    }
+
+    // =========================================================================
+    // Mask Predicate Tests
+    // =========================================================================
+
+    #[test]
+    fn test_mask_basic() {
+        // Rule: (mask tcp-flags 0x02) -> DROP (SYN bit set)
+        // Packet with tcp-flags=2 (SYN only): matches
+        // Packet with tcp-flags=3 (SYN+FIN): matches
+        // Packet with tcp-flags=1 (FIN only): does NOT match
+        let rules = vec![
+            RuleSpec::compound(
+                vec![Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02)],
+                RuleAction::Drop,
+            ).with_priority(100),
+        ];
+        let flat = flatten_tree(&compile_tree(&rules), 1);
+
+        let (matched, action, _, _) = simulate_single_walk(&flat, &[(FieldDim::TcpFlags, 2)]);
+        assert!(matched, "tcp-flags=2 (SYN only) should match");
+        assert_eq!(action, crate::ACT_DROP);
+
+        let (matched, action, _, _) = simulate_single_walk(&flat, &[(FieldDim::TcpFlags, 3)]);
+        assert!(matched, "tcp-flags=3 (SYN+FIN) should match");
+        assert_eq!(action, crate::ACT_DROP);
+
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[(FieldDim::TcpFlags, 1)]);
+        assert!(!matched, "tcp-flags=1 (FIN only) should NOT match");
+    }
+
+    #[test]
+    fn test_mask_with_eq() {
+        // Rule: (= proto 6) (mask tcp-flags 0x02) -> DROP (TCP SYN packets)
+        // Packet proto=6, flags=2: matches
+        // Packet proto=6, flags=1: does NOT match (no SYN bit)
+        // Packet proto=17, flags=2: does NOT match (wrong proto)
+        let rules = vec![
+            RuleSpec::compound(
+                vec![
+                    Predicate::Eq(crate::FieldRef::Dim(FieldDim::Proto), 6),
+                    Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02),
+                ],
+                RuleAction::Drop,
+            ).with_priority(100),
+        ];
+        let flat = flatten_tree(&compile_tree(&rules), 1);
+
+        let (matched, action, _, _) = simulate_single_walk(&flat, &[(FieldDim::Proto, 6), (FieldDim::TcpFlags, 2)]);
+        assert!(matched, "TCP with SYN should match");
+        assert_eq!(action, crate::ACT_DROP);
+
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[(FieldDim::Proto, 6), (FieldDim::TcpFlags, 1)]);
+        assert!(!matched, "TCP without SYN should NOT match");
+
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[(FieldDim::Proto, 17), (FieldDim::TcpFlags, 2)]);
+        assert!(!matched, "UDP with flags=2 should NOT match");
+    }
+
+    #[test]
+    fn test_mask_vs_wildcard_priority() {
+        // Rule A: (mask tcp-flags 0x02) -> DROP, priority 100
+        // Rule B: wildcard -> PASS, priority 50
+        // Packet flags=2: A wins (higher priority)
+        // Packet flags=1: B wins (only matches B)
+        let rules = vec![
+            RuleSpec::compound(
+                vec![Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02)],
+                RuleAction::Drop,
+            ).with_priority(100),
+            RuleSpec::compound(vec![], RuleAction::Pass).with_priority(50),
+        ];
+        let flat = flatten_tree(&compile_tree(&rules), 1);
+
+        let (matched, action, prio, _) = simulate_single_walk(&flat, &[(FieldDim::TcpFlags, 2)]);
+        assert!(matched);
+        assert_eq!(prio, 100, "Mask rule should win");
+        assert_eq!(action, crate::ACT_DROP);
+
+        let (matched, action, prio, _) = simulate_single_walk(&flat, &[(FieldDim::TcpFlags, 1)]);
+        assert!(matched);
+        assert_eq!(prio, 50, "Wildcard rule should win");
+        assert_eq!(action, crate::ACT_PASS);
+    }
+
+    #[test]
+    fn test_mask_two_masks_same_dim() {
+        // Rule A: (mask tcp-flags 0x02) -> DROP, priority 100 (SYN bit)
+        // Rule B: (mask tcp-flags 0x10) -> RATE_LIMIT, priority 100 (ACK bit)
+        // Packet flags=0x02: only A matches
+        // Packet flags=0x10: only B matches
+        // Packet flags=0x12 (SYN+ACK): both match, but DFS order/priority tie breaks
+        let rules = vec![
+            RuleSpec::compound(
+                vec![Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02)],
+                RuleAction::Drop,
+            ).with_priority(100),
+            RuleSpec::compound(
+                vec![Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x10)],
+                RuleAction::RateLimit { pps: 5000, name: None },
+            ).with_priority(100),
+        ];
+        let flat = flatten_tree(&compile_tree(&rules), 1);
+
+        let (matched, action, _, _) = simulate_single_walk(&flat, &[(FieldDim::TcpFlags, 0x02)]);
+        assert!(matched, "flags=0x02 (SYN) should match rule A");
+        assert_eq!(action, crate::ACT_DROP);
+
+        let (matched, action, _, _) = simulate_single_walk(&flat, &[(FieldDim::TcpFlags, 0x10)]);
+        assert!(matched, "flags=0x10 (ACK) should match rule B");
+        assert_eq!(action, ACT_RATE_LIMIT);
+
+        // When both match (SYN+ACK), priority ties, so DFS order determines outcome.
+        // Both rules are at the same priority, so whichever is visited last wins.
+        let (matched, _, prio, _) = simulate_single_walk(&flat, &[(FieldDim::TcpFlags, 0x12)]);
+        assert!(matched, "flags=0x12 (SYN+ACK) should match at least one rule");
+        assert_eq!(prio, 100);
     }
 
     // =========================================================================

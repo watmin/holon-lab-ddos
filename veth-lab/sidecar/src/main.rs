@@ -986,6 +986,14 @@ fn parse_edn_predicate(edn: &Edn) -> Result<Option<Predicate>> {
             let value = parse_field_value(&list[2], dim)?;
             Ok(Some(Predicate::Lte(veth_filter::FieldRef::Dim(dim), value)))
         }
+        "mask" => {
+            // (mask field mask_value)
+            if list.len() != 3 {
+                anyhow::bail!("mask predicate requires exactly 3 elements, got {}", list.len());
+            }
+            let value = parse_field_value(&list[2], dim)?;
+            Ok(Some(Predicate::Mask(veth_filter::FieldRef::Dim(dim), value)))
+        }
         _ => anyhow::bail!("Unsupported predicate operator: {}", op),
     }
 }
