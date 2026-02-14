@@ -13,5 +13,5 @@ Cargo.lock
 # Ignore log files
 logs/*.log
 
-# Generated rule files (use scripts/generate_ruleset.py to recreate)
-veth-lab/scenarios/rules-*.json
+# Generated rule files (use scripts/generate_ruleset_edn.py to recreate)
+veth-lab/scenarios/rules-*
