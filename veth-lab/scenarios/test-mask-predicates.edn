@@ -1,29 +1,17 @@
 ;; Test scenario for Mask predicate (bitmask matching)
 ;; Tests TCP flag bit matching: SYN, ACK, RST, FIN
 
-[
- ;; Rule 1: Drop all TCP SYN packets (bit 0x02 set)
- {:constraints [(= proto 6) (mask tcp-flags 0x02)]
-  :actions [(drop)]
-  :priority 100}
+;; Rule 1: Drop all TCP SYN packets (bit 0x02 set)
+{:constraints [(= proto 6) (mask tcp-flags 0x02)] :actions [(drop)] :priority 100}
 
- ;; Rule 2: Rate-limit TCP ACK packets (bit 0x10 set)
- {:constraints [(= proto 6) (mask tcp-flags 0x10)]
-  :actions [(rate-limit 500 :name ["test", "tcp-ack"])]
-  :priority 90}
+;; Rule 2: Rate-limit TCP ACK packets (bit 0x10 set)
+{:constraints [(= proto 6) (mask tcp-flags 0x10)] :actions [(rate-limit 500 :name ["test" "tcp-ack"])] :priority 90}
 
- ;; Rule 3: Count TCP RST packets (bit 0x04 set)
- {:constraints [(= proto 6) (mask tcp-flags 0x04)]
-  :actions [(count :name ["monitor", "tcp-rst"])]}
+;; Rule 3: Count TCP RST packets (bit 0x04 set)
+{:constraints [(= proto 6) (mask tcp-flags 0x04)] :actions [(count :name ["monitor" "tcp-rst"])]}
 
- ;; Rule 4: Drop TCP packets with both SYN and FIN set (0x03)
- ;; This is a SYN-FIN scan indicator
- {:constraints [(= proto 6) (mask tcp-flags 0x03)]
-  :actions [(drop)]
-  :priority 200}
+;; Rule 4: Drop TCP packets with both SYN and FIN set (0x03 = SYN+FIN scan indicator)
+{:constraints [(= proto 6) (mask tcp-flags 0x03)] :actions [(drop)] :priority 200}
 
- ;; Rule 5: Pass all other traffic
- {:constraints []
-  :actions [(pass)]
-  :priority 1}
-]
+;; Rule 5: Pass all other traffic
+{:constraints [] :actions [(pass)] :priority 1}
