@@ -55,25 +55,90 @@ Multiple constraints use implicit AND:
 {:actions [(pass)]}
 ```
 
-**Rate-limit (unnamed):**
+**Rate-limit (unnamed, per-rule bucket):**
 ```edn
 {:actions [(rate-limit 500)]}
 ```
 
-**Rate-limit (named, for shared buckets - future):**
+**Rate-limit (named, shared bucket):**
 ```edn
-{:actions [(rate-limit 500 :name "dns-amp")]}
+{:actions [(rate-limit 500 :name ["ddos-mitigation" "dns-amp"])]}
 ```
+Multiple rules with the same `:name` share the same rate limiter bucket.
 
-**Count (non-terminating - future):**
+**Count (non-terminating observability):**
 ```edn
-{:actions [(count :name "syn-packets")]}
+{:actions [(count :name ["observability" "syn-packets"])]}
 ```
+Count actions increment a counter without affecting packet forwarding.
 
 **Multiple actions:**
 ```edn
-{:actions [(rate-limit 500) (count :name "attacks")]}
+{:actions [(count :name ["metrics" "attacks"]) (rate-limit 500 :name ["mitigation" "dns"])]}
 ```
+
+## Action Details
+
+### Rate Limiting
+
+**Unnamed (per-rule):**
+Each rule gets its own independent token bucket identified by the rule's canonical hash.
+
+```edn
+{:constraints [(= proto 17) (= src-port 53)] :actions [(rate-limit 500)]}
+{:constraints [(= proto 17) (= src-port 123)] :actions [(rate-limit 1000)]}
+;; These have separate 500 PPS and 1000 PPS buckets
+```
+
+**Named (shared bucket):**
+Multiple rules can share the same rate limiter by using the same `:name` tuple `["namespace" "name"]`.
+
+```edn
+{:constraints [(= src-addr "10.0.0.1")] :actions [(rate-limit 1000 :name ["ddos" "dns-amp"])]}
+{:constraints [(= src-addr "10.0.0.2")] :actions [(rate-limit 1000 :name ["ddos" "dns-amp"])]}
+;; Both rules share a single 1000 PPS bucket named "ddos/dns-amp"
+```
+
+If rules with the same bucket name specify different PPS values, the **last-defined wins** (with a warning logged).
+
+**Observability:**
+Rate limiter stats (allowed/dropped counts) are logged every 10 detection windows.
+
+### Count Actions
+
+Count actions are **non-terminating** - they increment a counter but don't affect packet forwarding. Other rules in the tree continue to be evaluated.
+
+```edn
+{:constraints [(= proto 6) (= tcp-flags 2)] :actions [(count :name ["metrics" "syn-packets"])]}
+```
+
+Count actions **require a name** (no unnamed counters).
+
+**Use cases:**
+- Observability without enforcement
+- Tracking attack patterns
+- Pre-mitigation monitoring
+
+Counter values are logged every 10 detection windows, showing namespace, name, and packet count.
+
+### Rule Labels
+
+Rules can have an optional `:label` for metrics organization:
+
+```edn
+{:constraints [(= proto 17) (= src-port 53)] 
+ :actions     [(rate-limit 500)] 
+ :label       ["attack-type" "dns-amplification"]}
+```
+
+**Auto-generated labels:**
+If no `:label` is specified, rules automatically get a label in the `"system"` namespace using their canonical constraint EDN:
+
+```
+[system [(= proto 17) (= dst-port 53)]]
+```
+
+This ensures every rule has a meaningful, human-readable identifier for observability and metrics.
 
 ## Examples
 

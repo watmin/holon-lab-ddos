@@ -296,6 +296,8 @@ pub struct TokenBucket {
     pub rate_pps: u32,
     pub tokens: u32,
     pub last_update_ns: u64,
+    pub allowed_count: u64,
+    pub dropped_count: u64,
 }
 
 unsafe impl aya::Pod for TokenBucket {}
@@ -485,34 +487,88 @@ impl RuleSpec {
         if h == 0 { 1 } else { h }
     }
 
-    /// Compute the rate limiter bucket key for this rule.
+    /// Compute the bucket key for this rule (for rate limiters and counters).
     /// 
-    /// Named rate limiters (e.g., `(rate-limit 1000 :name ["attack" "dns-amp"])`) share a bucket
-    /// across all rules with the same namespace and name. Unnamed rate limiters get a per-rule bucket
-    /// keyed by the rule's canonical hash.
+    /// Named actions (rate-limit or count with :name ["ns" "name"]) share a bucket/counter
+    /// across all rules with the same namespace and name. Unnamed actions get a per-rule key
+    /// based on the rule's canonical hash.
     /// 
-    /// Returns the bucket key (u32) for the first rate-limit action, or None if no rate-limit.
+    /// Returns the key (u32) for the first rate-limit or count action, or None if neither.
     pub fn bucket_key(&self) -> Option<u32> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         
-        // Find first rate-limit action
+        // Find first rate-limit or count action
         for action in &self.actions {
-            if let RuleAction::RateLimit { pps: _, name } = action {
-                if let Some((namespace, name)) = name {
-                    // Named bucket: hash namespace + name
-                    let mut hasher = DefaultHasher::new();
-                    namespace.hash(&mut hasher);
-                    name.hash(&mut hasher);
-                    let h = hasher.finish() as u32;
-                    return Some(if h == 0 { 1 } else { h });
-                } else {
-                    // Unnamed bucket: use rule's canonical hash (default behavior)
-                    return Some(self.canonical_hash());
+            match action {
+                RuleAction::RateLimit { pps: _, name } | RuleAction::Count { name } => {
+                    if let Some((namespace, name)) = name {
+                        // Named bucket: hash namespace + name
+                        let mut hasher = DefaultHasher::new();
+                        namespace.hash(&mut hasher);
+                        name.hash(&mut hasher);
+                        let h = hasher.finish() as u32;
+                        return Some(if h == 0 { 1 } else { h });
+                    } else {
+                        // Unnamed bucket: use rule's canonical hash (default behavior)
+                        return Some(self.canonical_hash());
+                    }
                 }
+                _ => continue,
             }
         }
         None
+    }
+
+    /// Generate a canonical EDN string representation of constraints for logging/metrics.
+    /// Constraints are sorted by dimension for consistency.
+    pub fn constraints_to_edn(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        
+        // Sort constraints by dimension for canonical ordering
+        let mut sorted: Vec<&Predicate> = self.constraints.iter().collect();
+        sorted.sort_by_key(|p| {
+            p.as_eq_dim().map(|(d, _)| d as u8).unwrap_or(255)
+        });
+        
+        for pred in sorted {
+            if let Some((dim, val)) = pred.as_eq_dim() {
+                let (dim_name, val_str) = match dim {
+                    FieldDim::Proto => ("proto", val.to_string()),
+                    FieldDim::SrcIp => {
+                        // IP addresses are stored in network byte order (big-endian)
+                        let ip = std::net::Ipv4Addr::from(val.to_be());
+                        ("src-ip", ip.to_string())
+                    }
+                    FieldDim::DstIp => {
+                        // IP addresses are stored in network byte order (big-endian)
+                        let ip = std::net::Ipv4Addr::from(val.to_be());
+                        ("dst-ip", ip.to_string())
+                    }
+                    FieldDim::L4Word0 => ("src-port", val.to_string()),
+                    FieldDim::L4Word1 => ("dst-port", val.to_string()),
+                    FieldDim::TcpFlags => ("tcp-flags", val.to_string()),
+                    FieldDim::Ttl => ("ttl", val.to_string()),
+                    FieldDim::DfBit => ("df-bit", val.to_string()),
+                    FieldDim::TcpWindow => ("tcp-window", val.to_string()),
+                };
+                parts.push(format!("(= {} {})", dim_name, val_str));
+            }
+        }
+        
+        format!("[{}]", parts.join(" "))
+    }
+
+    /// Get the display label for this rule.
+    /// Returns the explicit label if set, otherwise returns canonical constraint EDN
+    /// with an implied "system" namespace for auto-generated rules.
+    pub fn display_label(&self) -> String {
+        if let Some((ns, name)) = &self.label {
+            format!("[{} {}]", ns, name)
+        } else {
+            // Implied "system" namespace for auto-generated constraint-based labels
+            format!("[system {}]", self.constraints_to_edn())
+        }
     }
 
     /// Whether this rule needs Phase 2 fields
@@ -1216,6 +1272,49 @@ impl VethFilter {
         mgr.compile_and_flip(rules, &mut bpf)
     }
 
+    /// Read TREE_COUNTERS map and return (key, value) pairs
+    pub async fn read_counters(&self) -> Result<Vec<(u32, u64)>> {
+        use aya::maps::HashMap as AyaHashMap;
+        let bpf = self.bpf.read().await;
+        
+        let map = bpf.map("TREE_COUNTERS")
+            .ok_or_else(|| anyhow::anyhow!("TREE_COUNTERS map not found"))?;
+        let counters_map = AyaHashMap::<_, u32, u64>::try_from(map)?;
+        let mut results = Vec::new();
+        
+        for key_result in counters_map.keys() {
+            if let Ok(key) = key_result {
+                if let Ok(value) = counters_map.get(&key, 0) {
+                    results.push((key, value));
+                }
+            }
+        }
+        
+        Ok(results)
+    }
+
+    /// Read rate limiter statistics from the TREE_RATE_STATE map.
+    /// Returns Vec<(bucket_id, allowed, dropped)>
+    pub async fn read_rate_limit_stats(&self) -> Result<Vec<(u32, u64, u64)>> {
+        use aya::maps::HashMap as AyaHashMap;
+        let bpf = self.bpf.read().await;
+        
+        let map = bpf.map("TREE_RATE_STATE")
+            .ok_or_else(|| anyhow::anyhow!("TREE_RATE_STATE map not found"))?;
+        let rate_map = AyaHashMap::<_, u32, TokenBucket>::try_from(map)?;
+        let mut results = Vec::new();
+        
+        for key_result in rate_map.keys() {
+            if let Ok(key) = key_result {
+                if let Ok(bucket) = rate_map.get(&key, 0) {
+                    results.push((key, bucket.allowed_count, bucket.dropped_count));
+                }
+            }
+        }
+        
+        Ok(results)
+    }
+
     /// Clear both tree slots.
     pub async fn clear_tree(&self) -> Result<()> {
         let mut bpf = self.bpf.write().await;
@@ -1324,7 +1423,13 @@ impl VethFilter {
             if let Some(pps) = first_action.rate_pps() {
                 let mut rate_state: HashMap<_, u32, TokenBucket> = bpf
                     .map_mut("RATE_STATE").context("RATE_STATE not found")?.try_into()?;
-                rate_state.insert(bit, TokenBucket { rate_pps: pps, tokens: pps, last_update_ns: 0 }, 0)?;
+                rate_state.insert(bit, TokenBucket { 
+                    rate_pps: pps, 
+                    tokens: pps, 
+                    last_update_ns: 0,
+                    allowed_count: 0,
+                    dropped_count: 0,
+                }, 0)?;
             }
         }
 

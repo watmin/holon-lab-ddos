@@ -1239,6 +1239,13 @@ async fn main() -> Result<()> {
     // Whether the tree needs recompilation (set when rules change)
     let tree_dirty: Arc<std::sync::atomic::AtomicBool> = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Counter name map for printing (hash -> (namespace, name))
+    let counter_names: Arc<RwLock<std::collections::HashMap<u32, (String, String)>>> = 
+        Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+    let rate_limiter_names: Arc<RwLock<std::collections::HashMap<u32, (String, String)>>> = 
+        Arc::new(RwLock::new(std::collections::HashMap::new()));
+
     // ── Pre-load rules from file if specified ──
     if let Some(ref rules_path) = args.rules_file {
         let start = Instant::now();
@@ -1248,13 +1255,49 @@ async fn main() -> Result<()> {
 
         if !preloaded.is_empty() {
             let mut rules = active_rules.write().await;
+            let mut counter_map = counter_names.write().await;
+            let mut rate_map = rate_limiter_names.write().await;
+            
+            // Build counter and rate limiter name maps for logging
             for spec in &preloaded {
+                if let Some(key) = spec.bucket_key() {
+                    // Check if this is a count action with a name
+                    for action in &spec.actions {
+                        match action {
+                            veth_filter::RuleAction::Count { name: Some((ns, n)) } => {
+                                counter_map.insert(key, (ns.clone(), n.clone()));
+                                break;
+                            }
+                            veth_filter::RuleAction::RateLimit { name: Some((ns, n)), .. } => {
+                                rate_map.insert(key, (ns.clone(), n.clone()));
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                
                 let key = spec.describe();
                 rules.insert(key, ActiveRule {
                     last_seen: Instant::now(),
                     spec: spec.clone(),
                     preloaded: true,
                 });
+            }
+            
+            // Log configured counters
+            if !counter_map.is_empty() {
+                info!("Configured {} count actions:", counter_map.len());
+                for (hash, (ns, name)) in counter_map.iter() {
+                    info!("  [\"{}\" \"{}\"] → key 0x{:08x}", ns, name, hash);
+                }
+            }
+
+            if !rate_map.is_empty() {
+                info!("Configured {} rate limiters:", rate_map.len());
+                for (hash, (ns, name)) in rate_map.iter() {
+                    info!("  [\"{}\" \"{}\"] → key 0x{:08x}", ns, name, hash);
+                }
             }
 
             if args.enforce {
@@ -1423,6 +1466,54 @@ async fn main() -> Result<()> {
                     current_phase, total, drops, hard_drops, rate_drops, tc_entries, dfs_comp,
                     d_eval2, d_root, d_state, d_tc_try, d_tc_fail
                 );
+                
+                // Print counter stats every 10 windows
+                if windows_processed % 10 == 0 {
+                    let counter_map = counter_names.read().await;
+                    if !counter_map.is_empty() {
+                        if let Ok(counter_values) = filter.read_counters().await {
+                            if !counter_values.is_empty() {
+                                info!("=== Count Actions (window {}) ===", windows_processed);
+                                let mut sorted = counter_values.clone();
+                                sorted.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+                                for (key, value) in sorted {
+                                    if let Some((ns, name)) = counter_map.get(&key) {
+                                        info!("  [{}  {}] {} packets", ns, name, value);
+                                    } else {
+                                        info!("  [unknown 0x{:08x}] {} packets", key, value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Report rate limiter stats
+                    if let Ok(rate_stats) = filter.read_rate_limit_stats().await {
+                        if !rate_stats.is_empty() {
+                            info!("=== Rate Limiters (window {}) ===", windows_processed);
+                            let mut sorted = rate_stats.clone();
+                            sorted.sort_by_key(|(_, allowed, dropped)| std::cmp::Reverse(allowed + dropped));
+                            
+                            let rate_map = rate_limiter_names.read().await;
+                            let rules_lock = active_rules.read().await;
+                            
+                            for (key, allowed, dropped) in sorted {
+                                // First check if it's a named rate limiter
+                                if let Some((ns, name)) = rate_map.get(&key) {
+                                    info!("  [{}  {}] allowed: {}  dropped: {}", ns, name, allowed, dropped);
+                                } else {
+                                    // Unnamed limiter - look up rule by canonical hash
+                                    // The key IS the canonical_hash for unnamed limiters
+                                    let label = rules_lock.values()
+                                        .find(|r| r.spec.canonical_hash() == key)
+                                        .map(|r| r.spec.display_label())
+                                        .unwrap_or_else(|| format!("unknown-0x{:08x}", key));
+                                    info!("  {} allowed: {}  dropped: {}", label, allowed, dropped);
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Log attribution if available
                 if let Some((pattern, confidence)) = &attribution {

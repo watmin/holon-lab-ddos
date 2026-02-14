@@ -94,6 +94,8 @@ pub struct TokenBucket {
     pub rate_pps: u32,
     pub tokens: u32,
     pub last_update_ns: u64,
+    pub allowed_count: u64,
+    pub dropped_count: u64,
 }
 
 // =============================================================================
@@ -947,7 +949,16 @@ fn apply_tree_token_bucket(rule_id: u32) -> bool {
                     bucket.last_update_ns = now;
                 }
             }
-            if bucket.tokens > 0 { bucket.tokens -= 1; false } else { true }
+            
+            // Token check and enforcement stats
+            if bucket.tokens > 0 {
+                bucket.tokens -= 1;
+                bucket.allowed_count += 1;
+                false  // Allow packet
+            } else {
+                bucket.dropped_count += 1;
+                true   // Drop packet
+            }
         }
         None => false,
     }

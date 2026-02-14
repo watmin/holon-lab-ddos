@@ -19,8 +19,8 @@ use aya::Ebpf;
 use tracing::info;
 
 use crate::{
-    EdgeKey, FieldDim, RuleAction, RuleSpec, TokenBucket, TreeNode,
-    ACT_DROP, ACT_PASS, ACT_RATE_LIMIT, DIM_LEAF, NUM_DIMENSIONS, TREE_SLOT_SIZE,
+    EdgeKey, FieldDim, RuleSpec, TokenBucket, TreeNode,
+    ACT_PASS, ACT_RATE_LIMIT, DIM_LEAF, NUM_DIMENSIONS, TREE_SLOT_SIZE,
 };
 
 // =============================================================================
@@ -271,6 +271,8 @@ fn flatten_recursive(
                     rate_pps: a.rate_pps,
                     tokens: a.rate_pps,
                     last_update_ns: 0,
+                    allowed_count: 0,
+                    dropped_count: 0,
                 }));
             }
         }

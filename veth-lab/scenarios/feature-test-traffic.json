@@ -1,0 +1,50 @@
+{
+  "name": "Feature Test - Named Buckets & Count Actions",
+  "description": "Test named rate limiter buckets and non-terminating count actions at scale",
+  "baseline_pps": 50000,
+  "attack_pps": 500000,
+  "phases": [
+    {
+      "name": "warmup",
+      "duration_secs": 20,
+      "type": "normal",
+      "description": "Baseline 50k pps UDP traffic - triggers count actions"
+    },
+    {
+      "name": "dns_amp_attack",
+      "duration_secs": 15,
+      "type": "attack",
+      "description": "500k pps UDP amplification - triggers named buckets + counts"
+    },
+    {
+      "name": "calm1",
+      "duration_secs": 10,
+      "type": "normal",
+      "description": "Recovery at 50k pps"
+    },
+    {
+      "name": "sustained_attack",
+      "duration_secs": 20,
+      "type": "attack",
+      "description": "Sustained 500k pps - test shared bucket exhaustion"
+    },
+    {
+      "name": "calm2",
+      "duration_secs": 10,
+      "type": "normal",
+      "description": "Recovery at 50k pps"
+    },
+    {
+      "name": "extreme_attack",
+      "duration_secs": 15,
+      "type": "attack",
+      "description": "Final push at 500k pps"
+    },
+    {
+      "name": "final",
+      "duration_secs": 15,
+      "type": "normal",
+      "description": "Final baseline at 50k pps"
+    }
+  ]
+}
