@@ -1,0 +1,92 @@
+;; Comprehensive Predicate & Action Test
+;;
+;; Exercises EVERY predicate type and EVERY action variant (with/without :name).
+;;
+;; Traffic (comprehensive-test-traffic.json):
+;;   Normal  = UDP port 8888, TTL=64,  DF=1, payload "VETH-LAB-TEST"
+;;   Attack  = UDP port 9999, TTL=255, DF=0, payload "VETH-LAB-TEST"
+;;   SYN     = TCP SYN (flags=0x02),  TTL=128, window=65535
+;;
+;; === TERMINATING RULES (highest priority wins per packet) ===
+;;
+;; R1: Named PASS + range (<= ttl 100)
+;;   Matches: Normal UDP (TTL=64)
+;;   Proves:  named pass action, range <= predicate
+{:constraints [(= proto 17) (<= ttl 100)] :actions [(pass :name ["allow" "low-ttl-udp"])] :priority 200 :comment "Named pass: normal UDP via range <="}
+
+;; R2: Named DROP + tcp-flags-match
+;;   Matches: SYN flood (proto=6, SYN bit set)
+;;   Proves:  named drop action, tcp-flags-match predicate
+{:constraints [(= proto 6) (tcp-flags-match 0x02 0x02)] :actions [(drop :name ["security" "syn-block"])] :priority 250 :comment "Named drop: TCP SYN via tcp-flags-match"}
+
+;; R3: Named RATE-LIMIT + range (> ttl 200)
+;;   Matches: Attack UDP (TTL=255)
+;;   Proves:  named rate-limit action, range > predicate
+{:constraints [(= proto 17) (> ttl 200)] :actions [(rate-limit 5000 :name ["throttle" "high-ttl-udp"])] :priority 240 :comment "Named rate-limit: attack UDP via range >"}
+
+;; === NON-TERMINATING COUNTS (always fire regardless of priority) ===
+;;
+;; R4: mask-eq with REAL masking (upper nibble of TTL)
+;;   TTL=64=0x40 → (0x40 & 0xF0) == 0x40 ✓
+;;   TTL=255=0xFF → (0xFF & 0xF0) == 0xF0 ✗
+;;   TTL=128=0x80 → (0x80 & 0xF0) == 0x40 ✗
+;;   Matches: Normal UDP only
+;;   Proves:  mask-eq with non-trivial mask (0xF0, not 0xFF)
+{:constraints [(mask-eq ttl 0xF0 0x40)] :actions [(count :name ["monitor" "mask-ttl-upper-0x4"])] :priority 100 :comment "Count: mask-eq TTL upper nibble = 0x4 (normal UDP)"}
+
+;; R5: protocol-match
+;;   (17 & 0xFF) == 17 → all UDP
+;;   Matches: Normal + Attack UDP
+;;   Proves:  protocol-match predicate
+{:constraints [(protocol-match 17 0xFF)] :actions [(count :name ["monitor" "proto-match-udp"])] :priority 90 :comment "Count: protocol-match for UDP"}
+
+;; R6: l4-match long (13 bytes, pattern guard)
+;;   "VETH-LAB-TEST" at L4 offset 8
+;;   Matches: All UDP (normal + attack) — both have this payload
+;;   Proves:  l4-match long (5-64 byte pattern guard)
+{:constraints [(= proto 17) (l4-match 8 "564554482D4C41422D54455354" "FFFFFFFFFFFFFFFFFFFFFFFFFF")] :actions [(count :name ["monitor" "veth-payload"])] :priority 80 :comment "Count: l4-match long 13-byte payload"}
+
+;; R7: l4-match short (2 bytes, custom dimension fan-out)
+;;   UDP dst port at L4 offset 2: 8888 = 0x22B8
+;;   Matches: Normal UDP (port 8888)
+;;   Proves:  l4-match short (custom dim)
+{:constraints [(= proto 17) (l4-match 2 "22B8" "FFFF")] :actions [(count :name ["monitor" "port8888-l4"])] :priority 70 :comment "Count: l4-match short on port 8888 bytes"}
+
+;; R8: range (>= ttl 128)
+;;   TTL=64 → 64 >= 128 ✗
+;;   TTL=128 → 128 >= 128 ✓
+;;   TTL=255 → 255 >= 128 ✓
+;;   Matches: Attack UDP + SYN flood
+;;   Proves:  range >= predicate
+{:constraints [(>= ttl 128)] :actions [(count :name ["monitor" "gte-ttl-128"])] :priority 60 :comment "Count: range >= TTL 128 (attack + SYN)"}
+
+;; R9: range (< ttl 200)
+;;   TTL=64 → 64 < 200 ✓
+;;   TTL=128 → 128 < 200 ✓
+;;   TTL=255 → 255 < 200 ✗
+;;   Matches: Normal UDP + SYN flood
+;;   Proves:  range < predicate
+{:constraints [(< ttl 200)] :actions [(count :name ["monitor" "lt-ttl-200"])] :priority 50 :comment "Count: range < TTL 200 (normal + SYN)"}
+
+;; ===================================================================
+;; Expected results per traffic type:
+;;
+;; Normal UDP (port 8888, TTL=64):
+;;   PASS [allow low-ttl-udp]            ← R1 wins (terminating, prio 200)
+;;   COUNT [monitor mask-ttl-upper-0x4]  ← R4 (mask-eq)
+;;   COUNT [monitor proto-match-udp]     ← R5 (protocol-match)
+;;   COUNT [monitor veth-payload]        ← R6 (l4-match long)
+;;   COUNT [monitor port8888-l4]         ← R7 (l4-match short)
+;;   COUNT [monitor lt-ttl-200]          ← R9 (range <)
+;;
+;; Attack UDP (port 9999, TTL=255):
+;;   RATE-LIMIT [throttle high-ttl-udp]  ← R3 wins (terminating, prio 240)
+;;   COUNT [monitor proto-match-udp]     ← R5 (protocol-match)
+;;   COUNT [monitor veth-payload]        ← R6 (l4-match long)
+;;   COUNT [monitor gte-ttl-128]         ← R8 (range >=)
+;;
+;; SYN flood (TCP, flags=0x02, TTL=128):
+;;   DROP [security syn-block]           ← R2 wins (terminating, prio 250)
+;;   COUNT [monitor gte-ttl-128]         ← R8 (range >=)
+;;   COUNT [monitor lt-ttl-200]          ← R9 (range <)
+;; ===================================================================

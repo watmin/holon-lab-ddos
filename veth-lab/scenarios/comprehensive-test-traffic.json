@@ -1,0 +1,50 @@
+{
+  "name": "Comprehensive Predicate & Action Test",
+  "description": "Exercises all predicate types and action variants across 3 traffic types: normal UDP, attack UDP, SYN flood. Each phase runs long enough for metrics to accumulate.",
+  "baseline_pps": 5000,
+  "attack_pps": 50000,
+  "phases": [
+    {
+      "name": "warmup_normal",
+      "duration_secs": 25,
+      "type": "normal",
+      "description": "Normal UDP baseline (port 8888, TTL=64, DF=1). Expect: PASS fires, COUNT R4/R5/R6/R7/R9 tick."
+    },
+    {
+      "name": "udp_attack_1",
+      "duration_secs": 20,
+      "type": "attack",
+      "description": "Attack UDP flood (port 9999, TTL=255, DF=0). Expect: RATE-LIMIT fires, COUNT R5/R6/R8 tick."
+    },
+    {
+      "name": "calm_1",
+      "duration_secs": 10,
+      "type": "normal",
+      "description": "Recovery back to normal UDP."
+    },
+    {
+      "name": "syn_flood_1",
+      "duration_secs": 20,
+      "type": "syn_flood",
+      "description": "TCP SYN flood (flags=0x02, TTL=128). Expect: DROP fires, COUNT R8/R9 tick."
+    },
+    {
+      "name": "calm_2",
+      "duration_secs": 10,
+      "type": "normal",
+      "description": "Recovery back to normal UDP."
+    },
+    {
+      "name": "udp_attack_2",
+      "duration_secs": 15,
+      "type": "attack",
+      "description": "Second attack round — confirms rate-limit + counts are consistent."
+    },
+    {
+      "name": "final_calm",
+      "duration_secs": 15,
+      "type": "normal",
+      "description": "Final normal baseline — all counters should show accumulated totals."
+    }
+  ]
+}
