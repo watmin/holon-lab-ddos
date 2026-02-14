@@ -36,6 +36,12 @@ const ACT_DROP: u8 = 1;
 const ACT_RATE_LIMIT: u8 = 2;
 const ACT_COUNT: u8 = 3;
 
+// Range operator constants (must match userspace)
+const RANGE_OP_GT: u8 = 1;
+const RANGE_OP_LT: u8 = 2;
+const RANGE_OP_GTE: u8 = 3;
+const RANGE_OP_LTE: u8 = 4;
+
 /// Token bucket state for rate limiting
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -59,7 +65,8 @@ const DIM_LEAF: u8 = 0xFF;
 
 /// Node in the decision tree. Stored in TREE_NODES array.
 /// Each node optionally carries an action (match point) and optionally
-/// branches on a dimension (specific edges in TREE_EDGES + wildcard child).
+/// branches on a dimension (specific edges in TREE_EDGES + wildcard child +
+/// up to 2 range-guarded children).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TreeNode {
@@ -77,6 +84,22 @@ pub struct TreeNode {
     pub wildcard_child: u32,
     /// Stable rule ID for rate state lookup (0 = no rule)
     pub rule_id: u32,
+    // --- Range edges (up to 2 per node) ---
+    /// Number of active range edges (0-2)
+    pub range_count: u8,
+    /// Range operator for edge 0 (RANGE_OP_GT/LT/GTE/LTE, 0 = none)
+    pub range_op_0: u8,
+    /// Range operator for edge 1
+    pub range_op_1: u8,
+    pub _range_pad: u8,
+    /// Threshold value for range edge 0
+    pub range_val_0: u32,
+    /// Child node ID for range edge 0
+    pub range_child_0: u32,
+    /// Threshold value for range edge 1
+    pub range_val_1: u32,
+    /// Child node ID for range edge 1
+    pub range_child_1: u32,
 }
 
 /// Edge key: (parent_node_id, field_value) -> child_node_id
@@ -629,14 +652,42 @@ fn try_tree_walk_step(ctx: &XdpContext) -> Result<u32, ()> {
     // ---------------------------------------------------------------
     let fv = state.fields[(node.dimension as usize) & 0xF];
 
-    // Push wildcard child FIRST (so specific is popped first — DFS
-    // prefers the more-discriminating specific path)
+    // Push wildcard child FIRST (lowest priority in LIFO order)
     if node.wildcard_child != 0 && state.top < 16 {
         state.stack[(state.top & 0xF) as usize] = node.wildcard_child;
         state.top += 1;
     }
 
-    // Push specific child (popped first due to LIFO)
+    // Push range-guarded children (evaluated at runtime against packet value)
+    // Range edge 1 pushed before edge 0 so edge 0 is popped first (LIFO)
+    if node.range_count > 1 && node.range_op_1 != 0 && node.range_child_1 != 0 {
+        let passes = match node.range_op_1 {
+            RANGE_OP_GT  => fv > node.range_val_1,
+            RANGE_OP_LT  => fv < node.range_val_1,
+            RANGE_OP_GTE => fv >= node.range_val_1,
+            RANGE_OP_LTE => fv <= node.range_val_1,
+            _ => false,
+        };
+        if passes && state.top < 16 {
+            state.stack[(state.top & 0xF) as usize] = node.range_child_1;
+            state.top += 1;
+        }
+    }
+    if node.range_count > 0 && node.range_op_0 != 0 && node.range_child_0 != 0 {
+        let passes = match node.range_op_0 {
+            RANGE_OP_GT  => fv > node.range_val_0,
+            RANGE_OP_LT  => fv < node.range_val_0,
+            RANGE_OP_GTE => fv >= node.range_val_0,
+            RANGE_OP_LTE => fv <= node.range_val_0,
+            _ => false,
+        };
+        if passes && state.top < 16 {
+            state.stack[(state.top & 0xF) as usize] = node.range_child_0;
+            state.top += 1;
+        }
+    }
+
+    // Push specific child (popped first due to LIFO — most discriminating path)
     let key = EdgeKey { parent: nid, value: fv };
     if let Some(&child) = unsafe { TREE_EDGES.get(&key) } {
         if state.top < 16 {

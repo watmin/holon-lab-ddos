@@ -954,6 +954,38 @@ fn parse_edn_predicate(edn: &Edn) -> Result<Option<Predicate>> {
             }
             Ok(Some(Predicate::In(veth_filter::FieldRef::Dim(dim), values)))
         }
+        ">" => {
+            // (> field value)
+            if list.len() != 3 {
+                anyhow::bail!("> predicate requires exactly 3 elements, got {}", list.len());
+            }
+            let value = parse_field_value(&list[2], dim)?;
+            Ok(Some(Predicate::Gt(veth_filter::FieldRef::Dim(dim), value)))
+        }
+        "<" => {
+            // (< field value)
+            if list.len() != 3 {
+                anyhow::bail!("< predicate requires exactly 3 elements, got {}", list.len());
+            }
+            let value = parse_field_value(&list[2], dim)?;
+            Ok(Some(Predicate::Lt(veth_filter::FieldRef::Dim(dim), value)))
+        }
+        ">=" => {
+            // (>= field value)
+            if list.len() != 3 {
+                anyhow::bail!(">= predicate requires exactly 3 elements, got {}", list.len());
+            }
+            let value = parse_field_value(&list[2], dim)?;
+            Ok(Some(Predicate::Gte(veth_filter::FieldRef::Dim(dim), value)))
+        }
+        "<=" => {
+            // (<= field value)
+            if list.len() != 3 {
+                anyhow::bail!("<= predicate requires exactly 3 elements, got {}", list.len());
+            }
+            let value = parse_field_value(&list[2], dim)?;
+            Ok(Some(Predicate::Lte(veth_filter::FieldRef::Dim(dim), value)))
+        }
         _ => anyhow::bail!("Unsupported predicate operator: {}", op),
     }
 }

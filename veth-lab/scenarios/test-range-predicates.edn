@@ -1,0 +1,4 @@
+{:constraints [(= proto 17) (> dst-port 1000)] :actions [(rate-limit 10000)] :priority 100 :comment "Rate limit UDP on high ports"}
+{:constraints [(= proto 6) (<= ttl 32)] :actions [(drop)] :priority 150 :comment "Drop low-TTL TCP"}
+{:constraints [(>= src-port 49152)] :actions [(count :name ["test" "ephemeral-source"])] :priority 50 :comment "Count ephemeral source ports"}
+{:constraints [(= proto 1) (< ttl 5)] :actions [(drop)] :priority 200 :comment "Drop ICMP with very low TTL"}

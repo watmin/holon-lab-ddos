@@ -21,6 +21,7 @@ use tracing::info;
 use crate::{
     EdgeKey, FieldDim, Predicate, RuleSpec, TokenBucket, TreeNode,
     ACT_PASS, ACT_RATE_LIMIT, DIM_LEAF, NUM_DIMENSIONS, TREE_SLOT_SIZE,
+    RANGE_OP_NONE,
 };
 
 // =============================================================================
@@ -59,6 +60,19 @@ struct ShadowNode {
     children: StdHashMap<u32, Rc<ShadowNode>>,
     /// Wildcard child: subtree for rules that don't constrain this dimension
     wildcard: Option<Rc<ShadowNode>>,
+    /// Range-guarded children: (range_op, threshold) -> subtree
+    /// Rules with range predicates (>, <, >=, <=) on this dimension.
+    /// The eBPF walker checks: if packet_value OP threshold, push range child.
+    range_children: Vec<(RangeEdge, Rc<ShadowNode>)>,
+}
+
+/// A range edge descriptor for compile-time tree building.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RangeEdge {
+    /// Range operator (RANGE_OP_GT, RANGE_OP_LT, RANGE_OP_GTE, RANGE_OP_LTE)
+    op: u8,
+    /// Threshold value for comparison
+    value: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -75,11 +89,13 @@ struct ShadowAction {
 
 /// Compiles a set of RuleSpecs into a shadow DAG (no replication).
 /// Wildcard rules live only in the wildcard_child branch.
-/// The eBPF walker explores both specific and wildcard paths via DFS.
+/// The eBPF walker explores specific, range-guarded, and wildcard paths via DFS.
 fn compile_tree(rules: &[RuleSpec]) -> Rc<ShadowNode> {
-    // Expand In predicates into multiple rules
-    let expanded_rules = expand_in_predicates(rules);
-    compile_recursive(&expanded_rules, 0)
+    // Expand In predicates into multiple Eq-based rules.
+    // Range predicates are NOT expanded — they become range edges in the tree,
+    // evaluated at runtime by the eBPF walker.
+    let expanded = expand_in_predicates(rules);
+    compile_recursive(&expanded, 0)
 }
 
 /// Expand In predicates into multiple Eq-based rules.
@@ -124,6 +140,7 @@ pub fn expand_in_predicates(rules: &[RuleSpec]) -> Vec<RuleSpec> {
     expanded
 }
 
+
 fn compile_recursive(rules: &[RuleSpec], dim_idx: usize) -> Rc<ShadowNode> {
     // Base case: no more dimensions to branch on
     if dim_idx >= NUM_DIMENSIONS || rules.is_empty() {
@@ -132,6 +149,7 @@ fn compile_recursive(rules: &[RuleSpec], dim_idx: usize) -> Rc<ShadowNode> {
             action: None,
             children: StdHashMap::new(),
             wildcard: None,
+            range_children: Vec::new(),
         };
         // Pick the highest-priority rule as this leaf's action
         if let Some(best) = rules.iter().max_by_key(|r| r.priority) {
@@ -150,9 +168,9 @@ fn compile_recursive(rules: &[RuleSpec], dim_idx: usize) -> Rc<ShadowNode> {
 
     let dim = DIM_ORDER[dim_idx];
 
-    // Check if ANY rule constrains this dimension
+    // Check if ANY rule constrains this dimension (Eq, In, or range predicates)
     let any_constrains = rules.iter().any(|r| {
-        r.constraints.iter().any(|p| p.as_eq_dim().map_or(false, |(d, _)| d == dim))
+        r.constraints.iter().any(|p| p.constrains_dim(dim))
     });
 
     // If no rule constrains this dimension, skip it entirely
@@ -160,15 +178,25 @@ fn compile_recursive(rules: &[RuleSpec], dim_idx: usize) -> Rc<ShadowNode> {
         return compile_recursive(rules, dim_idx + 1);
     }
 
-    // Partition rules: specific (constrain this dim) vs wildcard (don't)
+    // Three-way partition:
+    //   specific:      Eq on this dimension → create specific edges
+    //   range_guarded: range predicate (>, <, >=, <=) on this dim → range edges
+    //   wildcard:      no constraint on this dimension → wildcard child
     let mut specific: StdHashMap<u32, Vec<&RuleSpec>> = StdHashMap::new();
+    let mut range_guarded: Vec<(RangeEdge, &RuleSpec)> = Vec::new();
     let mut wildcard: Vec<&RuleSpec> = Vec::new();
 
     for rule in rules {
+        // Check for Eq constraint on this dimension first
         let eq_value = rule.constraints.iter()
             .find_map(|p| p.as_eq_dim().filter(|(d, _)| *d == dim).map(|(_, v)| v));
         if let Some(value) = eq_value {
             specific.entry(value).or_default().push(rule);
+        } else if let Some((op, val)) = rule.constraints.iter()
+            .find_map(|p| p.as_range_on_dim(dim))
+        {
+            // Range predicate on this dimension
+            range_guarded.push((RangeEdge { op, value: val }, rule));
         } else {
             wildcard.push(rule);
         }
@@ -179,13 +207,14 @@ fn compile_recursive(rules: &[RuleSpec], dim_idx: usize) -> Rc<ShadowNode> {
         action: None,
         children: StdHashMap::new(),
         wildcard: None,
+        range_children: Vec::new(),
     };
 
     // Rules that terminate at or above this level (don't constrain this dim or any below)
     let remaining_dims: Vec<FieldDim> = DIM_ORDER[dim_idx..].to_vec();
     let terminating: Vec<&RuleSpec> = rules.iter()
         .filter(|r| !r.constraints.iter().any(|p| {
-            p.as_eq_dim().map_or(false, |(d, _)| remaining_dims.contains(&d))
+            p.field_dim().map_or(false, |d| remaining_dims.contains(&d))
         }))
         .collect();
     if let Some(best) = terminating.iter().max_by_key(|r| r.priority) {
@@ -205,6 +234,18 @@ fn compile_recursive(rules: &[RuleSpec], dim_idx: usize) -> Rc<ShadowNode> {
     for (value, specific_rules) in &specific {
         let owned: Vec<RuleSpec> = specific_rules.iter().map(|r| (*r).clone()).collect();
         node.children.insert(*value, compile_recursive(&owned, dim_idx + 1));
+    }
+
+    // Build range children: group by identical range predicate, compile each group.
+    // Rules with the same (op, threshold) share a subtree.
+    let mut range_groups: StdHashMap<RangeEdge, Vec<&RuleSpec>> = StdHashMap::new();
+    for (edge, rule) in &range_guarded {
+        range_groups.entry(edge.clone()).or_default().push(rule);
+    }
+    for (edge, range_rules) in &range_groups {
+        let owned: Vec<RuleSpec> = range_rules.iter().map(|r| (*r).clone()).collect();
+        let child = compile_recursive(&owned, dim_idx + 1);
+        node.range_children.push((edge.clone(), child));
     }
 
     // Build wildcard child: only wildcard rules
@@ -289,7 +330,42 @@ fn flatten_recursive(
         flat.edges.push((EdgeKey { parent: my_id, value }, child_id));
     }
 
-    let dimension = if shadow.children.is_empty() && shadow.wildcard.is_none() {
+    // Flatten range children (up to MAX_RANGE_EDGES=2)
+    let mut range_count: u8 = 0;
+    let mut range_op_0: u8 = RANGE_OP_NONE;
+    let mut range_op_1: u8 = RANGE_OP_NONE;
+    let mut range_val_0: u32 = 0;
+    let mut range_child_0: u32 = 0;
+    let mut range_val_1: u32 = 0;
+    let mut range_child_1: u32 = 0;
+
+    for (i, (edge, child)) in shadow.range_children.iter().enumerate() {
+        if i >= 2 {
+            eprintln!("WARN: Node has {} range edges, but max is 2. Extras ignored.",
+                      shadow.range_children.len());
+            break;
+        }
+        let child_id = flatten_recursive(child, alloc, flat, dedup);
+        match i {
+            0 => {
+                range_op_0 = edge.op;
+                range_val_0 = edge.value;
+                range_child_0 = child_id;
+            }
+            1 => {
+                range_op_1 = edge.op;
+                range_val_1 = edge.value;
+                range_child_1 = child_id;
+            }
+            _ => unreachable!(),
+        }
+        range_count += 1;
+    }
+
+    let has_children = !shadow.children.is_empty()
+        || shadow.wildcard.is_some()
+        || !shadow.range_children.is_empty();
+    let dimension = if !has_children {
         DIM_LEAF
     } else if shadow.dim_index < NUM_DIMENSIONS {
         DIM_ORDER[shadow.dim_index] as u8
@@ -333,6 +409,14 @@ fn flatten_recursive(
         rate_pps,
         wildcard_child,
         rule_id,
+        range_count,
+        range_op_0,
+        range_op_1,
+        _range_pad: 0,
+        range_val_0,
+        range_child_0,
+        range_val_1,
+        range_child_1,
     }));
 
     my_id
@@ -794,6 +878,32 @@ mod tests {
                         }
                     }
                 }
+
+                // Also push range-guarded children where the packet value satisfies the range
+                if node.range_count > 0 && node.range_op_0 != 0 && node.range_child_0 != 0 {
+                    let passes = match node.range_op_0 {
+                        crate::RANGE_OP_GT  => fv > node.range_val_0,
+                        crate::RANGE_OP_LT  => fv < node.range_val_0,
+                        crate::RANGE_OP_GTE => fv >= node.range_val_0,
+                        crate::RANGE_OP_LTE => fv <= node.range_val_0,
+                        _ => false,
+                    };
+                    if passes {
+                        next_cursors.push(node.range_child_0);
+                    }
+                }
+                if node.range_count > 1 && node.range_op_1 != 0 && node.range_child_1 != 0 {
+                    let passes = match node.range_op_1 {
+                        crate::RANGE_OP_GT  => fv > node.range_val_1,
+                        crate::RANGE_OP_LT  => fv < node.range_val_1,
+                        crate::RANGE_OP_GTE => fv >= node.range_val_1,
+                        crate::RANGE_OP_LTE => fv <= node.range_val_1,
+                        _ => false,
+                    };
+                    if passes {
+                        next_cursors.push(node.range_child_1);
+                    }
+                }
             }
 
             // Deduplicate cursors to avoid redundant work
@@ -901,8 +1011,7 @@ mod tests {
             // Get packet field value for this dimension
             let fv = pkt.get(&node.dimension).copied().unwrap_or(0);
 
-            // Push wildcard child FIRST (so specific is popped first — DFS
-            // prefers the more-discriminating specific path)
+            // Push wildcard child FIRST (lowest priority in LIFO order)
             if node.wildcard_child != 0 && top < 16 {
                 if trace {
                     eprintln!("  iter={}: nid={} dim={} PUSH wildcard_child={}", _iter, nid, node.dimension, node.wildcard_child);
@@ -911,7 +1020,43 @@ mod tests {
                 top += 1;
             }
 
-            // Push specific child (popped first due to LIFO)
+            // Push range-guarded children (evaluated against packet value)
+            if node.range_count > 1 && node.range_op_1 != 0 && node.range_child_1 != 0 {
+                let passes = match node.range_op_1 {
+                    crate::RANGE_OP_GT  => fv > node.range_val_1,
+                    crate::RANGE_OP_LT  => fv < node.range_val_1,
+                    crate::RANGE_OP_GTE => fv >= node.range_val_1,
+                    crate::RANGE_OP_LTE => fv <= node.range_val_1,
+                    _ => false,
+                };
+                if passes && top < 16 {
+                    if trace {
+                        eprintln!("  iter={}: nid={} dim={} val={} PUSH range_child_1={} (op={} thr={})",
+                            _iter, nid, node.dimension, fv, node.range_child_1, node.range_op_1, node.range_val_1);
+                    }
+                    stack[top] = node.range_child_1;
+                    top += 1;
+                }
+            }
+            if node.range_count > 0 && node.range_op_0 != 0 && node.range_child_0 != 0 {
+                let passes = match node.range_op_0 {
+                    crate::RANGE_OP_GT  => fv > node.range_val_0,
+                    crate::RANGE_OP_LT  => fv < node.range_val_0,
+                    crate::RANGE_OP_GTE => fv >= node.range_val_0,
+                    crate::RANGE_OP_LTE => fv <= node.range_val_0,
+                    _ => false,
+                };
+                if passes && top < 16 {
+                    if trace {
+                        eprintln!("  iter={}: nid={} dim={} val={} PUSH range_child_0={} (op={} thr={})",
+                            _iter, nid, node.dimension, fv, node.range_child_0, node.range_op_0, node.range_val_0);
+                    }
+                    stack[top] = node.range_child_0;
+                    top += 1;
+                }
+            }
+
+            // Push specific child (popped first due to LIFO — most discriminating)
             let edge_key = (nid, fv);
             match edges.get(&edge_key) {
                 Some(&child) => {
@@ -1329,6 +1474,18 @@ mod tests {
                     Predicate::In(crate::FieldRef::Dim(dim), values) => {
                         pkt.get(dim).map_or(false, |v| values.contains(v))
                     }
+                    Predicate::Gt(crate::FieldRef::Dim(dim), value) => {
+                        pkt.get(dim).map_or(false, |v| v > value)
+                    }
+                    Predicate::Lt(crate::FieldRef::Dim(dim), value) => {
+                        pkt.get(dim).map_or(false, |v| v < value)
+                    }
+                    Predicate::Gte(crate::FieldRef::Dim(dim), value) => {
+                        pkt.get(dim).map_or(false, |v| v >= value)
+                    }
+                    Predicate::Lte(crate::FieldRef::Dim(dim), value) => {
+                        pkt.get(dim).map_or(false, |v| v <= value)
+                    }
                 }
             });
             if all_match && rule.priority >= best_prio {
@@ -1418,6 +1575,10 @@ mod tests {
                             r.constraints.iter().all(|pred| match pred {
                                 Predicate::Eq(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).copied() == Some(*val),
                                 Predicate::In(crate::FieldRef::Dim(dim), vals) => pkt_map.get(dim).map_or(false, |v| vals.contains(v)),
+                                Predicate::Gt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v > val),
+                                Predicate::Lt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v < val),
+                                Predicate::Gte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v >= val),
+                                Predicate::Lte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v <= val),
                             })
                         }).collect();
                         eprintln!("FAIL iter={}, packet={:?}", iter, packet);
@@ -1437,6 +1598,10 @@ mod tests {
                         r.priority == bf_p && r.constraints.iter().all(|pred| match pred {
                             Predicate::Eq(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).copied() == Some(*val),
                             Predicate::In(crate::FieldRef::Dim(dim), vals) => pkt_map.get(dim).map_or(false, |v| vals.contains(v)),
+                            Predicate::Gt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v > val),
+                            Predicate::Lt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v < val),
+                            Predicate::Gte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v >= val),
+                            Predicate::Lte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v <= val),
                         })
                     }).count();
                     if top_prio_count == 1 {
@@ -1524,6 +1689,10 @@ mod tests {
                             r.constraints.iter().all(|pred| match pred {
                                 Predicate::Eq(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).copied() == Some(*val),
                                 Predicate::In(crate::FieldRef::Dim(dim), vals) => pkt_map.get(dim).map_or(false, |v| vals.contains(v)),
+                                Predicate::Gt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v > val),
+                                Predicate::Lt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v < val),
+                                Predicate::Gte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v >= val),
+                                Predicate::Lte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v <= val),
                             })
                         }).collect();
                         eprintln!("FAIL iter={}, packet={:?}", iter, packet);
@@ -1542,6 +1711,10 @@ mod tests {
                         r.priority == bf_p && r.constraints.iter().all(|pred| match pred {
                             Predicate::Eq(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).copied() == Some(*val),
                             Predicate::In(crate::FieldRef::Dim(dim), vals) => pkt_map.get(dim).map_or(false, |v| vals.contains(v)),
+                            Predicate::Gt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v > val),
+                            Predicate::Lt(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v < val),
+                            Predicate::Gte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v >= val),
+                            Predicate::Lte(crate::FieldRef::Dim(dim), val) => pkt_map.get(dim).map_or(false, |v| v <= val),
                         })
                     }).count();
                     if top_prio_count == 1 {
@@ -1785,6 +1958,214 @@ mod tests {
         }
 
         stress_compile("realistic_500", &rules);
+    }
+
+    // =========================================================================
+    // Range Predicate Tests
+    // =========================================================================
+
+    #[test]
+    fn test_range_gt_basic() {
+        // Rule: (> dst-port 1000) -> DROP, priority 100
+        // Packet with dst-port=2000 should match
+        // Packet with dst-port=500 should NOT match
+        let rules = vec![
+            RuleSpec::compound(
+                vec![Predicate::Gt(crate::FieldRef::Dim(FieldDim::L4Word1), 1000)],
+                RuleAction::Drop,
+            ).with_priority(100),
+        ];
+        let flat = flatten_tree(&compile_tree(&rules), 1);
+
+        // dst-port=2000 > 1000 → match
+        let (matched, action, prio, _) = simulate_single_walk(&flat, &[
+            (FieldDim::L4Word1, 2000),
+        ]);
+        assert!(matched, "dst-port 2000 > 1000 should match");
+        assert_eq!(action, crate::ACT_DROP);
+        assert_eq!(prio, 100);
+
+        // dst-port=500, NOT > 1000 → no match
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[
+            (FieldDim::L4Word1, 500),
+        ]);
+        assert!(!matched, "dst-port 500 should NOT match (> 1000)");
+
+        // dst-port=1000, NOT > 1000 (strictly greater) → no match
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[
+            (FieldDim::L4Word1, 1000),
+        ]);
+        assert!(!matched, "dst-port 1000 should NOT match (> 1000, strict)");
+
+        // dst-port=1001, > 1000 → match
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[
+            (FieldDim::L4Word1, 1001),
+        ]);
+        assert!(matched, "dst-port 1001 should match (> 1000)");
+    }
+
+    #[test]
+    fn test_range_lt_basic() {
+        // Rule: (< ttl 5) -> DROP
+        let rules = vec![
+            RuleSpec::compound(
+                vec![Predicate::Lt(crate::FieldRef::Dim(FieldDim::Ttl), 5)],
+                RuleAction::Drop,
+            ).with_priority(100),
+        ];
+        let flat = flatten_tree(&compile_tree(&rules), 1);
+
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[(FieldDim::Ttl, 3)]);
+        assert!(matched, "ttl 3 < 5 should match");
+
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[(FieldDim::Ttl, 5)]);
+        assert!(!matched, "ttl 5 should NOT match (< 5, strict)");
+
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[(FieldDim::Ttl, 128)]);
+        assert!(!matched, "ttl 128 should NOT match (< 5)");
+    }
+
+    #[test]
+    fn test_range_gte_lte() {
+        // Rule: (>= src-port 49152) -> COUNT
+        let rules = vec![
+            RuleSpec::compound(
+                vec![Predicate::Gte(crate::FieldRef::Dim(FieldDim::L4Word0), 49152)],
+                RuleAction::Count { name: None },
+            ).with_priority(50),
+        ];
+        let flat = flatten_tree(&compile_tree(&rules), 1);
+
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[(FieldDim::L4Word0, 49152)]);
+        assert!(matched, "src-port 49152 >= 49152 should match");
+
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[(FieldDim::L4Word0, 65535)]);
+        assert!(matched, "src-port 65535 >= 49152 should match");
+
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[(FieldDim::L4Word0, 49151)]);
+        assert!(!matched, "src-port 49151 should NOT match (>= 49152)");
+    }
+
+    #[test]
+    fn test_range_with_eq_priority_competition() {
+        // Rule A: (= proto 17) (> dst-port 1000) -> DROP, priority 100
+        // Rule B: (= proto 17) -> PASS, priority 50 (wildcard on dst-port)
+        // Packet proto=17, dst-port=2000: both match, A wins (higher prio)
+        // Packet proto=17, dst-port=500: only B matches (range fails), B wins
+        let rules = vec![
+            RuleSpec::compound(
+                vec![
+                    Predicate::eq(FieldDim::Proto, 17),
+                    Predicate::Gt(crate::FieldRef::Dim(FieldDim::L4Word1), 1000),
+                ],
+                RuleAction::Drop,
+            ).with_priority(100),
+            RuleSpec::compound(
+                vec![Predicate::eq(FieldDim::Proto, 17)],
+                RuleAction::Pass,
+            ).with_priority(50),
+        ];
+        let flat = flatten_tree(&compile_tree(&rules), 1);
+
+        // dst-port=2000 > 1000 → both rules match, A wins (prio 100)
+        let (matched, action, prio, _) = simulate_single_walk(&flat, &[
+            (FieldDim::Proto, 17), (FieldDim::L4Word1, 2000),
+        ]);
+        assert!(matched, "Should match (range passes)");
+        assert_eq!(action, crate::ACT_DROP, "Range rule should win");
+        assert_eq!(prio, 100);
+
+        // dst-port=500 NOT > 1000 → only B matches (prio 50)
+        let (matched, action, prio, _) = simulate_single_walk(&flat, &[
+            (FieldDim::Proto, 17), (FieldDim::L4Word1, 500),
+        ]);
+        assert!(matched, "Wildcard rule should still match");
+        assert_eq!(action, ACT_PASS, "Wildcard rule should win when range fails");
+        assert_eq!(prio, 50);
+    }
+
+    #[test]
+    fn test_range_with_specific_and_wildcard() {
+        // Rule A: (= proto 17) (= dst-port 8080) -> DROP, priority 200
+        // Rule B: (= proto 17) (> dst-port 1000) -> RATE_LIMIT, priority 100
+        // Rule C: (= proto 17) -> PASS, priority 50
+        //
+        // Packet proto=17, dst-port=8080: A wins (specific, highest prio)
+        // Packet proto=17, dst-port=2000: B wins (range match, prio 100 > 50)
+        // Packet proto=17, dst-port=500: C wins (only wildcard matches)
+        let rules = vec![
+            RuleSpec::compound(
+                vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word1, 8080)],
+                RuleAction::Drop,
+            ).with_priority(200),
+            RuleSpec::compound(
+                vec![
+                    Predicate::eq(FieldDim::Proto, 17),
+                    Predicate::Gt(crate::FieldRef::Dim(FieldDim::L4Word1), 1000),
+                ],
+                RuleAction::RateLimit { pps: 5000, name: None },
+            ).with_priority(100),
+            RuleSpec::compound(
+                vec![Predicate::eq(FieldDim::Proto, 17)],
+                RuleAction::Pass,
+            ).with_priority(50),
+        ];
+        let flat = flatten_tree(&compile_tree(&rules), 1);
+
+        // dst-port=8080: specific A wins
+        let (matched, action, prio, _) = simulate_single_walk(&flat, &[
+            (FieldDim::Proto, 17), (FieldDim::L4Word1, 8080),
+        ]);
+        assert!(matched);
+        assert_eq!(action, crate::ACT_DROP);
+        assert_eq!(prio, 200);
+
+        // dst-port=2000: range B wins
+        let (matched, action, prio, _) = simulate_single_walk(&flat, &[
+            (FieldDim::Proto, 17), (FieldDim::L4Word1, 2000),
+        ]);
+        assert!(matched);
+        assert_eq!(action, ACT_RATE_LIMIT);
+        assert_eq!(prio, 100);
+
+        // dst-port=500: wildcard C wins
+        let (matched, action, prio, _) = simulate_single_walk(&flat, &[
+            (FieldDim::Proto, 17), (FieldDim::L4Word1, 500),
+        ]);
+        assert!(matched);
+        assert_eq!(action, ACT_PASS);
+        assert_eq!(prio, 50);
+    }
+
+    #[test]
+    fn test_range_two_ranges_same_dim() {
+        // Rule A: (> dst-port 1000) -> DROP, priority 100
+        // Rule B: (< dst-port 100) -> RATE_LIMIT, priority 100
+        // Packet dst-port=2000: only A matches
+        // Packet dst-port=50: only B matches
+        // Packet dst-port=500: neither range matches → no match
+        let rules = vec![
+            RuleSpec::compound(
+                vec![Predicate::Gt(crate::FieldRef::Dim(FieldDim::L4Word1), 1000)],
+                RuleAction::Drop,
+            ).with_priority(100),
+            RuleSpec::compound(
+                vec![Predicate::Lt(crate::FieldRef::Dim(FieldDim::L4Word1), 100)],
+                RuleAction::RateLimit { pps: 5000, name: None },
+            ).with_priority(100),
+        ];
+        let flat = flatten_tree(&compile_tree(&rules), 1);
+
+        let (matched, action, _, _) = simulate_single_walk(&flat, &[(FieldDim::L4Word1, 2000)]);
+        assert!(matched, "dst-port 2000 should match (> 1000)");
+        assert_eq!(action, crate::ACT_DROP);
+
+        let (matched, action, _, _) = simulate_single_walk(&flat, &[(FieldDim::L4Word1, 50)]);
+        assert!(matched, "dst-port 50 should match (< 100)");
+        assert_eq!(action, ACT_RATE_LIMIT);
+
+        let (matched, _, _, _) = simulate_single_walk(&flat, &[(FieldDim::L4Word1, 500)]);
+        assert!(!matched, "dst-port 500 should NOT match (neither range)");
     }
 
     // =========================================================================

@@ -185,11 +185,15 @@ pub enum Predicate {
     Eq(FieldRef, u32),
     /// Set membership: field in [val1, val2, ...]
     In(FieldRef, Vec<u32>),
+    /// Greater than: field > value
+    Gt(FieldRef, u32),
+    /// Less than: field < value
+    Lt(FieldRef, u32),
+    /// Greater than or equal: field >= value
+    Gte(FieldRef, u32),
+    /// Less than or equal: field <= value
+    Lte(FieldRef, u32),
     // Future:
-    // Gt(FieldRef, u32),
-    // Lt(FieldRef, u32),
-    // Gte(FieldRef, u32),
-    // Lte(FieldRef, u32),
     // Mask(FieldRef, u32),
     // Not(Box<Predicate>),
     // Or(Vec<Predicate>),
@@ -202,18 +206,40 @@ impl Predicate {
     }
 
     /// Extract (FieldDim, value) if this is an Eq on a Dim ref.
-    /// Returns `None` for In and future predicate variants.
+    /// Returns `None` for In, range predicates, and other variants.
     pub fn as_eq_dim(&self) -> Option<(FieldDim, u32)> {
         match self {
             Predicate::Eq(FieldRef::Dim(dim), value) => Some((*dim, *value)),
-            Predicate::In(_, _) => None,
+            _ => None,
         }
     }
 
-    /// Get the field dimension this predicate tests (works for Eq and In)
+    /// Check if this predicate constrains the given dimension (any predicate type).
+    pub fn constrains_dim(&self, dim: FieldDim) -> bool {
+        self.field_dim() == Some(dim)
+    }
+
+    /// If this is a range predicate on the given dimension, return (range_op, threshold).
+    /// Returns None for Eq, In, or predicates on other dimensions.
+    pub fn as_range_on_dim(&self, dim: FieldDim) -> Option<(u8, u32)> {
+        match self {
+            Predicate::Gt(FieldRef::Dim(d), val) if *d == dim => Some((RANGE_OP_GT, *val)),
+            Predicate::Lt(FieldRef::Dim(d), val) if *d == dim => Some((RANGE_OP_LT, *val)),
+            Predicate::Gte(FieldRef::Dim(d), val) if *d == dim => Some((RANGE_OP_GTE, *val)),
+            Predicate::Lte(FieldRef::Dim(d), val) if *d == dim => Some((RANGE_OP_LTE, *val)),
+            _ => None,
+        }
+    }
+
+    /// Get the field dimension this predicate tests (works for all predicate types)
     pub fn field_dim(&self) -> Option<FieldDim> {
         match self {
-            Predicate::Eq(FieldRef::Dim(dim), _) | Predicate::In(FieldRef::Dim(dim), _) => Some(*dim),
+            Predicate::Eq(FieldRef::Dim(dim), _) 
+            | Predicate::In(FieldRef::Dim(dim), _)
+            | Predicate::Gt(FieldRef::Dim(dim), _)
+            | Predicate::Lt(FieldRef::Dim(dim), _)
+            | Predicate::Gte(FieldRef::Dim(dim), _)
+            | Predicate::Lte(FieldRef::Dim(dim), _) => Some(*dim),
         }
     }
 
@@ -228,6 +254,18 @@ impl Predicate {
                     .map(|v| dim.sexpr_value(*v))
                     .collect();
                 format!("(in {} {})", dim.sexpr_name(), vals.join(" "))
+            }
+            Predicate::Gt(FieldRef::Dim(dim), value) => {
+                format!("(> {} {})", dim.sexpr_name(), dim.sexpr_value(*value))
+            }
+            Predicate::Lt(FieldRef::Dim(dim), value) => {
+                format!("(< {} {})", dim.sexpr_name(), dim.sexpr_value(*value))
+            }
+            Predicate::Gte(FieldRef::Dim(dim), value) => {
+                format!("(>= {} {})", dim.sexpr_name(), dim.sexpr_value(*value))
+            }
+            Predicate::Lte(FieldRef::Dim(dim), value) => {
+                format!("(<= {} {})", dim.sexpr_name(), dim.sexpr_value(*value))
             }
         }
     }
@@ -267,7 +305,22 @@ pub const ACT_DROP: u8 = 1;
 pub const ACT_RATE_LIMIT: u8 = 2;
 pub const ACT_COUNT: u8 = 3;
 
+/// Range operator constants (must match eBPF)
+pub const RANGE_OP_NONE: u8 = 0;
+pub const RANGE_OP_GT: u8 = 1;
+pub const RANGE_OP_LT: u8 = 2;
+pub const RANGE_OP_GTE: u8 = 3;
+pub const RANGE_OP_LTE: u8 = 4;
+
+/// Maximum range edges per tree node
+pub const MAX_RANGE_EDGES: usize = 2;
+
 /// Node in the decision tree (must match eBPF TreeNode exactly).
+///
+/// Each node optionally branches on a dimension (specific edges via TREE_EDGES,
+/// wildcard child, and up to MAX_RANGE_EDGES range-guarded children).
+/// Range edges are evaluated at runtime: if packet_value OP threshold,
+/// the range child is pushed onto the DFS stack.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct TreeNode {
@@ -278,6 +331,15 @@ pub struct TreeNode {
     pub rate_pps: u32,
     pub wildcard_child: u32,
     pub rule_id: u32,
+    // Range edges (up to 2 per node)
+    pub range_count: u8,
+    pub range_op_0: u8,
+    pub range_op_1: u8,
+    pub _range_pad: u8,
+    pub range_val_0: u32,
+    pub range_child_0: u32,
+    pub range_val_1: u32,
+    pub range_child_1: u32,
 }
 
 unsafe impl aya::Pod for TreeNode {}
@@ -292,6 +354,14 @@ impl Default for TreeNode {
             rate_pps: 0,
             wildcard_child: 0,
             rule_id: 0,
+            range_count: 0,
+            range_op_0: RANGE_OP_NONE,
+            range_op_1: RANGE_OP_NONE,
+            _range_pad: 0,
+            range_val_0: 0,
+            range_child_0: 0,
+            range_val_1: 0,
+            range_child_1: 0,
         }
     }
 }
@@ -408,6 +478,18 @@ impl RuleSpec {
                         .join(",");
                     sorted_parts.push(format!("in-{}-{}", *dim as u8, vals_str));
                 }
+                Predicate::Gt(FieldRef::Dim(dim), val) => {
+                    sorted_parts.push(format!("gt-{}-{}", *dim as u8, val));
+                }
+                Predicate::Lt(FieldRef::Dim(dim), val) => {
+                    sorted_parts.push(format!("lt-{}-{}", *dim as u8, val));
+                }
+                Predicate::Gte(FieldRef::Dim(dim), val) => {
+                    sorted_parts.push(format!("gte-{}-{}", *dim as u8, val));
+                }
+                Predicate::Lte(FieldRef::Dim(dim), val) => {
+                    sorted_parts.push(format!("lte-{}-{}", *dim as u8, val));
+                }
             }
         }
         sorted_parts.sort();
@@ -503,6 +585,22 @@ impl RuleSpec {
                         .map(|v| Self::format_dim_value(*dim, *v).1)
                         .collect();
                     parts.push(format!("(in {} {})", dim_name, val_strs.join(" ")));
+                }
+                Predicate::Gt(FieldRef::Dim(dim), val) => {
+                    let (dim_name, val_str) = Self::format_dim_value(*dim, *val);
+                    parts.push(format!("(> {} {})", dim_name, val_str));
+                }
+                Predicate::Lt(FieldRef::Dim(dim), val) => {
+                    let (dim_name, val_str) = Self::format_dim_value(*dim, *val);
+                    parts.push(format!("(< {} {})", dim_name, val_str));
+                }
+                Predicate::Gte(FieldRef::Dim(dim), val) => {
+                    let (dim_name, val_str) = Self::format_dim_value(*dim, *val);
+                    parts.push(format!("(>= {} {})", dim_name, val_str));
+                }
+                Predicate::Lte(FieldRef::Dim(dim), val) => {
+                    let (dim_name, val_str) = Self::format_dim_value(*dim, *val);
+                    parts.push(format!("(<= {} {})", dim_name, val_str));
                 }
             }
         }
