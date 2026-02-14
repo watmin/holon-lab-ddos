@@ -1980,7 +1980,7 @@ mod tests {
         let actions = [
             RuleAction::drop(), 
             RuleAction::RateLimit { pps: 1000, name: None }, 
-            RuleAction::Pass
+            RuleAction::pass()
         ];
 
         let mut rng = rand::thread_rng();
@@ -2103,7 +2103,7 @@ mod tests {
         let actions = [
             RuleAction::drop(), 
             RuleAction::RateLimit { pps: 1000, name: None }, 
-            RuleAction::Pass
+            RuleAction::pass()
         ];
 
         let mut rng = rand::thread_rng();
@@ -2539,7 +2539,7 @@ mod tests {
             ).with_priority(100),
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17)],
-                RuleAction::Pass,
+                RuleAction::pass(),
             ).with_priority(50),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -2584,7 +2584,7 @@ mod tests {
             ).with_priority(100),
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17)],
-                RuleAction::Pass,
+                RuleAction::pass(),
             ).with_priority(50),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -2714,7 +2714,7 @@ mod tests {
                 vec![Predicate::MaskEq(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02, 0x02)],
                 RuleAction::drop(),
             ).with_priority(100),
-            RuleSpec::compound(vec![], RuleAction::Pass).with_priority(50),
+            RuleSpec::compound(vec![], RuleAction::pass()).with_priority(50),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
 
@@ -2793,7 +2793,7 @@ mod tests {
                     Predicate::Eq(crate::FieldRef::Dim(FieldDim::Proto), 6),
                     Predicate::MaskEq(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x04, 0x04),
                 ],
-                RuleAction::Pass,
+                RuleAction::pass(),
             ).with_priority(100),
             RuleSpec::compound(
                 vec![
@@ -2877,7 +2877,7 @@ mod tests {
             ).with_priority(150),
             RuleSpec::compound(
                 vec![Predicate::MaskEq(crate::FieldRef::Dim(FieldDim::L4Word1), 0x8000, 0x8000)],
-                RuleAction::Pass,
+                RuleAction::pass(),
             ).with_priority(100),
             RuleSpec::compound(
                 vec![Predicate::Gte(crate::FieldRef::Dim(FieldDim::L4Word1), 1024)],
@@ -3083,7 +3083,7 @@ mod tests {
             ).with_priority(100),
             RuleSpec::compound(
                 vec![Predicate::Eq(FieldRef::L4Byte { offset: 4, length: 2 }, 0x0200)],
-                RuleAction::Pass,
+                RuleAction::pass(),
             ).with_priority(50),
         ];
 
@@ -3406,7 +3406,7 @@ mod tests {
                     Predicate::Eq(FieldRef::L4Byte { offset: 0, length: 1 }, 0x01),
                     Predicate::RawByteMatch(Box::new(pat2)),
                 ],
-                RuleAction::Pass,
+                RuleAction::pass(),
             ).with_priority(50),
         ];
 

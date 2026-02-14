@@ -907,6 +907,14 @@ fn apply_dfs_result(_ctx: &XdpContext, state: &mut DfsState) -> Result<u32, ()> 
         return Ok(xdp_action::XDP_DROP);
     }
 
+    // Per-rule pass counter (for named pass rules showing up in metrics)
+    if matched && action == ACT_PASS {
+        match TREE_COUNTERS.get_ptr_mut(&rule_id) {
+            Some(ptr) => { unsafe { *ptr += 1; } }
+            None => { let _ = TREE_COUNTERS.insert(&rule_id, &1, 0); }
+        }
+    }
+
     pass_packet()
 }
 

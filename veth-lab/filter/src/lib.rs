@@ -29,20 +29,23 @@ pub mod tree;
 /// Complex actions (with names) are handled at compile time in userspace.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RuleAction {
-    Pass,
+    Pass { name: Option<(String, String)> },
     Drop { name: Option<(String, String)> },
     RateLimit { pps: u32, name: Option<(String, String)> },  // name: (namespace, name)
     Count { name: Option<(String, String)> },
 }
 
 impl RuleAction {
+    /// Convenience constructor for unnamed pass
+    pub fn pass() -> Self { RuleAction::Pass { name: None } }
+
     /// Convenience constructor for unnamed drop
     pub fn drop() -> Self { RuleAction::Drop { name: None } }
 
     /// Get the action type as a u8 for eBPF (matches ACT_* constants)
     pub fn action_type(&self) -> u8 {
         match self {
-            RuleAction::Pass => ACT_PASS,
+            RuleAction::Pass { .. } => ACT_PASS,
             RuleAction::Drop { .. } => ACT_DROP,
             RuleAction::RateLimit { .. } => ACT_RATE_LIMIT,
             RuleAction::Count { .. } => ACT_COUNT,
@@ -60,10 +63,9 @@ impl RuleAction {
     /// Get the name tuple (namespace, name) if this action has one
     pub fn name(&self) -> Option<&(String, String)> {
         match self {
-            RuleAction::Drop { name } | RuleAction::RateLimit { name, .. } | RuleAction::Count { name } => {
+            RuleAction::Pass { name } | RuleAction::Drop { name } | RuleAction::RateLimit { name, .. } | RuleAction::Count { name } => {
                 name.as_ref()
             }
-            _ => None,
         }
     }
 }
@@ -87,7 +89,7 @@ impl RuleManifestEntry {
     /// Human-readable action kind string for log section headers
     pub fn action_kind(&self) -> &'static str {
         match &self.action {
-            RuleAction::Pass => "pass",
+            RuleAction::Pass { .. } => "pass",
             RuleAction::Drop { .. } => "drop",
             RuleAction::RateLimit { .. } => "rate-limit",
             RuleAction::Count { .. } => "count",
@@ -730,7 +732,12 @@ impl RuleSpec {
         // Hash all actions (sorted by type first, then by fields)
         let mut action_strs: Vec<String> = self.actions.iter().map(|a| {
             match a {
-                RuleAction::Pass => "pass".to_string(),
+                RuleAction::Pass { name } => {
+                    let name_str = name.as_ref()
+                        .map(|(ns, n)| format!("{}:{}", ns, n))
+                        .unwrap_or_default();
+                    format!("pass:{}", name_str)
+                }
                 RuleAction::Drop { name } => {
                     let name_str = name.as_ref()
                         .map(|(ns, n)| format!("{}:{}", ns, n))
@@ -775,10 +782,10 @@ impl RuleSpec {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         
-        // Find first rate-limit, count, or drop action
+        // Find first action with a bucket (pass, drop, rate-limit, or count)
         for action in &self.actions {
             match action {
-                RuleAction::Drop { name } | RuleAction::RateLimit { pps: _, name } | RuleAction::Count { name } => {
+                RuleAction::Pass { name } | RuleAction::Drop { name } | RuleAction::RateLimit { pps: _, name } | RuleAction::Count { name } => {
                     if let Some((namespace, name)) = name {
                         // Named bucket: hash namespace + name
                         let mut hasher = DefaultHasher::new();
@@ -791,7 +798,6 @@ impl RuleSpec {
                         return Some(self.canonical_hash());
                     }
                 }
-                _ => continue,
             }
         }
         None
@@ -968,7 +974,10 @@ impl RuleSpec {
     /// Format a single action as s-expression
     fn action_to_sexpr(action: &RuleAction) -> String {
         match action {
-            RuleAction::Pass => "(pass)".to_string(),
+            RuleAction::Pass { name: None } => "(pass)".to_string(),
+            RuleAction::Pass { name: Some((ns, n)) } => {
+                format!("(pass :name [\"{}\", \"{}\"])", ns, n)
+            }
             RuleAction::Drop { name: None } => "(drop)".to_string(),
             RuleAction::Drop { name: Some((ns, n)) } => {
                 format!("(drop :name [\"{}\", \"{}\"])", ns, n)
@@ -1580,7 +1589,7 @@ mod tests {
     fn test_sexpr_pass() {
         let spec = RuleSpec {
             constraints: vec![],
-            actions: vec![RuleAction::Pass],
+            actions: vec![RuleAction::pass()],
             priority: 100,
             comment: None,
             label: None,

@@ -1200,7 +1200,27 @@ fn parse_edn_action(edn: &Edn) -> Result<Option<RuleAction>> {
     let action_type = list[0].to_string();
     
     match action_type.as_str() {
-        "pass" => Ok(Some(RuleAction::Pass)),
+        "pass" => {
+            // Check for optional :name keyword - MUST be [namespace, name] vector
+            let name = if list.len() >= 3 && list[1].to_string() == ":name" {
+                match &list[2] {
+                    Edn::Vector(vec) => {
+                        let items = vec.clone().to_vec();
+                        if items.len() != 2 {
+                            anyhow::bail!(":name must be [namespace, name] with exactly 2 elements");
+                        }
+                        let ns = items[0].to_string().trim_matches('"').to_string();
+                        let n = items[1].to_string().trim_matches('"').to_string();
+                        Some((ns, n))
+                    }
+                    _ => anyhow::bail!(":name must be a vector [namespace, name], got: {:?}", list[2]),
+                }
+            } else {
+                None
+            };
+            
+            Ok(Some(RuleAction::Pass { name }))
+        }
         "drop" => {
             // Check for optional :name keyword - MUST be [namespace, name] vector
             let name = if list.len() >= 3 && list[1].to_string() == ":name" {
@@ -1709,6 +1729,7 @@ async fn main() -> Result<()> {
                             let tcl = tree_counter_labels.read().await;
                             
                             // Partition entries by action kind using the manifest
+                            let mut pass_entries: Vec<(u32, u64, String)> = Vec::new();
                             let mut count_entries: Vec<(u32, u64, String)> = Vec::new();
                             let mut drop_entries: Vec<(u32, u64, String)> = Vec::new();
                             let mut other_entries: Vec<(u32, u64, String, String)> = Vec::new();
@@ -1716,6 +1737,7 @@ async fn main() -> Result<()> {
                             for &(key, value) in &counter_values {
                                 if let Some((kind, label)) = tcl.get(&key) {
                                     match kind.as_str() {
+                                        "pass" => pass_entries.push((key, value, label.clone())),
                                         "count" => count_entries.push((key, value, label.clone())),
                                         "drop" => drop_entries.push((key, value, label.clone())),
                                         other => other_entries.push((key, value, label.clone(), other.to_string())),
@@ -1723,6 +1745,14 @@ async fn main() -> Result<()> {
                                 } else {
                                     // Entry not in manifest — could be from a previous compilation
                                     other_entries.push((key, value, format!("unknown-0x{:08x}", key), "?".to_string()));
+                                }
+                            }
+
+                            if !pass_entries.is_empty() {
+                                info!("=== Pass Actions (window {}) ===", windows_processed);
+                                pass_entries.sort_by_key(|(_, v, _)| std::cmp::Reverse(*v));
+                                for (_, value, label) in &pass_entries {
+                                    info!("  {} {} packets passed", label, value);
                                 }
                             }
 
@@ -1815,7 +1845,7 @@ async fn main() -> Result<()> {
                             let action_str = match &spec.actions[0] {
                                 RuleAction::Drop { .. } => "DROP",
                                 RuleAction::RateLimit { .. } => "RATE-LIMIT",
-                                RuleAction::Pass => "PASS",
+                                RuleAction::Pass { .. } => "PASS",
                                 RuleAction::Count { .. } => "COUNT",
                             };
                             warn!("    RULE:\n{}", spec.to_edn_pretty());
