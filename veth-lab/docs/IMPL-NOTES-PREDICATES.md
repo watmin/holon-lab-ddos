@@ -1,5 +1,9 @@
 # Implementation Notes: Remaining Predicate Extensions
 
+**Status:** ✅ Bitmask predicate completed (Feb 14, 2026). The implementation
+went far beyond the original spec — see PLAN-NEXT.md section 4b for the full
+summary. Negation (section 4d) remains as a future task.
+
 **Context for the implementing model.** The range predicate implementation
 established a pattern for extending the tree Rete engine with new predicate
 types. This document explains that pattern and specifies the next two predicates.
@@ -82,9 +86,12 @@ struct ShadowNode {
 
 ---
 
-## Next: 4b. Bitmask Predicate
+## ✅ COMPLETED: 4b. Bitmask Predicate
 
-**Syntax:** `(mask tcp-flags 0x02)` — match if `(field_value & mask) != 0`
+**Original Syntax:** `(mask tcp-flags 0x02)` — match if `(field_value & mask) != 0`
+
+**Actual Implementation:** Replaced with `MaskEq` (`(value & mask) == expected`)
+plus full L4 byte matching system. See PLAN-NEXT.md section 4b for details.
 
 **Use case:** TCP flags are a bitmask field. `(mask tcp-flags 0x02)` matches any
 packet with the SYN bit set, regardless of other flag bits. Currently you'd need

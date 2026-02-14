@@ -415,20 +415,56 @@ Key design: `compile_recursive` does 3-way partitioning at each dimension:
 No expansion needed — `(> dst-port 1000)` is a single range edge, not 64K rules.
 Verified with eBPF verifier, 42 tests pass, live tested with ~27M packets.
 
-### 4b. Bitmask Predicate
+### ✅ 4b. Bitmask & Byte Matching Predicates [COMPLETED 2026-02-14]
 
-**Example:** `(mask tcp-flags 2)` — match if SYN bit is set.
+**Status:** ✅ Implemented far beyond the original spec. What started as a simple
+bitmask predicate evolved into a comprehensive three-tiered matching system.
 
-**Compilation:** Cannot use edge lookup. Options:
+#### Implementation Summary
 
-1. **Expansion:** Enumerate all values where `value & mask != 0`. For
-   `(mask tcp-flags 2)`, that's 128 values. Feasible for 8-bit fields.
+The original `(mask tcp-flags 2)` with `!= 0` semantics was replaced with
+**`MaskEq`** using `(value & mask) == expected` semantics, which is strictly
+more powerful. This was then extended to support arbitrary L4 byte matching.
 
-2. **Node annotation:** Add `mask_check: u32` to TreeNode. If nonzero,
-   the check is `(field_value & mask_check) != 0` instead of edge lookup.
+**Three-tiered matching system:**
 
-**Recommendation:** Node annotation. Bitmask checks are a single AND + branch
-in eBPF, much cheaper than 128 edge lookups.
+1. **`MaskEq` guard edges** on pre-extracted fields (1-2 bytes).
+   Reuses range edge slots with `RANGE_OP_MASK_EQ = 5`.
+   - `(mask-eq <field> <mask> <expected>)` — generic on any field
+   - `(protocol-match <match> <mask>)` — sugar for protocol field
+   - `(tcp-flags-match <match> <mask>)` — sugar for TCP flags field
+
+2. **Custom dimension fan-out** (1-4 byte exact matches at L4 offsets).
+   `FieldDim::Custom0-Custom6` (indices 9-15) dynamically assigned at compile
+   time. Enables O(1) HashMap edge lookup for short L4 byte patterns.
+   - `(l4-match <offset> "<hex-match>" "<hex-mask>")` where len 1-4
+
+3. **`PatternGuard` edges** referencing `BYTE_PATTERNS` BPF map (5-64 bytes).
+   Byte-by-byte comparison against pre-copied `DfsState.pattern_data`.
+   Match/mask bytes are pre-shifted at compile time to avoid runtime offset
+   arithmetic (eBPF verifier compliance).
+   - `(l4-match <offset> "<hex-match>" "<hex-mask>")` where len 5-64
+
+**Key eBPF innovations:**
+- `DfsState.pattern_data: [u8; 64]` — pre-copies transport payload in
+  `veth_filter` (which has verified packet access) so `tree_walk_step`
+  can match without raw packet pointer issues
+- Custom dimensions extracted from `pattern_data` via `extract_custom_dim_from_data`
+  (avoids variable-offset packet access that the verifier rejects)
+- Pre-shifted `BytePattern.match_bytes` and `mask_bytes` eliminate runtime
+  offset arithmetic in `check_byte_pattern`
+
+**Per-rule metrics and manifest:**
+- All action types (PASS, DROP, RATE-LIMIT, COUNT) support `:name ["ns" "metric"]`
+- DROP and PASS actions increment `TREE_COUNTERS` for per-rule attribution
+- Compiler returns authoritative `RuleManifestEntry` manifest mapping
+  `rule_id` to action type and label
+- `resolve_l4byte_refs` uses `BTreeSet` for deterministic custom dimension
+  assignment, ensuring stable `rule_id`s across recompilations
+
+**Comprehensive integration test:** 9 rules covering every predicate type
+and every action variant, verified with live traffic across 3 traffic types.
+See `veth-lab/scenarios/comprehensive-predicate-test.edn`.
 
 ### ✅ 4c. Set Membership (In) [COMPLETED 2026-02-13]
 

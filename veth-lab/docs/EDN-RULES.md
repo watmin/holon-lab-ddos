@@ -28,14 +28,46 @@ Each line is a complete EDN map:
 
 ### Predicates
 
-Currently only `=` (equality) is implemented:
-
+**Equality:**
 ```edn
 (= proto 17)              ;; UDP
 (= src-addr 10.0.0.200)   ;; Source IP
 (= dst-port 9999)         ;; Destination port
 (= tcp-flags 2)           ;; SYN flag
 ```
+
+**Set membership:**
+```edn
+(in src-port 53 123 5353)  ;; Match any of these ports
+```
+
+**Range predicates:**
+```edn
+(> ttl 200)                ;; TTL greater than 200
+(< ttl 100)                ;; TTL less than 100
+(>= dst-port 1024)         ;; Destination port >= 1024
+(<= ttl 64)                ;; TTL <= 64
+```
+
+**Bitmask matching (MaskEq):**
+```edn
+(mask-eq ttl 0xF0 0x40)                ;; (TTL & 0xF0) == 0x40 (upper nibble = 4)
+(protocol-match 17 0xFF)               ;; (proto & 0xFF) == 17 (exact UDP match)
+(tcp-flags-match 0x02 0x02)            ;; (flags & 0x02) == 0x02 (SYN bit set)
+```
+
+**L4 byte matching (arbitrary transport-relative offsets):**
+```edn
+;; Short match (1-4 bytes): uses custom dimension fan-out for O(1) lookup
+(l4-match 2 "22B8" "FFFF")            ;; 2 bytes at L4 offset 2 (dst port 8888)
+
+;; Long match (5-64 bytes): uses pattern guard with byte-by-byte comparison
+(l4-match 8 "564554482D4C41422D54455354" "FFFFFFFFFFFFFFFFFFFFFFFFFF")
+;; 13 bytes at L4 offset 8 matching "VETH-LAB-TEST"
+```
+
+Match and mask values are **hexadecimal strings**. The offset is relative to the
+start of the transport (L4) header (byte 0 = first byte after IP header).
 
 Multiple constraints use implicit AND:
 
@@ -48,11 +80,13 @@ Multiple constraints use implicit AND:
 **Drop:**
 ```edn
 {:actions [(drop)]}
+{:actions [(drop :name ["security" "syn-block"])]}
 ```
 
 **Pass:**
 ```edn
 {:actions [(pass)]}
+{:actions [(pass :name ["allow" "normal-udp"])]}
 ```
 
 **Rate-limit (unnamed, per-rule bucket):**

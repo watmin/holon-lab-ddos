@@ -2,7 +2,7 @@
 
 **Status:** Tree Rete Engine Live — 1M Rules Proven  
 **Date:** February 2026  
-**Latest Update:** February 13, 2026  
+**Latest Update:** February 14, 2026  
 **Result:** Scalable decision-tree rule engine with BPF tail-call DFS, blue/green atomic deployment, and s-expression rule representation  
 **Key Achievement:** 1,000,000 rules loaded and dropping packets, BPF tail-call architecture, stack-based DFS trie traversal, ~5 tail calls per packet regardless of rule count
 
@@ -504,6 +504,9 @@ An unintentional stress test occurred when a rate-limiting bug caused the genera
 | Feb 12 | **Extended rule language** — ranges, OR, negation, bitmask, byte-at-offset design. 50K rule stress test. DAG compiler with structural deduplication and memoization |
 | Feb 13 | **BPF tail-call DFS** — stack-based trie traversal via `tree_walk_step` self-tail-call. Per-CPU `DfsState` for cross-call state. Explores all matching paths (specific + wildcard), picks highest priority |
 | Feb 13 | **1,000,000 rules** — 2M nodes, 3.8s compile, ~5 tail calls/packet, 3.9M drops. Maps scaled to 5M nodes / 5M edges. Proved per-packet cost is independent of rule count |
+| Feb 14 | **Range predicates** — `>`, `<`, `>=`, `<=` via guard edges with runtime evaluation. No tree expansion needed |
+| Feb 14 | **MaskEq + byte matching** — `(mask-eq)`, `(protocol-match)`, `(tcp-flags-match)` for bitmask fields. `(l4-match)` for arbitrary transport-offset byte matching (1-64 bytes). Three-tiered system: MaskEq guard edges, custom dimension fan-out (1-4B), pattern guards (5-64B) |
+| Feb 14 | **Per-rule metrics manifest** — All actions support `:name`. Compiler returns `RuleManifestEntry` manifest. Deterministic custom dim assignment for stable `rule_id`s. Comprehensive 9-rule integration test verified all predicates and action types |
 
 ## Future Work
 
@@ -522,6 +525,13 @@ An unintentional stress test occurred when a rate-limiting bug caused the genera
 - [x] **1,000,000 rule scale** — Proven with live traffic: 2M nodes, 3.8s compile, ~5 tail calls/packet, full detection and mitigation
 - [x] **DAG compiler with memoization** — Structural deduplication, content-hash sharing, `Rc<ShadowNode>` for memory efficiency
 - [x] **Extended rule language design** — Ranges, OR, negation, bitmask, byte-at-offset (extensibility proven, implementation deferred)
+- [x] **Range predicates** — `>`, `<`, `>=`, `<=` via guard edges with `RANGE_OP_GT/LT/GTE/LTE` constants
+- [x] **MaskEq predicates** — `(mask-eq field mask expected)` with `(value & mask) == expected` semantics. Guard edge `RANGE_OP_MASK_EQ = 5`
+- [x] **Protocol/TCP-flags match** — `(protocol-match)`, `(tcp-flags-match)` sugar forms for MaskEq
+- [x] **L4 byte matching** — `(l4-match offset "hex-match" "hex-mask")` for 1-64 byte patterns at transport-relative offsets. Custom dimensions (1-4B), pattern guards (5-64B)
+- [x] **Per-rule drop/pass metrics** — DROP and PASS actions increment `TREE_COUNTERS` for per-rule attribution in logs
+- [x] **Rule manifest** — Compiler returns `RuleManifestEntry` for authoritative action-type and label mapping
+- [x] **Named actions on all types** — `:name ["ns" "metric"]` supported on pass, drop, rate-limit, and count
 
 ### Short Term
 - [ ] Make rule TTL configurable via CLI
