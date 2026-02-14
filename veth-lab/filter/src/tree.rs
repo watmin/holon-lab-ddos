@@ -330,41 +330,29 @@ fn flatten_recursive(
         flat.edges.push((EdgeKey { parent: my_id, value }, child_id));
     }
 
-    // Flatten range children (up to MAX_RANGE_EDGES=2)
-    let mut range_count: u8 = 0;
-    let mut range_op_0: u8 = RANGE_OP_NONE;
-    let mut range_op_1: u8 = RANGE_OP_NONE;
-    let mut range_val_0: u32 = 0;
-    let mut range_child_0: u32 = 0;
-    let mut range_val_1: u32 = 0;
-    let mut range_child_1: u32 = 0;
+    // Flatten range/guard children.
+    // Each TreeNode has 2 guard edge slots. If >2 guards exist on a single
+    // dimension, we chain overflow through intermediate nodes connected via
+    // the wildcard pointer. The DFS walker naturally follows the chain.
+    //
+    // Example with 4 guards:
+    //   MainNode: guards[0,1], wildcard → OverflowNode
+    //   OverflowNode: guards[2,3], wildcard → original_wildcard
+    //
+    // The overflow nodes have the same dimension, no specific edges, no action.
+    // The walker visits them via wildcard traversal and evaluates their guards.
 
-    for (i, (edge, child)) in shadow.range_children.iter().enumerate() {
-        if i >= 2 {
-            eprintln!("WARN: Node has {} range edges, but max is 2. Extras ignored.",
-                      shadow.range_children.len());
-            break;
-        }
-        let child_id = flatten_recursive(child, alloc, flat, dedup);
-        match i {
-            0 => {
-                range_op_0 = edge.op;
-                range_val_0 = edge.value;
-                range_child_0 = child_id;
-            }
-            1 => {
-                range_op_1 = edge.op;
-                range_val_1 = edge.value;
-                range_child_1 = child_id;
-            }
-            _ => unreachable!(),
-        }
-        range_count += 1;
-    }
+    // First, flatten all guard edge children to get their node IDs
+    let guard_children: Vec<(RangeEdge, u32)> = shadow.range_children.iter()
+        .map(|(edge, child)| {
+            let child_id = flatten_recursive(child, alloc, flat, dedup);
+            (edge.clone(), child_id)
+        })
+        .collect();
 
     let has_children = !shadow.children.is_empty()
         || shadow.wildcard.is_some()
-        || !shadow.range_children.is_empty();
+        || !guard_children.is_empty();
     let dimension = if !has_children {
         DIM_LEAF
     } else if shadow.dim_index < NUM_DIMENSIONS {
@@ -372,6 +360,87 @@ fn flatten_recursive(
     } else {
         DIM_LEAF
     };
+
+    // Build overflow chain for guards beyond the first 2
+    let effective_wildcard = if guard_children.len() <= 2 {
+        wildcard_child
+    } else {
+        // Chain overflow nodes from tail to head.
+        // Last overflow gets the original wildcard; each earlier one's
+        // wildcard points to the next overflow in the chain.
+        let overflow = &guard_children[2..];
+        let mut chain_tail = wildcard_child; // original wildcard goes at the end
+
+        // Process pairs from end to start so each node's wildcard → next node
+        let chunks: Vec<&[(RangeEdge, u32)]> = overflow.chunks(2).collect();
+        for chunk in chunks.iter().rev() {
+            let overflow_id = alloc.alloc();
+            let mut ov_count = 0u8;
+            let mut ov_op_0 = RANGE_OP_NONE;
+            let mut ov_op_1 = RANGE_OP_NONE;
+            let mut ov_val_0 = 0u32;
+            let mut ov_ch_0 = 0u32;
+            let mut ov_val_1 = 0u32;
+            let mut ov_ch_1 = 0u32;
+
+            if let Some((edge, child_id)) = chunk.get(0) {
+                ov_op_0 = edge.op;
+                ov_val_0 = edge.value;
+                ov_ch_0 = *child_id;
+                ov_count += 1;
+            }
+            if let Some((edge, child_id)) = chunk.get(1) {
+                ov_op_1 = edge.op;
+                ov_val_1 = edge.value;
+                ov_ch_1 = *child_id;
+                ov_count += 1;
+            }
+
+            flat.nodes.push((overflow_id, TreeNode {
+                dimension,
+                has_action: 0,
+                action: ACT_PASS,
+                priority: 0,
+                rate_pps: 0,
+                wildcard_child: chain_tail,
+                rule_id: 0,
+                range_count: ov_count,
+                range_op_0: ov_op_0,
+                range_op_1: ov_op_1,
+                _range_pad: 0,
+                range_val_0: ov_val_0,
+                range_child_0: ov_ch_0,
+                range_val_1: ov_val_1,
+                range_child_1: ov_ch_1,
+            }));
+
+            chain_tail = overflow_id;
+        }
+
+        chain_tail // main node's wildcard → head of overflow chain
+    };
+
+    // First 2 guards go directly on the main node
+    let mut range_count = 0u8;
+    let mut range_op_0 = RANGE_OP_NONE;
+    let mut range_op_1 = RANGE_OP_NONE;
+    let mut range_val_0 = 0u32;
+    let mut range_child_0 = 0u32;
+    let mut range_val_1 = 0u32;
+    let mut range_child_1 = 0u32;
+
+    if let Some((edge, child_id)) = guard_children.get(0) {
+        range_op_0 = edge.op;
+        range_val_0 = edge.value;
+        range_child_0 = *child_id;
+        range_count += 1;
+    }
+    if let Some((edge, child_id)) = guard_children.get(1) {
+        range_op_1 = edge.op;
+        range_val_1 = edge.value;
+        range_child_1 = *child_id;
+        range_count += 1;
+    }
 
     let (has_action, action, priority, rate_pps, rule_id) = if let Some(a) = &shadow.action {
         if a.action == ACT_RATE_LIMIT && a.rate_pps > 0 {
@@ -407,7 +476,7 @@ fn flatten_recursive(
         action,
         priority,
         rate_pps,
-        wildcard_child,
+        wildcard_child: effective_wildcard,
         rule_id,
         range_count,
         range_op_0,
@@ -2295,6 +2364,181 @@ mod tests {
         let (matched, _, prio, _) = simulate_single_walk(&flat, &[(FieldDim::TcpFlags, 0x12)]);
         assert!(matched, "flags=0x12 (SYN+ACK) should match at least one rule");
         assert_eq!(prio, 100);
+    }
+
+    #[test]
+    fn test_guard_edge_overflow_4_masks() {
+        // 4 mask predicates on tcp-flags, all under proto=6.
+        // This produces 4 guard edges at the tcp-flags dimension — more than
+        // the 2 per-node limit. The compiler must chain overflow nodes.
+        //
+        // Rule A: (= proto 6) (mask tcp-flags 0x02) -> DROP,       prio 200 (SYN)
+        // Rule B: (= proto 6) (mask tcp-flags 0x10) -> RATE_LIMIT, prio 150 (ACK)
+        // Rule C: (= proto 6) (mask tcp-flags 0x04) -> PASS,       prio 100 (RST)
+        // Rule D: (= proto 6) (mask tcp-flags 0x01) -> DROP,       prio 50  (FIN)
+        let rules = vec![
+            RuleSpec::compound(
+                vec![
+                    Predicate::Eq(crate::FieldRef::Dim(FieldDim::Proto), 6),
+                    Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02),
+                ],
+                RuleAction::Drop,
+            ).with_priority(200),
+            RuleSpec::compound(
+                vec![
+                    Predicate::Eq(crate::FieldRef::Dim(FieldDim::Proto), 6),
+                    Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x10),
+                ],
+                RuleAction::RateLimit { pps: 500, name: None },
+            ).with_priority(150),
+            RuleSpec::compound(
+                vec![
+                    Predicate::Eq(crate::FieldRef::Dim(FieldDim::Proto), 6),
+                    Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x04),
+                ],
+                RuleAction::Pass,
+            ).with_priority(100),
+            RuleSpec::compound(
+                vec![
+                    Predicate::Eq(crate::FieldRef::Dim(FieldDim::Proto), 6),
+                    Predicate::Mask(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x01),
+                ],
+                RuleAction::Drop,
+            ).with_priority(50),
+        ];
+        let flat = flatten_tree(&compile_tree(&rules), 1);
+
+        // SYN only (0x02): matches rule A (prio 200, DROP)
+        let (m, a, p, _) = simulate_single_walk(&flat, &[(FieldDim::Proto, 6), (FieldDim::TcpFlags, 0x02)]);
+        assert!(m, "SYN should match");
+        assert_eq!(p, 200);
+        assert_eq!(a, crate::ACT_DROP);
+
+        // ACK only (0x10): matches rule B (prio 150, RATE_LIMIT)
+        let (m, a, p, _) = simulate_single_walk(&flat, &[(FieldDim::Proto, 6), (FieldDim::TcpFlags, 0x10)]);
+        assert!(m, "ACK should match");
+        assert_eq!(p, 150);
+        assert_eq!(a, ACT_RATE_LIMIT);
+
+        // RST only (0x04): matches rule C (prio 100, PASS)
+        let (m, a, p, _) = simulate_single_walk(&flat, &[(FieldDim::Proto, 6), (FieldDim::TcpFlags, 0x04)]);
+        assert!(m, "RST should match");
+        assert_eq!(p, 100);
+        assert_eq!(a, crate::ACT_PASS);
+
+        // FIN only (0x01): matches rule D (prio 50, DROP)
+        let (m, a, p, _) = simulate_single_walk(&flat, &[(FieldDim::Proto, 6), (FieldDim::TcpFlags, 0x01)]);
+        assert!(m, "FIN should match");
+        assert_eq!(p, 50);
+        assert_eq!(a, crate::ACT_DROP);
+
+        // SYN+ACK (0x12): matches A (200) and B (150). A wins.
+        let (m, a, p, _) = simulate_single_walk(&flat, &[(FieldDim::Proto, 6), (FieldDim::TcpFlags, 0x12)]);
+        assert!(m, "SYN+ACK should match");
+        assert_eq!(p, 200, "SYN rule (prio 200) should beat ACK rule (prio 150)");
+        assert_eq!(a, crate::ACT_DROP);
+
+        // RST+FIN (0x05): matches C (100) and D (50). C wins.
+        let (m, a, p, _) = simulate_single_walk(&flat, &[(FieldDim::Proto, 6), (FieldDim::TcpFlags, 0x05)]);
+        assert!(m, "RST+FIN should match");
+        assert_eq!(p, 100, "RST rule (prio 100) should beat FIN rule (prio 50)");
+        assert_eq!(a, crate::ACT_PASS);
+
+        // SYN+RST+FIN+ACK (0x17): all 4 match. A wins (highest prio 200).
+        let (m, a, p, _) = simulate_single_walk(&flat, &[(FieldDim::Proto, 6), (FieldDim::TcpFlags, 0x17)]);
+        assert!(m, "all flags should match something");
+        assert_eq!(p, 200, "highest-priority rule should win");
+        assert_eq!(a, crate::ACT_DROP);
+
+        // No matching bits (0x08): no rule matches
+        let (m, _, _, _) = simulate_single_walk(&flat, &[(FieldDim::Proto, 6), (FieldDim::TcpFlags, 0x08)]);
+        assert!(!m, "no mask should match 0x08 (PSH only)");
+
+        // Wrong proto: no match regardless of flags
+        let (m, _, _, _) = simulate_single_walk(&flat, &[(FieldDim::Proto, 17), (FieldDim::TcpFlags, 0x02)]);
+        assert!(!m, "UDP should not match any rule");
+    }
+
+    #[test]
+    fn test_guard_edge_overflow_5_guards_mixed() {
+        // 5 guard edges on the same dimension: 3 ranges + 2 masks.
+        // Exercises the overflow chain with an odd number (5 = 2+2+1 → 2 overflow nodes).
+        //
+        // Rule A: (> dst-port 50000) -> DROP,       prio 200
+        // Rule B: (< dst-port 100)   -> DROP,       prio 150
+        // Rule C: (mask dst-port 0x8000) -> PASS,    prio 100  (high bit set = port >= 32768)
+        // Rule D: (>= dst-port 1024)  -> RATE_LIMIT, prio 80
+        // Rule E: (mask dst-port 0x0001) -> DROP,    prio 50   (odd port)
+        let rules = vec![
+            RuleSpec::compound(
+                vec![Predicate::Gt(crate::FieldRef::Dim(FieldDim::L4Word1), 50000)],
+                RuleAction::Drop,
+            ).with_priority(200),
+            RuleSpec::compound(
+                vec![Predicate::Lt(crate::FieldRef::Dim(FieldDim::L4Word1), 100)],
+                RuleAction::Drop,
+            ).with_priority(150),
+            RuleSpec::compound(
+                vec![Predicate::Mask(crate::FieldRef::Dim(FieldDim::L4Word1), 0x8000)],
+                RuleAction::Pass,
+            ).with_priority(100),
+            RuleSpec::compound(
+                vec![Predicate::Gte(crate::FieldRef::Dim(FieldDim::L4Word1), 1024)],
+                RuleAction::RateLimit { pps: 1000, name: None },
+            ).with_priority(80),
+            RuleSpec::compound(
+                vec![Predicate::Mask(crate::FieldRef::Dim(FieldDim::L4Word1), 0x0001)],
+                RuleAction::Drop,
+            ).with_priority(50),
+        ];
+        let flat = flatten_tree(&compile_tree(&rules), 1);
+
+        // port 60000 (>50000, >=1024, bit 0x8000 set, even): A(200), C(100), D(80) match. A wins.
+        let (m, a, p, _) = simulate_single_walk(&flat, &[(FieldDim::L4Word1, 60000)]);
+        assert!(m);
+        assert_eq!(p, 200);
+        assert_eq!(a, crate::ACT_DROP);
+
+        // port 50: (<100, odd): B(150), E(50) match (50 is even actually! 50=0x32)
+        // Wait, 50 is even. So only B matches.
+        let (m, a, p, _) = simulate_single_walk(&flat, &[(FieldDim::L4Word1, 50)]);
+        assert!(m);
+        assert_eq!(p, 150);
+        assert_eq!(a, crate::ACT_DROP);
+
+        // port 51: (<100, odd port): B(150), E(50) match. B wins.
+        let (m, a, p, _) = simulate_single_walk(&flat, &[(FieldDim::L4Word1, 51)]);
+        assert!(m);
+        assert_eq!(p, 150);
+        assert_eq!(a, crate::ACT_DROP);
+
+        // port 33000: (>=1024, bit 0x8000 set, even): C(100), D(80) match. C wins.
+        let (m, a, p, _) = simulate_single_walk(&flat, &[(FieldDim::L4Word1, 33000)]);
+        assert!(m);
+        assert_eq!(p, 100);
+        assert_eq!(a, crate::ACT_PASS);
+
+        // port 2000 (>=1024, no 0x8000, even): only D(80) matches.
+        let (m, a, p, _) = simulate_single_walk(&flat, &[(FieldDim::L4Word1, 2000)]);
+        assert!(m);
+        assert_eq!(p, 80);
+        assert_eq!(a, ACT_RATE_LIMIT);
+
+        // port 2001 (>=1024, no 0x8000, odd): D(80), E(50) match. D wins.
+        let (m, a, p, _) = simulate_single_walk(&flat, &[(FieldDim::L4Word1, 2001)]);
+        assert!(m);
+        assert_eq!(p, 80);
+        assert_eq!(a, ACT_RATE_LIMIT);
+
+        // port 500 (not >50000, not <100, not >=1024, no 0x8000, even): no match
+        let (m, _, _, _) = simulate_single_walk(&flat, &[(FieldDim::L4Word1, 500)]);
+        assert!(!m, "port 500 should not match any rule");
+
+        // port 501 (same but odd): only E(50) matches.
+        let (m, a, p, _) = simulate_single_walk(&flat, &[(FieldDim::L4Word1, 501)]);
+        assert!(m);
+        assert_eq!(p, 50);
+        assert_eq!(a, crate::ACT_DROP);
     }
 
     // =========================================================================
