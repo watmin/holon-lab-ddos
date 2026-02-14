@@ -63,19 +63,24 @@ sudo ./scripts/teardown.sh
 ### With Pre-Loaded Rules (Stress Test)
 
 ```bash
-# Generate 1M rules
+# Generate 1M rules in EDN format (recommended)
+python3 scripts/generate_ruleset_edn.py --count 1000000 --output scenarios/rules-1m.edn
+
+# Or generate JSON (legacy format)
 python3 scripts/generate_ruleset.py --count 1000000 --output scenarios/rules-1m.json
 
-# Run with pre-loaded rules
+# Run with pre-loaded rules (auto-detects format)
 sudo ./target/release/veth-sidecar \
     --interface veth-filter \
     --enforce \
     --rate-limit \
-    --rules-file scenarios/rules-1m.json \
+    --rules-file scenarios/rules-1m.edn \
     --warmup-windows 15 \
     --warmup-packets 1500 \
     --sample-rate 100
 ```
+
+**Performance:** EDN format parses 1M rules in ~2.7 seconds (40% smaller files than JSON).
 
 ## Components
 
@@ -93,26 +98,34 @@ sudo ./target/release/veth-sidecar \
 2. **Holon encodes samples** as 4096-dimensional hypervectors using VSA binding and bundling
 3. **Drift detection** compares the current window's accumulator against the frozen baseline
 4. **Pattern attribution** identifies which fields (proto, src-ip, dst-port, etc.) are concentrated in anomalous traffic
-5. **Rules are generated** as s-expressions: `((and (= proto 17) (= src-port 53)) => (rate-limit 1906))`
+5. **Rules are generated** as EDN maps: `{:constraints [(= proto 17) (= src-port 53)] :actions [(rate-limit 1906)]}`
 6. **DAG compiler** builds a decision tree with memoization and structural sharing (`Rc<ShadowNode>`)
 7. **Blue/green flip** writes the new tree to the inactive slot and atomically swaps `TREE_ROOT`
 8. **BPF tail-call DFS** walks the tree — ~5 tail calls per packet, regardless of rule count
 
 ## Rule Language
 
-Rules use s-expressions in Clara-style LHS => RHS format with raw numeric values:
+Rules use EDN (Extensible Data Notation) format with s-expression predicates:
 
+```edn
+{:constraints [(= proto 17)
+               (= src-port 53)
+               (= src-addr "10.0.0.200")]
+ :actions     [(rate-limit 1906)]
+ :priority    200}
 ```
-((and (= proto 17)
-      (= src-port 53)
-      (= src-addr 10.0.0.200))
- =>
- (rate-limit 1906))
+
+**File Format:** One rule per line (streaming-friendly, handles 1M+ rules):
+```edn
+{:constraints [(= proto 17) (= src-port 53)] :actions [(rate-limit 500)] :priority 200}
 ```
 
-Fields: `proto`, `src-addr`, `dst-addr`, `src-port`, `dst-port`, `tcp-flags`, `ttl`, `df`, `tcp-window`
+**Fields:** `proto`, `src-addr`, `dst-addr`, `src-port`, `dst-port`, `tcp-flags`, `ttl`, `df`, `tcp-window`
 
-See [docs/RULES.md](docs/RULES.md) for the complete language reference.
+**Actions:** `(drop)`, `(pass)`, `(rate-limit <pps>)`, `(rate-limit <pps> :name "label")`, `(count :name "label")`
+
+See [docs/EDN-RULES.md](docs/EDN-RULES.md) for the complete EDN format reference.  
+See [docs/RULES.md](docs/RULES.md) for the legacy s-expression format and language theory.
 
 ## Documentation
 
@@ -124,7 +137,8 @@ See [docs/RULES.md](docs/RULES.md) for the complete language reference.
 | [EBPF.md](docs/EBPF.md) | eBPF engineering — 6 chapters of verifier battles |
 | [DECISIONS.md](docs/DECISIONS.md) | 10 architecture decision records |
 | [SCALING.md](docs/SCALING.md) | Performance from 50K to 1M rules, projections to 5M+ |
-| [RULES.md](docs/RULES.md) | Rule language reference and extension roadmap |
+| [EDN-RULES.md](docs/EDN-RULES.md) | **EDN rule format reference (current format)** |
+| [RULES.md](docs/RULES.md) | Legacy s-expression format and language theory |
 | [OPERATIONS.md](docs/OPERATIONS.md) | Build, run, tune, monitor, debug runbook |
 
 ## Safety

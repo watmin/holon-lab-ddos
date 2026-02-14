@@ -5,9 +5,29 @@ that can be handed to a capable model for implementation.**
 
 ---
 
-## 1. RHS Syntax Redesign
+## ✅ 1. RHS Syntax Redesign [COMPLETED 2026-02-13]
 
-### Problem
+**Status:** ✅ Implemented and deployed. See `docs/COMMIT-EDN-IMPLEMENTATION.md` for details.
+
+### Implementation Summary
+
+Successfully implemented EDN-style rule syntax with:
+- ✅ Actions as vector: `{:actions [(rate-limit 500)]}`
+- ✅ Named rate limiters supported: `(rate-limit 500 :name "dns")`
+- ✅ Count action: `(count :name "attacks")`
+- ✅ Multiple actions: `{:actions [(rate-limit 500) (count)]}`
+- ✅ Pretty-print formatting for logs
+- ✅ Streaming parser (1M rules in 2.74s)
+- ✅ 40% smaller files vs JSON
+- ✅ Backward compatible with JSON
+
+### Performance
+- **Parse time**: 2.74s for 1M rules
+- **File size**: 887KB vs 1.5MB (40% reduction) for 10K rules
+- **Tree compilation**: 2M nodes for 1M rules
+- **Memory**: Streaming (constant memory usage)
+
+### Original Design Problem
 
 The current s-expression RHS feels noisy and the `:priority` tacked on after
 the action is awkward:
@@ -88,23 +108,9 @@ pub enum RuleAction {
 **Canonical hash:** Must include ALL actions (sorted) + priority. Named rate
 limiters share the same bucket key derived from the name, not the rule hash.
 
-**JSON format update:**
-
-```json
-{
-  "constraints": [{"field": "proto", "value": 17}],
-  "actions": [
-    {"type": "rate-limit", "pps": 500, "name": "amplification"}
-  ],
-  "priority": 200
-}
-```
-
-Backward compat: still accept `"action": "drop"` (singular) as shorthand.
-
 ---
 
-## 2. Named Rate Limiters
+## 2. Named Rate Limiters (Shared Buckets)
 
 ### Problem
 

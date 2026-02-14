@@ -14,10 +14,12 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 use clap::Parser;
+use edn_rs::Edn;
 use holon::{Holon, Primitives, SegmentMethod, Vector};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -762,126 +764,287 @@ impl Detection {
         let constraint = self.to_constraint()?;
         let estimated_current_pps = (window_samples as f64 * sample_rate as f64) / 2.0;
         let allowed_pps = (estimated_current_pps * self.rate_factor).max(100.0) as u32;
-        let action = if use_rate_limit { RuleAction::RateLimit } else { RuleAction::Drop };
-        let rate_pps = if use_rate_limit { Some(allowed_pps) } else { None };
-        Some(RuleSpec { constraints: vec![constraint], action, rate_pps, priority: 100 })
+        
+        let action = if use_rate_limit { 
+            RuleAction::RateLimit { pps: allowed_pps, name: None }
+        } else { 
+            RuleAction::Drop 
+        };
+        
+        Some(RuleSpec { 
+            constraints: vec![constraint], 
+            actions: vec![action], 
+            priority: 100,
+            comment: None,
+            label: None,
+        })
     }
 }
 
 // =============================================================================
-// Rules File Loader
+// =============================================================================
+// Rules File Loader (EDN Format)
 // =============================================================================
 
-/// JSON schema for a single rule in the rules file
-#[derive(serde::Deserialize)]
-struct RuleFileEntry {
-    constraints: Vec<ConstraintFileEntry>,
-    action: String,
-    rate_pps: Option<u32>,
-    priority: Option<u8>,
-}
-
-#[derive(serde::Deserialize)]
-struct ConstraintFileEntry {
-    field: String,
-    value: serde_json::Value,
-}
-
-/// Parse a JSON rules file into RuleSpecs.
-///
-/// Format: JSON array of objects:
-/// ```json
-/// [
-///   {
-///     "constraints": [
-///       {"field": "proto", "value": 17},
-///       {"field": "src-addr", "value": "10.0.0.200"}
-///     ],
-///     "action": "rate-limit",
-///     "rate_pps": 500,
-///     "priority": 200
-///   }
-/// ]
+/// Parse an EDN rules file (one rule per line, streaming-friendly).
+/// 
+/// Format: EDN maps, one per line
+/// ```edn
+/// {:constraints [(= proto 17) (= src-port 53)] :actions [(rate-limit 500)] :priority 190}
+/// {:constraints [(= proto 6) (= tcp-flags 2)] :actions [(drop)] :priority 200}
+/// {:constraints [(= src-addr "10.0.0.200")] :actions [(drop)] :comment "Known attacker"}
 /// ```
-///
-/// Field names match s-expression names: proto, src-addr, dst-addr, src-port,
-/// dst-port, tcp-flags, ttl, df, tcp-window.
+/// 
+/// Comments (lines starting with `;`) and blank lines are ignored.
 fn parse_rules_file(path: &std::path::Path) -> Result<Vec<RuleSpec>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read rules file: {:?}", path))?;
-
-    let entries: Vec<RuleFileEntry> = serde_json::from_str(&content)
-        .context("Failed to parse rules file as JSON")?;
-
-    let mut rules = Vec::with_capacity(entries.len());
-    let mut skipped = 0usize;
-
-    for entry in &entries {
-        let mut constraints = Vec::new();
-        for c in &entry.constraints {
-            let dim = match c.field.as_str() {
-                "proto" => FieldDim::Proto,
-                "src-addr" => FieldDim::SrcIp,
-                "dst-addr" => FieldDim::DstIp,
-                "src-port" => FieldDim::L4Word0,
-                "dst-port" => FieldDim::L4Word1,
-                "tcp-flags" => FieldDim::TcpFlags,
-                "ttl" => FieldDim::Ttl,
-                "df" => FieldDim::DfBit,
-                "tcp-window" => FieldDim::TcpWindow,
-                other => {
-                    warn!("Unknown field '{}' in rules file, skipping constraint", other);
-                    continue;
-                }
-            };
-            let value = match &c.value {
-                serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as u32,
-                serde_json::Value::String(s) => {
-                    if let Ok(ip) = s.parse::<Ipv4Addr>() {
-                        u32::from_ne_bytes(ip.octets())
-                    } else {
-                        warn!("Cannot parse value '{}' for field '{}', skipping", s, c.field);
-                        continue;
-                    }
-                }
-                _ => {
-                    warn!("Invalid value type for field '{}', skipping", c.field);
-                    continue;
-                }
-            };
-            constraints.push(Predicate::eq(dim, value));
-        }
-
-        if constraints.is_empty() {
-            skipped += 1;
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open rules file: {:?}", path))?;
+    
+    let reader = BufReader::new(file);
+    let mut rules = Vec::new();
+    let mut skipped = 0;
+    let mut line_num = 0;
+    
+    for line in reader.lines() {
+        line_num += 1;
+        let line = line?;
+        let line = line.trim();
+        
+        // Skip empty lines and comments
+        if line.is_empty() || line.starts_with(';') {
             continue;
         }
-
-        let action = match entry.action.as_str() {
-            "drop" => RuleAction::Drop,
-            "rate-limit" => RuleAction::RateLimit,
-            "pass" => RuleAction::Pass,
-            other => {
-                warn!("Unknown action '{}', defaulting to drop", other);
-                RuleAction::Drop
+        
+        // Each line should be a complete EDN map
+        match parse_edn_rule_line(line, line_num) {
+            Ok(rule) => rules.push(rule),
+            Err(e) => {
+                warn!("Line {}: Failed to parse rule: {} - Line: {}", line_num, e, line);
+                skipped += 1;
             }
-        };
-
-        rules.push(RuleSpec {
-            constraints,
-            action,
-            rate_pps: entry.rate_pps,
-            priority: entry.priority.unwrap_or(100),
-        });
+        }
     }
-
+    
     if skipped > 0 {
-        warn!("Skipped {} rules with empty constraints", skipped);
+        warn!("Skipped {} malformed rules", skipped);
     }
-
+    
     Ok(rules)
 }
 
+/// Parse a single EDN rule line
+fn parse_edn_rule_line(line: &str, line_num: usize) -> Result<RuleSpec> {
+    let edn: Edn = line.parse()
+        .map_err(|e| anyhow::anyhow!("Failed to parse EDN on line {}: {:?}", line_num, e))?;
+    
+    // Extract map fields
+    let constraints_edn = edn.get(":constraints")
+        .ok_or_else(|| anyhow::anyhow!("Missing :constraints"))?;
+    let actions_edn = edn.get(":actions")
+        .ok_or_else(|| anyhow::anyhow!("Missing :actions"))?;
+    let priority = edn.get(":priority")
+        .map(|p| p.to_string().parse::<u8>().unwrap_or(100))
+        .unwrap_or(100);
+    let comment = edn.get(":comment")
+        .map(|c| {
+            let mut s = c.to_string();
+            s = s.trim_matches('"').to_string();
+            // Truncate to 256 chars
+            if s.len() > 256 {
+                s.truncate(256);
+            }
+            s
+        });
+    let label = edn.get(":label")
+        .and_then(|l| {
+            if let Edn::Vector(vec) = l {
+                let items = vec.clone().to_vec();
+                if items.len() == 2 {
+                    let mut ns = items[0].to_string().trim_matches('"').to_string();
+                    let mut name = items[1].to_string().trim_matches('"').to_string();
+                    // Truncate to 64 chars each
+                    if ns.len() > 64 { ns.truncate(64); }
+                    if name.len() > 64 { name.truncate(64); }
+                    Some((ns, name))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+    
+    // Parse constraints (vector of s-expressions)
+    let constraints = parse_edn_constraints(constraints_edn)?;
+    
+    // Parse actions (vector of s-expressions)
+    let actions = parse_edn_actions(actions_edn)?;
+    
+    if constraints.is_empty() {
+        anyhow::bail!("Rule has no constraints");
+    }
+    
+    if actions.is_empty() {
+        anyhow::bail!("Rule has no actions");
+    }
+    
+    Ok(RuleSpec {
+        constraints,
+        actions,
+        priority,
+        comment,
+        label,
+    })
+}
+
+/// Parse EDN constraints vector: [(= proto 17) (= src-port 53)]
+fn parse_edn_constraints(edn: &Edn) -> Result<Vec<Predicate>> {
+    // EDN vector is parsed as a list
+    if let Edn::Vector(vec) = edn {
+        let mut constraints = Vec::new();
+        for item in vec.clone().to_vec() {
+            if let Some(pred) = parse_edn_predicate(&item)? {
+                constraints.push(pred);
+            }
+        }
+        Ok(constraints)
+    } else {
+        anyhow::bail!("constraints must be a vector")
+    }
+}
+
+/// Parse a single predicate s-expression: (= proto 17)
+fn parse_edn_predicate(edn: &Edn) -> Result<Option<Predicate>> {
+    // EDN parses (op field value) as either List or Vector depending on brackets
+    let list = match edn {
+        Edn::List(lst) => lst.clone().to_vec(),
+        Edn::Vector(vec) => vec.clone().to_vec(),
+        _ => anyhow::bail!("Predicate must be a list or vector, got: {:?}", edn),
+    };
+    
+    if list.len() < 3 {
+        anyhow::bail!("Predicate must have at least 3 elements: (op field value)");
+    }
+    
+    let op = list[0].to_string();
+    if op != "=" {
+        anyhow::bail!("Only = predicates supported for now, got: {}", op);
+    }
+    
+    let field = list[1].to_string();
+    let dim = parse_field_name(&field)?;
+    
+    let value = parse_field_value(&list[2], dim)?;
+    
+    Ok(Some(Predicate::eq(dim, value)))
+}
+
+/// Parse field name from EDN symbol
+fn parse_field_name(name: &str) -> Result<FieldDim> {
+    match name {
+        "proto" => Ok(FieldDim::Proto),
+        "src-addr" => Ok(FieldDim::SrcIp),
+        "dst-addr" => Ok(FieldDim::DstIp),
+        "src-port" => Ok(FieldDim::L4Word0),
+        "dst-port" => Ok(FieldDim::L4Word1),
+        "tcp-flags" => Ok(FieldDim::TcpFlags),
+        "ttl" => Ok(FieldDim::Ttl),
+        "df" => Ok(FieldDim::DfBit),
+        "tcp-window" => Ok(FieldDim::TcpWindow),
+        other => anyhow::bail!("Unknown field: {}", other),
+    }
+}
+
+/// Parse field value from EDN (number or IP string)
+fn parse_field_value(edn: &Edn, dim: FieldDim) -> Result<u32> {
+    match dim {
+        FieldDim::SrcIp | FieldDim::DstIp => {
+            // IP addresses can be Symbols or Strings in EDN
+            let s = match edn {
+                Edn::Str(s) => s.to_string(),
+                Edn::Symbol(s) => s.to_string(),
+                _ => edn.to_string(),
+            };
+            let s = s.trim_matches('"'); // Remove quotes if present
+            let ip: Ipv4Addr = s.parse()
+                .with_context(|| format!("Invalid IP address: {} (from EDN: {:?})", s, edn))?;
+            Ok(u32::from_ne_bytes(ip.octets()))
+        }
+        _ => {
+            // Everything else is a number - try to parse from string
+            let s = edn.to_string();
+            s.parse::<u32>()
+                .with_context(|| format!("Expected number, got: {}", s))
+        }
+    }
+}
+
+/// Parse EDN actions vector: [(rate-limit 500) (count :name "foo")]
+fn parse_edn_actions(edn: &Edn) -> Result<Vec<RuleAction>> {
+    if let Edn::Vector(vec) = edn {
+        let mut actions = Vec::new();
+        for item in vec.clone().to_vec() {
+            if let Some(action) = parse_edn_action(&item)? {
+                actions.push(action);
+            }
+        }
+        Ok(actions)
+    } else {
+        anyhow::bail!("actions must be a vector")
+    }
+}
+
+/// Parse a single action s-expression: (rate-limit 500 :name "foo")
+fn parse_edn_action(edn: &Edn) -> Result<Option<RuleAction>> {
+    // EDN parses (action-type args...) as either List or Vector
+    let list = match edn {
+        Edn::List(lst) => lst.clone().to_vec(),
+        Edn::Vector(vec) => vec.clone().to_vec(),
+        _ => anyhow::bail!("Action must be a list or vector, got: {:?}", edn),
+    };
+    
+    if list.is_empty() {
+        anyhow::bail!("Action list is empty");
+    }
+    
+    let action_type = list[0].to_string();
+    
+    match action_type.as_str() {
+        "pass" => Ok(Some(RuleAction::Pass)),
+        "drop" => Ok(Some(RuleAction::Drop)),
+        "rate-limit" => {
+            if list.len() < 2 {
+                anyhow::bail!("rate-limit requires PPS argument");
+            }
+            let pps = list[1].to_string().parse::<u32>()
+                .with_context(|| "rate-limit PPS must be a number")?;
+            
+            // Check for optional :name keyword
+            let name = if list.len() >= 4 && list[2].to_string() == ":name" {
+                let name_str = list[3].to_string();
+                Some(name_str.trim_matches('"').to_string())
+            } else {
+                None
+            };
+            
+                Ok(Some(RuleAction::RateLimit { pps, name }))
+            }
+            "count" => {
+                // Check for optional :name keyword
+                let name = if list.len() >= 3 && list[1].to_string() == ":name" {
+                    let name_str = list[2].to_string();
+                    Some(name_str.trim_matches('"').to_string())
+                } else {
+                    None
+                };
+                
+                Ok(Some(RuleAction::Count { name }))
+            }
+            other => anyhow::bail!("Unknown action type: {}", other),
+        }
+}
+
+/// Legacy JSON parser (backward compatibility)
 /// Compile multiple concentrated detections into a compound RuleSpec.
 /// Gathers all constraints and produces a single rule.
 fn compile_compound_rule(
@@ -903,10 +1066,20 @@ fn compile_compound_rule(
     let estimated_current_pps = (window_samples as f64 * sample_rate as f64) / 2.0;
     let rate_factor = detections[0].rate_factor;
     let allowed_pps = (estimated_current_pps * rate_factor).max(100.0) as u32;
-    let action = if use_rate_limit { RuleAction::RateLimit } else { RuleAction::Drop };
-    let rate_pps = if use_rate_limit { Some(allowed_pps) } else { None };
+    
+    let action = if use_rate_limit { 
+        RuleAction::RateLimit { pps: allowed_pps, name: None }
+    } else { 
+        RuleAction::Drop 
+    };
 
-    Some(RuleSpec::compound(constraints, action, rate_pps))
+    Some(RuleSpec {
+        constraints,
+        actions: vec![action],
+        priority: 100,
+        comment: None,
+        label: None,
+    })
 }
 
 #[tokio::main]
@@ -1265,17 +1438,22 @@ async fn main() -> Result<()> {
                         if rules.contains_key(&rule_key) {
                             rules.get_mut(&rule_key).unwrap().last_seen = Instant::now();
                         } else {
-                            let action_str = match spec.action {
+                            let action_str = match &spec.actions[0] {
                                 RuleAction::Drop => "DROP",
-                                RuleAction::RateLimit => "RATE_LIMIT",
+                                RuleAction::RateLimit { .. } => "RATE-LIMIT",
                                 RuleAction::Pass => "PASS",
+                                RuleAction::Count { .. } => "COUNT",
                             };
-                            warn!("    RULE:\n{}", spec.to_sexpr_pretty());
+                            warn!("    RULE:\n{}", spec.to_edn_pretty());
+                            
+                            // Get rate_pps from first action if it's a rate limit
+                            let rate_pps = spec.actions.first().and_then(|a| a.rate_pps());
+                            
                             actions_taken.push(RuleInfo {
                                 rule_type: "tree".to_string(),
                                 value: spec.describe(),
                                 action: action_str.to_string(),
-                                rate_pps: spec.rate_pps,
+                                rate_pps,
                             });
                             rules.insert(rule_key, ActiveRule {
                                 last_seen: Instant::now(),

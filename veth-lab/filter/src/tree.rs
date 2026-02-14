@@ -91,16 +91,15 @@ fn compile_recursive(rules: &[RuleSpec], dim_idx: usize) -> Rc<ShadowNode> {
         };
         // Pick the highest-priority rule as this leaf's action
         if let Some(best) = rules.iter().max_by_key(|r| r.priority) {
-            node.action = Some(ShadowAction {
-                action: match best.action {
-                    RuleAction::Pass => ACT_PASS,
-                    RuleAction::Drop => ACT_DROP,
-                    RuleAction::RateLimit => ACT_RATE_LIMIT,
-                },
-                priority: best.priority,
-                rate_pps: best.rate_pps.unwrap_or(0),
-                rule_id: best.canonical_hash(),
-            });
+            // Use first action for tree node
+            if let Some(first_action) = best.actions.first() {
+                node.action = Some(ShadowAction {
+                    action: first_action.action_type(),
+                    priority: best.priority,
+                    rate_pps: first_action.rate_pps().unwrap_or(0),
+                    rule_id: best.canonical_hash(),
+                });
+            }
         }
         return Rc::new(node);
     }
@@ -146,16 +145,15 @@ fn compile_recursive(rules: &[RuleSpec], dim_idx: usize) -> Rc<ShadowNode> {
         }))
         .collect();
     if let Some(best) = terminating.iter().max_by_key(|r| r.priority) {
-        node.action = Some(ShadowAction {
-            action: match best.action {
-                RuleAction::Pass => ACT_PASS,
-                RuleAction::Drop => ACT_DROP,
-                RuleAction::RateLimit => ACT_RATE_LIMIT,
-            },
-            priority: best.priority,
-            rate_pps: best.rate_pps.unwrap_or(0),
-            rule_id: best.canonical_hash(),
-        });
+        // Use first action for tree node
+        if let Some(first_action) = best.actions.first() {
+            node.action = Some(ShadowAction {
+                action: first_action.action_type(),
+                priority: best.priority,
+                rate_pps: first_action.rate_pps().unwrap_or(0),
+                rule_id: best.canonical_hash(),
+            });
+        }
     }
 
     // Build specific children: ONLY their own rules (no replication here).
@@ -510,11 +508,11 @@ mod tests {
         let rules = vec![
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-                RuleAction::Drop, None,
+                RuleAction::Drop,
             ),
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 123)],
-                RuleAction::Drop, None,
+                RuleAction::Drop,
             ),
         ];
         let tree = compile_tree(&rules);
@@ -536,7 +534,7 @@ mod tests {
             RuleSpec::rate_limit_field(FieldDim::Proto, 17, 1000).with_priority(5),
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-                RuleAction::Drop, None,
+                RuleAction::Drop,
             ).with_priority(10),
         ];
         let tree = compile_tree(&rules);
@@ -605,12 +603,12 @@ mod tests {
     fn test_canonical_hash_idempotent() {
         let spec1 = RuleSpec::compound(
             vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-            RuleAction::Drop, None,
+            RuleAction::Drop,
         );
         let spec2 = RuleSpec::compound(
             // Same constraints in different order
             vec![Predicate::eq(FieldDim::L4Word0, 53), Predicate::eq(FieldDim::Proto, 17)],
-            RuleAction::Drop, None,
+            RuleAction::Drop,
         );
         assert_eq!(spec1.canonical_hash(), spec2.canonical_hash());
     }
@@ -870,7 +868,7 @@ mod tests {
         let rules = vec![
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-                RuleAction::Drop, None,
+                RuleAction::Drop,
             ).with_priority(10),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -904,7 +902,7 @@ mod tests {
             RuleSpec::rate_limit_field(FieldDim::Proto, 17, 1000).with_priority(20),
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-                RuleAction::Drop, None,
+                RuleAction::Drop,
             ).with_priority(5),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -926,7 +924,7 @@ mod tests {
             RuleSpec::rate_limit_field(FieldDim::Proto, 17, 1000).with_priority(5),
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-                RuleAction::Drop, None,
+                RuleAction::Drop,
             ).with_priority(10),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -949,7 +947,7 @@ mod tests {
             RuleSpec::rate_limit_field(FieldDim::Proto, 17, 1000).with_priority(5),
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-                RuleAction::Drop, None,
+                RuleAction::Drop,
             ).with_priority(10),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -967,7 +965,7 @@ mod tests {
         let rules = vec![
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-                RuleAction::Drop, None,
+                RuleAction::Drop,
             ).with_priority(10),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -998,7 +996,7 @@ mod tests {
         // Sentinels
         rules.push(RuleSpec::compound(
             vec![Predicate::eq(FieldDim::Proto, 17), Predicate::eq(FieldDim::L4Word0, 53)],
-            RuleAction::RateLimit, Some(500),
+            RuleAction::RateLimit { pps: 500, name: None },
         ).with_priority(200));
         rules.push(RuleSpec::compound(
             vec![
@@ -1006,7 +1004,7 @@ mod tests {
                 Predicate::eq(FieldDim::TcpFlags, 2),
                 Predicate::eq(FieldDim::L4Word1, 9999),
             ],
-            RuleAction::RateLimit, Some(100),
+            RuleAction::RateLimit { pps: 100, name: None },
         ).with_priority(210));
 
         // Background rules: 100 unique (proto=17, src_addr, dst_port) combos
@@ -1018,7 +1016,7 @@ mod tests {
                     Predicate::eq(FieldDim::SrcIp, ip),
                     Predicate::eq(FieldDim::L4Word1, 8000 + i),
                 ],
-                RuleAction::Drop, None,
+                RuleAction::Drop,
             ).with_priority(100));
         }
 
@@ -1089,11 +1087,11 @@ mod tests {
         let mut rules = vec![
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::L4Word1, 7)],
-                RuleAction::Drop, None,
+                RuleAction::Drop,
             ).with_priority(21),
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::TcpWindow, 11)],
-                RuleAction::RateLimit, Some(1000),
+                RuleAction::RateLimit { pps: 1000, name: None },
             ).with_priority(61),
         ];
         // Dense background
@@ -1104,7 +1102,7 @@ mod tests {
                     Predicate::eq(FieldDim::SrcIp, i),
                     Predicate::eq(FieldDim::DstIp, i + 100),
                 ],
-                RuleAction::Drop, None,
+                RuleAction::Drop,
             ).with_priority(10));
         }
 
@@ -1146,14 +1144,14 @@ mod tests {
         let rules = vec![
             RuleSpec::compound(
                 vec![Predicate::eq(FieldDim::TcpFlags, 2)],
-                RuleAction::Drop, None,
+                RuleAction::Drop,
             ).with_priority(150),
             RuleSpec::compound(
                 vec![
                     Predicate::eq(FieldDim::Proto, 6),
                     Predicate::eq(FieldDim::SrcIp, u32::from_ne_bytes([10, 0, 0, 1])),
                 ],
-                RuleAction::RateLimit, Some(1000),
+                RuleAction::RateLimit { pps: 1000, name: None },
             ).with_priority(100),
         ];
         let flat = flatten_tree(&compile_tree(&rules), 1);
@@ -1198,7 +1196,6 @@ mod tests {
                         Predicate::eq(FieldDim::L4Word1, 8000 + i),
                     ],
                     RuleAction::Drop,
-                    None,
                 ).with_priority(100)
             );
         }
@@ -1261,11 +1258,7 @@ mod tests {
             if all_match && rule.priority >= best_prio {
                 matched = true;
                 best_prio = rule.priority;
-                best_action = match rule.action {
-                    RuleAction::Drop => ACT_DROP,
-                    RuleAction::RateLimit => ACT_RATE_LIMIT,
-                    RuleAction::Pass => ACT_PASS,
-                };
+                best_action = rule.actions.first().map(|a| a.action_type()).unwrap_or(ACT_PASS);
             }
         }
         (matched, best_action, best_prio)
@@ -1282,7 +1275,11 @@ mod tests {
             FieldDim::L4Word0, FieldDim::L4Word1,
             FieldDim::TcpFlags, FieldDim::Ttl, FieldDim::DfBit, FieldDim::TcpWindow,
         ];
-        let actions = [RuleAction::Drop, RuleAction::RateLimit, RuleAction::Pass];
+        let actions = [
+            RuleAction::Drop, 
+            RuleAction::RateLimit { pps: 1000, name: None }, 
+            RuleAction::Pass
+        ];
 
         let mut rng = rand::thread_rng();
         let num_iterations = 50; // 50 random rulesets
@@ -1314,9 +1311,8 @@ mod tests {
                     constraints.push(Predicate::eq(dim, val));
                 }
                 let action = actions[rng.gen_range(0..actions.len())].clone();
-                let rate = if matches!(action, RuleAction::RateLimit) { Some(1000) } else { None };
                 let prio = rng.gen_range(1..=255u8);
-                rules.push(RuleSpec::compound(constraints, action, rate).with_priority(prio));
+                rules.push(RuleSpec::compound(constraints, action).with_priority(prio));
             }
 
             let tree = compile_tree(&rules);
@@ -1349,7 +1345,7 @@ mod tests {
                         }).collect();
                         eprintln!("FAIL iter={}, packet={:?}", iter, packet);
                         for (i, r) in &matching {
-                            eprintln!("  rule[{}] prio={} action={:?} constraints={:?}", i, r.priority, r.action, r.constraints);
+                            eprintln!("  rule[{}] prio={} action={:?} constraints={:?}", i, r.priority, r.actions, r.constraints);
                         }
                         // Re-run with tracing
                         simulate_walk_inner(&flat, &packet, true);
@@ -1388,7 +1384,11 @@ mod tests {
             FieldDim::L4Word0, FieldDim::L4Word1,
             FieldDim::TcpFlags, FieldDim::Ttl, FieldDim::DfBit, FieldDim::TcpWindow,
         ];
-        let actions = [RuleAction::Drop, RuleAction::RateLimit, RuleAction::Pass];
+        let actions = [
+            RuleAction::Drop, 
+            RuleAction::RateLimit { pps: 1000, name: None }, 
+            RuleAction::Pass
+        ];
 
         let mut rng = rand::thread_rng();
         let num_iterations = 50;
@@ -1417,9 +1417,8 @@ mod tests {
                     constraints.push(Predicate::eq(dim, val));
                 }
                 let action = actions[rng.gen_range(0..actions.len())].clone();
-                let rate = if matches!(action, RuleAction::RateLimit) { Some(1000) } else { None };
                 let prio = rng.gen_range(1..=255u8);
-                rules.push(RuleSpec::compound(constraints, action, rate).with_priority(prio));
+                rules.push(RuleSpec::compound(constraints, action).with_priority(prio));
             }
 
             let tree = compile_tree(&rules);
@@ -1450,7 +1449,7 @@ mod tests {
                         }).collect();
                         eprintln!("FAIL iter={}, packet={:?}", iter, packet);
                         for (i, r) in &matching {
-                            eprintln!("  rule[{}] prio={} action={:?} constraints={:?}", i, r.priority, r.action, r.constraints);
+                            eprintln!("  rule[{}] prio={} action={:?} constraints={:?}", i, r.priority, r.actions, r.constraints);
                         }
                         simulate_single_walk_inner(&flat, &packet, true);
                     }
@@ -1529,8 +1528,7 @@ mod tests {
                     Predicate::eq(FieldDim::SrcIp, make_ip(i)),
                     Predicate::eq(FieldDim::L4Word1, 10000 + i),
                 ],
-                RuleAction::RateLimit,
-                Some(1000),
+                RuleAction::RateLimit { pps: 1000, name: None },
             )
         }).collect();
         let flat = stress_compile("scale_100", &rules);
@@ -1545,8 +1543,7 @@ mod tests {
                     Predicate::eq(FieldDim::SrcIp, make_ip(i)),
                     Predicate::eq(FieldDim::L4Word1, 10000 + (i % 55000)),
                 ],
-                RuleAction::RateLimit,
-                Some(1000),
+                RuleAction::RateLimit { pps: 1000, name: None },
             )
         }).collect();
         stress_compile("scale_1k", &rules);
@@ -1560,8 +1557,7 @@ mod tests {
                     Predicate::eq(FieldDim::SrcIp, make_ip(i)),
                     Predicate::eq(FieldDim::L4Word1, 10000 + (i % 55000)),
                 ],
-                RuleAction::RateLimit,
-                Some(1000),
+                RuleAction::RateLimit { pps: 1000, name: None },
             )
         }).collect();
         stress_compile("scale_10k", &rules);
@@ -1576,8 +1572,7 @@ mod tests {
                     Predicate::eq(FieldDim::SrcIp, make_ip(i)),
                     Predicate::eq(FieldDim::L4Word1, 10000 + (i % 55000)),
                 ],
-                RuleAction::RateLimit,
-                Some(1000),
+                RuleAction::RateLimit { pps: 1000, name: None },
             )
         }).collect();
         stress_compile("scale_100k", &rules);
@@ -1617,7 +1612,6 @@ mod tests {
                         Predicate::eq(FieldDim::SrcIp, make_ip(i)),
                     ],
                     RuleAction::Drop,
-                    None,
                 ).with_priority((100 + i) as u8)
             );
         }
@@ -1642,7 +1636,6 @@ mod tests {
                     Predicate::eq(FieldDim::TcpWindow, 65535),
                 ],
                 RuleAction::Drop,
-                None,
             )
         }).collect();
         let flat = stress_compile("full_depth_100", &rules);
@@ -1666,8 +1659,7 @@ mod tests {
                             Predicate::eq(FieldDim::L4Word0, 53 + (i % 100)),
                             Predicate::eq(FieldDim::SrcIp, make_ip(i)),
                         ],
-                        RuleAction::RateLimit,
-                        Some(1000 + i),
+                        RuleAction::RateLimit { pps: 1000 + i, name: None },
                     ).with_priority(prio)
                 }
                 1 => {
@@ -1679,7 +1671,6 @@ mod tests {
                             Predicate::eq(FieldDim::L4Word1, 80 + (i % 50)),
                         ],
                         RuleAction::Drop,
-                        None,
                     ).with_priority(prio)
                 }
                 2 => {
@@ -1690,7 +1681,6 @@ mod tests {
                             Predicate::eq(FieldDim::L4Word1, 9999),
                         ],
                         RuleAction::Drop,
-                        None,
                     ).with_priority(prio)
                 }
                 3 => {
@@ -1702,8 +1692,7 @@ mod tests {
                             Predicate::eq(FieldDim::Ttl, 255),
                             Predicate::eq(FieldDim::DfBit, 0),
                         ],
-                        RuleAction::RateLimit,
-                        Some(500 + i),
+                        RuleAction::RateLimit { pps: 500 + i, name: None },
                     ).with_priority(prio)
                 }
                 _ => {
@@ -1747,8 +1736,7 @@ mod tests {
                         Predicate::eq(FieldDim::SrcIp, make_ip(i)),
                         Predicate::eq(FieldDim::L4Word1, 10000 + i),
                     ],
-                    RuleAction::RateLimit,
-                    Some(1000),
+                    RuleAction::RateLimit { pps: 1000, name: None },
                 )
             }).collect();
 
@@ -1764,8 +1752,7 @@ mod tests {
                         Predicate::eq(FieldDim::SrcIp, make_ip(i)),
                         Predicate::eq(FieldDim::L4Word1, 10000 + (i % 55000)),
                     ],
-                    RuleAction::RateLimit,
-                    Some(1000),
+                    RuleAction::RateLimit { pps: 1000, name: None },
                 )
             }).collect();
 

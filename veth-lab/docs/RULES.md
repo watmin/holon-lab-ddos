@@ -1,6 +1,12 @@
 # Rule Language Reference
 
+**Legacy s-expression format documentation. For the current EDN format, see [EDN-RULES.md](EDN-RULES.md).**
+
+---
+
 **The expression language for defining packet filter rules — what's supported now, how to extend it, and the design philosophy behind raw numbers.**
+
+> **Note:** This document describes the original s-expression format and the theoretical foundations of the rule language. The current production format is EDN (Extensible Data Notation), which provides the same semantics in a more efficient, streaming-friendly format. See [EDN-RULES.md](EDN-RULES.md) for current usage.
 
 ## Philosophy
 
@@ -200,9 +206,11 @@ For deep packet inspection beyond fixed fields:
 
 This would require a new `FieldDim` variant and corresponding eBPF extraction logic. The tree architecture supports it — it's just another dimension.
 
-## JSON Format
+## JSON Format (Legacy)
 
-Rules are loaded from JSON files. The format maps directly to the s-expression structure:
+**Note:** EDN format is now preferred for rule files. JSON is still supported for backward compatibility.
+
+Rules can be loaded from JSON files. The format maps directly to the s-expression structure:
 
 ```json
 [

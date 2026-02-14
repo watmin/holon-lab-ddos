@@ -35,12 +35,45 @@ pub enum RuleType {
     Protocol = 4,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[repr(u8)]
+/// Action to take when a rule matches.
+/// Note: The repr(u8) discriminants are used in eBPF for simple actions.
+/// Complex actions (with names) are handled at compile time in userspace.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RuleAction {
-    Pass = 0,
-    Drop = 1,
-    RateLimit = 2,
+    Pass,
+    Drop,
+    RateLimit { pps: u32, name: Option<String> },
+    Count { name: Option<String> },
+}
+
+impl RuleAction {
+    /// Get the action type as a u8 for eBPF (matches ACT_* constants)
+    pub fn action_type(&self) -> u8 {
+        match self {
+            RuleAction::Pass => ACT_PASS,
+            RuleAction::Drop => ACT_DROP,
+            RuleAction::RateLimit { .. } => ACT_RATE_LIMIT,
+            RuleAction::Count { .. } => 3, // ACT_COUNT (to be added to eBPF later)
+        }
+    }
+
+    /// Get PPS for rate limit actions, None for others
+    pub fn rate_pps(&self) -> Option<u32> {
+        match self {
+            RuleAction::RateLimit { pps, .. } => Some(*pps),
+            _ => None,
+        }
+    }
+
+    /// Get the name if this action has one
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            RuleAction::RateLimit { name, .. } | RuleAction::Count { name } => {
+                name.as_deref()
+            }
+            _ => None,
+        }
+    }
 }
 
 #[repr(C)]
@@ -324,35 +357,49 @@ pub struct EdgeKey {
 
 unsafe impl aya::Pod for EdgeKey {}
 
-/// A rule specification: set of constraints + action.
+/// A rule specification: set of constraints + actions.
 /// Each constraint is a `Predicate` (currently only `Eq`).
 /// Unconstrained dimensions get dont_care bits set (bitmask rete) or wildcard (tree rete).
 #[derive(Debug, Clone)]
 pub struct RuleSpec {
     /// Constraints: each predicate must match for the rule to fire.
     pub constraints: Vec<Predicate>,
-    /// Action to take when all constraints match
-    pub action: RuleAction,
-    /// Rate limit PPS (only for RateLimit action)
-    pub rate_pps: Option<u32>,
+    /// Actions to take when all constraints match (typically one, but supports multiple)
+    pub actions: Vec<RuleAction>,
     /// Priority (0-255, higher = more important). Default 100.
     pub priority: u8,
+    /// Optional comment for documentation (max 256 chars)
+    pub comment: Option<String>,
+    /// Optional label for metrics: [namespace, name] (each max 64 chars)
+    pub label: Option<(String, String)>,
 }
 
 impl RuleSpec {
     /// Create a simple single-field drop rule
     pub fn drop_field(dim: FieldDim, value: u32) -> Self {
-        Self { constraints: vec![Predicate::eq(dim, value)], action: RuleAction::Drop, rate_pps: None, priority: 100 }
+        Self { 
+            constraints: vec![Predicate::eq(dim, value)], 
+            actions: vec![RuleAction::Drop], 
+            priority: 100,
+            comment: None,
+            label: None,
+        }
     }
 
     /// Create a simple single-field rate limit rule
     pub fn rate_limit_field(dim: FieldDim, value: u32, pps: u32) -> Self {
-        Self { constraints: vec![Predicate::eq(dim, value)], action: RuleAction::RateLimit, rate_pps: Some(pps), priority: 100 }
+        Self { 
+            constraints: vec![Predicate::eq(dim, value)], 
+            actions: vec![RuleAction::RateLimit { pps, name: None }], 
+            priority: 100,
+            comment: None,
+            label: None,
+        }
     }
 
     /// Create a compound rule with multiple constraints (all must match)
-    pub fn compound(constraints: Vec<Predicate>, action: RuleAction, rate_pps: Option<u32>) -> Self {
-        Self { constraints, action, rate_pps, priority: 100 }
+    pub fn compound(constraints: Vec<Predicate>, action: RuleAction) -> Self {
+        Self { constraints, actions: vec![action], priority: 100, comment: None, label: None }
     }
 
     /// Create a rule with explicit priority
@@ -361,12 +408,39 @@ impl RuleSpec {
         self
     }
 
+    /// Create a rule with a comment
+    pub fn with_comment(mut self, comment: impl Into<String>) -> Self {
+        let mut comment = comment.into();
+        // Truncate to 256 chars
+        if comment.len() > 256 {
+            comment.truncate(256);
+        }
+        self.comment = Some(comment);
+        self
+    }
+
+    /// Create a rule with a label for metrics (namespace, name)
+    pub fn with_label(mut self, namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        let mut ns = namespace.into();
+        let mut nm = name.into();
+        // Truncate to 64 chars each
+        if ns.len() > 64 {
+            ns.truncate(64);
+        }
+        if nm.len() > 64 {
+            nm.truncate(64);
+        }
+        self.label = Some((ns, nm));
+        self
+    }
+
     /// Compute a stable canonical hash for this rule (for deduplication and rate state keying).
-    /// Excludes rate_pps so the same logical rule with different rates deduplicates.
+    /// Includes sorted constraints, all actions (sorted), and priority.
     pub fn canonical_hash(&self) -> u32 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
+        
         // Sort constraints for canonical ordering (Eq predicates by dim then value)
         let mut sorted: Vec<(u8, u32)> = self.constraints.iter()
             .filter_map(|p| p.as_eq_dim())
@@ -377,7 +451,28 @@ impl RuleSpec {
             dim.hash(&mut hasher);
             val.hash(&mut hasher);
         }
-        (self.action as u8).hash(&mut hasher);
+        
+        // Hash all actions (sorted by type first, then by fields)
+        let mut action_strs: Vec<String> = self.actions.iter().map(|a| {
+            match a {
+                RuleAction::Pass => "pass".to_string(),
+                RuleAction::Drop => "drop".to_string(),
+                RuleAction::RateLimit { pps, name } => {
+                    format!("ratelimit:{}:{}", pps, name.as_deref().unwrap_or(""))
+                }
+                RuleAction::Count { name } => {
+                    format!("count:{}", name.as_deref().unwrap_or(""))
+                }
+            }
+        }).collect();
+        action_strs.sort();
+        for s in &action_strs {
+            s.hash(&mut hasher);
+        }
+        
+        // Hash priority
+        self.priority.hash(&mut hasher);
+        
         // Truncate to u32 (non-zero)
         let h = hasher.finish() as u32;
         if h == 0 { 1 } else { h }
@@ -459,14 +554,148 @@ impl RuleSpec {
             format!("(and {})", clauses.join(" "))
         };
 
-        let rhs = match self.action {
-            RuleAction::Pass => "(pass)".to_string(),
-            RuleAction::Drop => "(drop)".to_string(),
-            RuleAction::RateLimit => format!("(rate-limit {})", self.rate_pps.unwrap_or(0)),
+        // For old-style sexpr, use first action only (backward compat for logging)
+        let rhs = if let Some(first_action) = self.actions.first() {
+            Self::action_to_sexpr(first_action)
+        } else {
+            "(pass)".to_string()
         };
 
         let prio = if self.priority != 100 { Some(self.priority) } else { None };
         (lhs, rhs, prio)
+    }
+
+    /// Format a single action as s-expression
+    fn action_to_sexpr(action: &RuleAction) -> String {
+        match action {
+            RuleAction::Pass => "(pass)".to_string(),
+            RuleAction::Drop => "(drop)".to_string(),
+            RuleAction::RateLimit { pps, name: None } => {
+                format!("(rate-limit {})", pps)
+            }
+            RuleAction::RateLimit { pps, name: Some(n) } => {
+                format!("(rate-limit {} :name \"{}\")", pps, n)
+            }
+            RuleAction::Count { name: None } => {
+                "(count)".to_string()
+            }
+            RuleAction::Count { name: Some(n) } => {
+                format!("(count :name \"{}\")", n)
+            }
+        }
+    }
+
+    /// Emit rule as EDN (compact, single-line format for file storage)
+    ///
+    /// Example: `{:constraints [(= proto 17) (= src-port 53)] :actions [(rate-limit 500)] :priority 190}`
+    pub fn to_edn(&self) -> String {
+        let constraints_str = if self.constraints.is_empty() {
+            "[]".to_string()
+        } else {
+            let clauses: Vec<String> = self.constraints.iter()
+                .map(|p| p.to_sexpr_clause())
+                .collect();
+            format!("[{}]", clauses.join(" "))
+        };
+
+        let actions_str = {
+            let action_exprs: Vec<String> = self.actions.iter()
+                .map(|a| Self::action_to_sexpr(a))
+                .collect();
+            format!("[{}]", action_exprs.join(" "))
+        };
+
+        let priority_str = if self.priority != 100 {
+            format!(" :priority {}", self.priority)
+        } else {
+            String::new()
+        };
+
+        let comment_str = if let Some(ref comment) = self.comment {
+            // Escape quotes in comment
+            let escaped = comment.replace('"', "\\\"");
+            format!(" :comment \"{}\"", escaped)
+        } else {
+            String::new()
+        };
+
+        let label_str = if let Some((ref ns, ref name)) = self.label {
+            let ns_escaped = ns.replace('"', "\\\"");
+            let name_escaped = name.replace('"', "\\\"");
+            format!(" :label [\"{}\" \"{}\"]", ns_escaped, name_escaped)
+        } else {
+            String::new()
+        };
+
+        format!("{{:constraints {} :actions {}{}{}{}}}", constraints_str, actions_str, priority_str, comment_str, label_str)
+    }
+
+    /// Emit rule as EDN (pretty, multi-line format for logs)
+    ///
+    /// Example:
+    /// ```edn
+    /// {:constraints [(= proto 17)
+    ///                (= src-port 53)]
+    ///  :actions     [(rate-limit 500)]
+    ///  :priority    190}
+    /// ```
+    pub fn to_edn_pretty(&self) -> String {
+        let constraint_indent = "               ";  // 15 spaces: align with first ( in ":constraints ["
+        let actions_indent = "              ";      // 14 spaces: align with first ( in " :actions     ["
+        
+        let constraints_str = if self.constraints.is_empty() {
+            "[]".to_string()
+        } else if self.constraints.len() == 1 {
+            format!("[{}]", self.constraints[0].to_sexpr_clause())
+        } else {
+            let clauses: Vec<String> = self.constraints.iter()
+                .map(|p| p.to_sexpr_clause())
+                .collect();
+            let mut s = format!("[{}", clauses[0]);
+            for clause in &clauses[1..] {
+                s.push_str(&format!("\n{}{}", constraint_indent, clause));
+            }
+            s.push(']');
+            s
+        };
+
+        let actions_str = if self.actions.len() == 1 {
+            format!("[{}]", Self::action_to_sexpr(&self.actions[0]))
+        } else {
+            let action_exprs: Vec<String> = self.actions.iter()
+                .map(|a| Self::action_to_sexpr(a))
+                .collect();
+            let mut s = format!("[{}", action_exprs[0]);
+            for expr in &action_exprs[1..] {
+                s.push_str(&format!("\n{}{}", actions_indent, expr));
+            }
+            s.push(']');
+            s
+        };
+
+        if self.priority != 100 || self.comment.is_some() || self.label.is_some() {
+            let mut parts = vec![
+                format!("{{:constraints {}", constraints_str),
+                format!(" :actions     {}", actions_str),
+            ];
+            if self.priority != 100 {
+                parts.push(format!(" :priority    {}", self.priority));
+            }
+            if let Some(ref comment) = self.comment {
+                let escaped = comment.replace('"', "\\\"");
+                parts.push(format!(" :comment     \"{}\"", escaped));
+            }
+            if let Some((ref ns, ref name)) = self.label {
+                let ns_escaped = ns.replace('"', "\\\"");
+                let name_escaped = name.replace('"', "\\\"");
+                parts.push(format!(" :label       [\"{}\" \"{}\"]", ns_escaped, name_escaped));
+            }
+            parts.push("}".to_string());
+            parts.join("\n")
+        } else {
+            format!("{{:constraints {}\n :actions     {}}}",
+                    constraints_str, actions_str)
+        }
     }
 }
 
@@ -687,20 +916,37 @@ impl Rule {
     }
     pub fn to_value(&self) -> RuleValue {
         RuleValue {
-            action: self.action as u8, _pad: [0; 3],
+            action: self.action.action_type(),
+            _pad: [0; 3],
             rate_pps: self.rate_pps.unwrap_or(0),
             tokens: self.rate_pps.unwrap_or(0),
-            last_update_ns: 0, match_count: 0,
+            last_update_ns: 0,
+            match_count: 0,
         }
     }
     pub fn rate_limit_src_ip(ip: Ipv4Addr, pps: u32) -> Self {
-        Self { rule_type: RuleType::SrcIp, value: ip.to_string(), action: RuleAction::RateLimit, rate_pps: Some(pps) }
+        Self { 
+            rule_type: RuleType::SrcIp, 
+            value: ip.to_string(), 
+            action: RuleAction::RateLimit { pps, name: None }, 
+            rate_pps: Some(pps) 
+        }
     }
     pub fn rate_limit_dst_port(port: u16, pps: u32) -> Self {
-        Self { rule_type: RuleType::DstPort, value: port.to_string(), action: RuleAction::RateLimit, rate_pps: Some(pps) }
+        Self { 
+            rule_type: RuleType::DstPort, 
+            value: port.to_string(), 
+            action: RuleAction::RateLimit { pps, name: None }, 
+            rate_pps: Some(pps) 
+        }
     }
     pub fn rate_limit_src_port(port: u16, pps: u32) -> Self {
-        Self { rule_type: RuleType::SrcPort, value: port.to_string(), action: RuleAction::RateLimit, rate_pps: Some(pps) }
+        Self { 
+            rule_type: RuleType::SrcPort, 
+            value: port.to_string(), 
+            action: RuleAction::RateLimit { pps, name: None }, 
+            rate_pps: Some(pps) 
+        }
     }
 }
 
@@ -893,7 +1139,10 @@ impl VethFilter {
                     RuleType::Protocol => (key.value as u8).to_string(),
                 };
                 let action = match value.action {
-                    0 => RuleAction::Pass, 1 => RuleAction::Drop, 2 => RuleAction::RateLimit, _ => continue,
+                    0 => RuleAction::Pass,
+                    1 => RuleAction::Drop,
+                    2 => RuleAction::RateLimit { pps: value.rate_pps, name: None },
+                    _ => continue,
                 };
                 result.push((Rule { rule_type, value: value_str, action, rate_pps: if value.rate_pps > 0 { Some(value.rate_pps) } else { None } }, value.match_count));
             }
@@ -977,10 +1226,13 @@ impl VethFilter {
         {
             let mut meta_map: Array<_, RuleMeta> = bpf
                 .map_mut("RULE_META").context("RULE_META not found")?.try_into()?;
+            
+            // Use first action for legacy rete engine
+            let first_action = spec.actions.first().unwrap_or(&RuleAction::Pass);
             meta_map.set(bit, RuleMeta {
-                action: spec.action as u8,
+                action: first_action.action_type(),
                 _pad: [0; 3],
-                rate_pps: spec.rate_pps.unwrap_or(0),
+                rate_pps: first_action.rate_pps().unwrap_or(0),
             }, 0)?;
         }
 
@@ -1031,8 +1283,8 @@ impl VethFilter {
         }
 
         // 6. Create rate state if needed
-        if spec.action == RuleAction::RateLimit {
-            if let Some(pps) = spec.rate_pps {
+        if let Some(first_action) = spec.actions.first() {
+            if let Some(pps) = first_action.rate_pps() {
                 let mut rate_state: HashMap<_, u32, TokenBucket> = bpf
                     .map_mut("RATE_STATE").context("RATE_STATE not found")?.try_into()?;
                 rate_state.insert(bit, TokenBucket { rate_pps: pps, tokens: pps, last_update_ns: 0 }, 0)?;
@@ -1205,7 +1457,8 @@ mod tests {
         let spec = RuleSpec::drop_field(FieldDim::Proto, 17);
         assert_eq!(spec.constraints.len(), 1);
         assert_eq!(spec.constraints[0], Predicate::eq(FieldDim::Proto, 17));
-        assert_eq!(spec.action, RuleAction::Drop);
+        assert_eq!(spec.actions.len(), 1);
+        assert_eq!(spec.actions[0], RuleAction::Drop);
         assert!(!spec.needs_phase2());
     }
 
@@ -1216,13 +1469,12 @@ mod tests {
                 Predicate::eq(FieldDim::SrcIp, 0x0A000001),
                 Predicate::eq(FieldDim::L4Word1, 9999),
             ],
-            RuleAction::RateLimit,
-            Some(5000),
+            RuleAction::RateLimit { pps: 5000, name: None },
         );
         assert_eq!(spec.constraints.len(), 2);
         assert!(!spec.needs_phase2());
-        assert_eq!(spec.action, RuleAction::RateLimit);
-        assert_eq!(spec.rate_pps, Some(5000));
+        assert_eq!(spec.actions.len(), 1);
+        assert_eq!(spec.actions[0], RuleAction::RateLimit { pps: 5000, name: None });
     }
 
     #[test]
@@ -1233,7 +1485,6 @@ mod tests {
                 Predicate::eq(FieldDim::TcpFlags, 0x02), // SYN
             ],
             RuleAction::Drop,
-            None,
         );
         assert!(spec.needs_phase2());
     }
@@ -1246,7 +1497,6 @@ mod tests {
                 Predicate::eq(FieldDim::L4Word1, 80),
             ],
             RuleAction::Drop,
-            None,
         );
         let desc = spec.describe();
         assert_eq!(desc, "((and (= proto 6) (= dst-port 80)) => (drop))");
@@ -1263,8 +1513,7 @@ mod tests {
         let ip = u32::from_ne_bytes([10, 0, 0, 100]);
         let spec = RuleSpec::compound(
             vec![Predicate::eq(FieldDim::SrcIp, ip), Predicate::eq(FieldDim::L4Word1, 9999)],
-            RuleAction::RateLimit,
-            Some(1906),
+            RuleAction::RateLimit { pps: 1906, name: None },
         );
         assert_eq!(
             spec.to_sexpr(),
@@ -1285,8 +1534,7 @@ mod tests {
     fn test_sexpr_pass() {
         let spec = RuleSpec {
             constraints: vec![],
-            action: RuleAction::Pass,
-            rate_pps: None,
+            actions: vec![RuleAction::Pass],
             priority: 100,
         };
         assert_eq!(spec.to_sexpr(), "(() => (pass))");
@@ -1301,8 +1549,7 @@ mod tests {
                 Predicate::eq(FieldDim::SrcIp, ip),
                 Predicate::eq(FieldDim::L4Word1, 9999),
             ],
-            RuleAction::RateLimit,
-            Some(1906),
+            RuleAction::RateLimit { pps: 1906, name: None },
         );
         let pretty = spec.to_sexpr_pretty();
         assert_eq!(pretty,

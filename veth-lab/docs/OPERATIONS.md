@@ -71,7 +71,7 @@ sudo ./target/release/veth-sidecar \
     --interface veth-filter \
     --enforce \
     --rate-limit \
-    --rules-file veth-lab/scenarios/rules-50k.json \
+    --rules-file veth-lab/scenarios/rules-50k.edn \
     --warmup-windows 15 \
     --warmup-packets 1500 \
     --sample-rate 100 \
@@ -105,7 +105,7 @@ The generator sends a mix of normal traffic and attack phases (UDP amplification
 | `--warmup-packets` | `500` | Minimum packets during warmup to establish baseline |
 | `--sample-rate` | `100` | Sample 1-in-N packets (100 = 1%) |
 | `--perf-pages` | `4` | Perf buffer pages per CPU (4 = 16KB) |
-| `--rules-file` | none | Path to JSON rules file to pre-load |
+| `--rules-file` | none | Path to rule file (EDN or JSON, auto-detected) |
 | `--log-dir` | `logs` | Directory for log files |
 
 ### Tuning Guidelines
@@ -200,21 +200,26 @@ tc_try:48095 tc_fail:48095 ← tc_try == tc_fail: ProgramArray empty
 ## Generating Rule Files
 
 ```bash
-# 10K rules
-python3 veth-lab/scripts/generate_ruleset.py --count 10000 --output veth-lab/scenarios/rules-10k.json
+# 10K rules (EDN format - recommended)
+python3 veth-lab/scripts/generate_ruleset_edn.py --count 10000 --output veth-lab/scenarios/rules-10k.edn
 
 # 50K rules
-python3 veth-lab/scripts/generate_ruleset.py --count 50000 --output veth-lab/scenarios/rules-50k.json
+python3 veth-lab/scripts/generate_ruleset_edn.py --count 50000 --output veth-lab/scenarios/rules-50k.edn
 
-# 1M rules
-python3 veth-lab/scripts/generate_ruleset.py --count 1000000 --output veth-lab/scenarios/rules-1m.json
+# 1M rules (streaming parser handles it easily)
+python3 veth-lab/scripts/generate_ruleset_edn.py --count 1000000 --output veth-lab/scenarios/rules-1m.edn
+
+# Legacy JSON format (still supported)
+python3 veth-lab/scripts/generate_ruleset.py --count 10000 --output veth-lab/scenarios/rules-10k.json
 ```
 
 Generated files contain:
 - 4 **sentinel rules** matching test traffic patterns (UDP amplification, SYN flood)
 - N-4 **background rules** with unique (proto, src-addr, dst-port) triples
 
-The `.gitignore` excludes `rules-*.json` — regenerate locally as needed.
+**Performance:** EDN format is 40% smaller and parses 1M rules in ~2.7 seconds (streaming).
+
+The `.gitignore` excludes `rules-*` — regenerate locally as needed.
 
 ## Debugging with bpftool
 
@@ -353,9 +358,10 @@ holon-lab-ddos/
 │   │   ├── build.sh          #   Build everything
 │   │   ├── setup.sh          #   Create veth pair
 │   │   ├── demo.sh           #   Run full demo
-│   │   └── generate_ruleset.py  # Generate large JSON rule files
+│   │   ├── generate_ruleset_edn.py  # Generate EDN rule files (current)
+│   │   └── generate_ruleset.py      # Generate JSON (legacy)
 │   ├── scenarios/            # Rule files (generated, git-ignored)
-│   │   └── rules-*.json
+│   │   └── rules-*.{edn,json}
 │   ├── docs/                 # Documentation
 │   │   ├── PROGRESS.md       #   Timeline and results
 │   │   ├── RETE.md           #   Rete theory mapping
