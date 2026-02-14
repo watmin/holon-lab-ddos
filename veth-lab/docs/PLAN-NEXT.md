@@ -3,433 +3,132 @@
 **Planning document for implementation. Each section is a self-contained spec
 that can be handed to a capable model for implementation.**
 
----
-
-## ✅ 1. RHS Syntax Redesign [COMPLETED 2026-02-13]
-
-**Status:** ✅ Implemented and deployed. See `docs/COMMIT-EDN-IMPLEMENTATION.md` for details.
-
-### Implementation Summary
-
-Successfully implemented EDN-style rule syntax with:
-- ✅ Actions as vector: `{:actions [(rate-limit 500)]}`
-- ✅ Named rate limiters supported: `(rate-limit 500 :name "dns")`
-- ✅ Count action: `(count :name "attacks")`
-- ✅ Multiple actions: `{:actions [(rate-limit 500) (count)]}`
-- ✅ Pretty-print formatting for logs
-- ✅ Streaming parser (1M rules in 2.74s)
-- ✅ 40% smaller files vs JSON
-- ✅ Backward compatible with JSON
-
-### Performance
-- **Parse time**: 2.74s for 1M rules
-- **File size**: 887KB vs 1.5MB (40% reduction) for 10K rules
-- **Tree compilation**: 2M nodes for 1M rules
-- **Memory**: Streaming (constant memory usage)
-
-### Original Design Problem
-
-The current s-expression RHS feels noisy and the `:priority` tacked on after
-the action is awkward:
-
-```
-((and (= proto 17) (= src-port 53)) => (rate-limit 1906) :priority 210)
-```
-
-Priority isn't part of the action — it's metadata about the rule itself. And as
-we add more metadata (named limiters, tags, counters), the flat keyword args
-after `=>` will become a mess.
-
-### Proposed: EDN-Style RHS
-
-Move to a map-like RHS where actions and metadata are clearly separated:
-
-```clojure
-((and (= proto 17) (= src-port 53))
- =>
- {:action  (rate-limit 1906)
-  :priority 210})
-```
-
-Or with named rate limiter:
-
-```clojure
-((and (= proto 17) (= src-port 53))
- =>
- {:action   (rate-limit 1906 :name "amplification")
-  :priority 210})
-```
-
-Or with multiple actions (rate-limit + count):
-
-```clojure
-((and (= proto 6) (= tcp-flags 2))
- =>
- {:actions  [(rate-limit 500 :name "syn-flood") (count :name "syn-attempts")]
-  :priority 200})
-```
-
-### Key Design Decisions
-
-1. **Single action vs action list:** Go with `:actions [...]` (plural, list).
-   Even if most rules have one action, the list form is forward-compatible.
-   If only one action, allow the shorthand `:action (rate-limit ...)` (singular).
-
-2. **Priority lives in the map**, not as a trailing keyword. Default 100 if omitted.
-
-3. **The map is the RHS.** The `=>` always points to a `{...}` map. No bare
-   `(drop)` after `=>` anymore. Migration: `(drop)` becomes `{:action (drop)}`.
-
-### Implementation
-
-**Files to change:**
-
-- `filter/src/lib.rs` — `RuleSpec::to_sexpr()`, `to_sexpr_pretty()`, `sexpr_parts()`
-- `sidecar/src/main.rs` — Anywhere rules are logged or formatted
-- `sidecar/src/main.rs` — `parse_rules_file()` JSON parsing (add optional `name` field)
-
-**Struct changes:**
-
-```rust
-pub struct RuleSpec {
-    pub constraints: Vec<Predicate>,
-    pub actions: Vec<RuleAction>,    // was: pub action: RuleAction
-    pub priority: u8,
-}
-
-pub enum RuleAction {
-    Pass,
-    Drop,
-    RateLimit { pps: u32, name: Option<String> },
-    Count { name: Option<String> },            // NEW
-}
-```
-
-**Canonical hash:** Must include ALL actions (sorted) + priority. Named rate
-limiters share the same bucket key derived from the name, not the rule hash.
+**Last updated:** 2026-02-14
 
 ---
 
-## ✅ 2. Named Rate Limiters (Shared Buckets) [COMPLETED 2026-02-13]
+# Part I — Completed Work
 
-**Status:** ✅ Implemented and tested with namespaced bucket names.
+## ✅ 1. EDN Rule Language & RHS Syntax [COMPLETED 2026-02-13]
 
-### Implementation Summary
+**See:** `docs/COMMIT-EDN-IMPLEMENTATION.md` for full details.
 
-Successfully implemented namespaced rate limiter buckets with:
-- ✅ `bucket_key()` method on `RuleSpec` for computing bucket keys
-- ✅ Named buckets use `[namespace, name]` tuple format
-- ✅ Bucket key derived by hashing namespace + name
-- ✅ Unnamed buckets use rule's canonical hash (per-rule behavior)
-- ✅ Tree compilation uses `bucket_key()` instead of `canonical_hash()` for rate limiters
-- ✅ PPS conflict handling: last-defined value wins, with warning
-- ✅ Test rules generated and verified (5 buckets from 10 rate-limit rules)
+### What Was Done
+
+Migrated from JSON to EDN as the primary rule format, with a clean map-based
+RHS syntax separating actions from metadata.
+
+- **EDN parser** via `edn-rs` with auto-detection (JSON still supported)
+- **Streaming parser**: 1M rules in 2.74s, constant memory
+- **File size**: 40% smaller than JSON (887KB vs 1.5MB for 10K rules)
+- **RHS as map**: `{:actions [(rate-limit 500)] :priority 200}`
+- **Multiple actions per rule**: `{:actions [(rate-limit 500) (count)]}`
+- **Pretty-print formatting** for logs
+
+### Rule Syntax
+
+```clojure
+;; Full rule with all features
+{:constraints [(= proto 6)
+               (= tcp-flags 2)]
+ :actions     [(rate-limit 500 :name ["game" "syn-limit"])
+               (count :name ["monitoring" "syn-attempts"])]
+ :priority    200}
+```
+
+**Files changed:** `sidecar/Cargo.toml`, `sidecar/src/main.rs`,
+`filter/src/lib.rs`
+
+---
+
+## ✅ 2. Named Rate Limiters & Compound Naming [COMPLETED 2026-02-13]
+
+### What Was Done
+
+Implemented namespaced shared rate limiter buckets and extended compound
+naming to all four action types (pass, drop, rate-limit, count).
+
+- **Compound names**: `:name ["namespace" "name"]` tuple format
+- **Shared buckets**: Rules with same name share one token bucket
+- **Bucket key**: `hash(namespace + name)` for named, `canonical_hash()` for unnamed
+- **PPS conflict handling**: Last-defined value wins, with warning
+- **All actions support `:name`**: pass, drop, rate-limit, count
 
 ### Behavior
 
-**Named buckets** (namespaced):
-- Format: `:name ["namespace", "name"]` (MUST be 2-tuple)
-- All rules with same namespace+name share one token bucket
-- Bucket key = hash(namespace + name)
-- Example: `["attack", "dns-amp"]` - all rules with this share tokens
-
-**Unnamed buckets** (per-rule):
-- Format: no `:name` field
-- Each rule gets its own token bucket
-- Bucket key = rule's canonical hash
-- Traditional behavior (backward compatible)
-
-When multiple rules share the same named bucket:
-1. They all reference the same token bucket in the eBPF map
-2. Tokens are shared across all rules with that name
-3. If PPS values differ, the last-defined value wins (with warning)
-
-### Example
-
 ```edn
-;; These three rules share the ["attack", "dns-amp"] bucket
-{:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.100")] 
- :actions [(rate-limit 1000 :name ["attack", "dns-amp"])]}
+;; Three rules share the ["attack" "dns-amp"] bucket
+{:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.100")]
+ :actions [(rate-limit 1000 :name ["attack" "dns-amp"])]}
 
-{:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.101")] 
- :actions [(rate-limit 1000 :name ["attack", "dns-amp"])]}
+{:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.101")]
+ :actions [(rate-limit 1000 :name ["attack" "dns-amp"])]}
 
-{:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.102")] 
- :actions [(rate-limit 1000 :name ["attack", "dns-amp"])]}
-
-;; Different namespace - separate bucket
-{:constraints [(= proto 17) (= dst-port 123) (= src-addr "10.0.0.110")] 
- :actions [(rate-limit 500 :name ["attack", "ntp-amp"])]}
-
-;; This rule has its own per-rule bucket (unnamed)
-{:constraints [(= proto 17) (= src-addr "10.0.0.200")] 
+;; Per-rule bucket (unnamed, backward compatible)
+{:constraints [(= proto 17) (= src-addr "10.0.0.200")]
  :actions [(rate-limit 100)]}
 ```
 
-Result: 3 buckets (["attack", "dns-amp"], ["attack", "ntp-amp"], and 1 unnamed).
+**Suggested namespaces:** `"attack"`, `"monitor"`, `"test"`, `"manual"`
 
-### Namespace Organization
-
-Suggested namespaces:
-- `"attack"` - shared limits for attack mitigation rules
-- `"monitor"` - counting/monitoring actions
-- `"test"` - temporary test rules
-- `"manual"` - operator-defined rules
-
----
-
-## 3. Attack Pattern Library (Holon-Generated Rules)
-
-### Problem
-
-Currently, each rule has its own token bucket keyed by the rule's canonical
-hash. If a SYN flood and a DNS reflection happen simultaneously, their rate
-limiters are independent — each gets its own PPS budget. The operator may want
-a single shared budget: "total inbound attack traffic shall not exceed X PPS."
-
-### Design
-
-**Named buckets.** A rate-limit action can include a `:name` string. All rules
-sharing the same name share the same token bucket.
-
-```clojure
-;; Both rules deplete from the same "inbound-attack" bucket
-((and (= proto 6) (= tcp-flags 2))
- =>
- {:action (rate-limit 1000 :name "inbound-attack"), :priority 200})
-
-((and (= proto 17) (= src-port 53))
- =>
- {:action (rate-limit 1000 :name "inbound-attack"), :priority 190})
-```
-
-If a packet matches the SYN rule and consumes a token, fewer tokens remain for
-the DNS rule's packets. Combined attack rate is capped at 1000 PPS total.
-
-**Unnamed buckets** (current behavior) use the rule's canonical hash as the
-bucket key. Nothing changes for existing rules.
-
-### Implementation
-
-**Bucket key derivation:**
-
-```rust
-fn bucket_key(action: &RuleAction) -> u32 {
-    match action {
-        RuleAction::RateLimit { name: Some(name), .. } => {
-            // Named: hash the name string to get a stable u32 key
-            let mut hasher = DefaultHasher::new();
-            name.hash(&mut hasher);
-            (hasher.finish() & 0xFFFFFFFF) as u32
-        }
-        RuleAction::RateLimit { name: None, pps } => {
-            // Unnamed: use rule canonical hash (existing behavior)
-            rule.canonical_hash() as u32
-        }
-        _ => 0, // non-rate-limit actions don't have buckets
-    }
-}
-```
-
-**eBPF side:** No changes needed. The eBPF `TreeNode` already stores
-`rule_id: u32` which is used as the `TREE_RATE_STATE` key. The compiler just
-needs to set `rule_id` to the named bucket key instead of the rule hash.
-
-**Compiler changes (`tree.rs`):**
-
-- When flattening a `TreeNode` with a rate-limit action, set
-  `flat_node.rule_id = bucket_key(action)` instead of `canonical_hash`
-- When inserting into `rate_buckets`, key by `bucket_key` and use the PPS
-  from the action (all rules sharing a name should specify the same PPS — warn
-  if they disagree, use the max)
-
-**Files to change:**
-
-- `filter/src/lib.rs` — `RuleAction` enum, `RuleSpec` struct, bucket key fn
-- `filter/src/tree.rs` — `flatten_tree()` to use bucket key
-- `sidecar/src/main.rs` — JSON parsing for `name` field
-
-### Edge Cases
-
-- **Conflicting PPS:** Two rules name the same bucket but specify different PPS.
-  Resolution: use the maximum PPS and log a warning. The operator likely wants
-  the more generous limit to apply.
-
-- **Holon-generated rules:** Auto-generated rules should NOT use named buckets
-  (they don't know about operator naming conventions). They continue to use
-  per-rule buckets keyed by canonical hash.
+**Files changed:** `filter/src/lib.rs` (`bucket_key()`, `RuleAction` enum),
+`filter/src/tree.rs`, `sidecar/src/main.rs`
 
 ---
 
 ## ✅ 3. Count Action (Non-Terminating) [COMPLETED 2026-02-13]
 
-**Status:** ✅ Implemented and tested.
+### What Was Done
 
-### Implementation Summary
+Added non-terminating Count actions that increment a counter without
+stopping the DFS walk. Packets continue to be evaluated against other rules.
 
-Successfully implemented non-terminating Count actions:
-- ✅ Added `ACT_COUNT = 3` constant to both userspace and eBPF
-- ✅ Added `TREE_COUNTERS` HashMap in eBPF for counter storage (100k max)
-- ✅ Modified `tree_walk_step` to handle Count as non-terminating
-- ✅ Count actions increment counter but don't stop DFS walk
-- ✅ Uses namespaced names like rate limiters: `["namespace", "name"]`
+- **`ACT_COUNT = 3`** in eBPF
+- **`TREE_COUNTERS: HashMap<u32, u64>`** (100k max entries)
+- **Non-terminating**: Increment counter, don't compete on priority, keep walking
+- **Named counters**: `(count :name ["monitor" "syn-packets"])`
 
-### Behavior
+### eBPF Logic
 
-**Count actions are non-terminating:**
-- When a Count node is matched, the counter is incremented
-- The DFS continues walking - other rules can still match
-- Count actions don't compete on priority with terminating actions
-- Perfect for observability without affecting packet forwarding
-
-**Example:**
-```edn
-;; Count all SYN packets (non-terminating)
-{:constraints [(= proto 6) (= tcp-flags 2)]
- :actions [(count :name ["monitor", "syn-packets"])]}
-
-;; Separately, rate-limit SYN floods to port 9999 (terminating)
-{:constraints [(= proto 6) (= tcp-flags 2) (= dst-port 9999)]
- :actions [(rate-limit 100)]
- :priority 200}
-```
-
-Result: Every SYN packet increments the counter. SYN packets to port 9999 ALSO hit the rate-limiter.
-
-### Counter Storage
-
-- **eBPF Map**: `TREE_COUNTERS: HashMap<u32, u64>` (100k max entries)
-- **Key**: Hash of `[namespace, name]` tuple (same as rate limiter buckets)
-- **Value**: Packet count (u64)
-- **Userspace**: Can read `TREE_COUNTERS` for observability (future enhancement)
-
-### Implementation Details
-
-**eBPF `tree_walk_step` logic:**
 ```rust
-if node.has_action != 0 {
-    if node.action == ACT_COUNT {
-        // Non-terminating: increment and continue
-        TREE_COUNTERS.increment(node.rule_id);
-        // Don't update best_action - keep walking
-    } else if node.priority >= state.best_prio {
-        // Terminating: compete on priority
-        state.best_action = node.action;
-        state.best_prio = node.priority;
-    }
+if node.action == ACT_COUNT {
+    // Non-terminating: increment and continue
+    TREE_COUNTERS.increment(node.rule_id);
+    // Don't update best_action — keep walking
+} else if node.priority >= state.best_prio {
+    // Terminating: compete on priority
+    state.best_action = node.action;
+    state.best_prio = node.priority;
 }
 ```
 
-All tests pass. Ready for production use.
+**Files changed:** `filter-ebpf/src/main.rs`, `filter/src/lib.rs`,
+`filter/src/tree.rs`, `sidecar/src/main.rs`
 
 ---
 
-## 4. Predicate Extensions
+## ✅ 4. Predicate Extensions [COMPLETED 2026-02-14]
 
-### Problem
+### ✅ 4a. Range Predicates (Gt, Lt, Gte, Lte)
 
-Currently all actions are terminating — a matched rule produces PASS, DROP, or
-RATE_LIMIT. There's no way to say "count how many packets match this pattern"
-without affecting forwarding.
+Implemented with eBPF runtime evaluation (node annotation, not expansion).
 
-### Design
+- **Range edge slots**: Each `TreeNode` has up to 2 range edge slots
+  (`range_op_0/1`, `range_val_0/1`, `range_child_0/1`)
+- **3-way partitioning** at each dimension: Eq → specific edges, Range → range
+  edges, unconstrained → wildcard child
+- **No expansion**: `(> dst-port 1000)` is a single range edge, not 64K rules
+- **Live tested** with ~27M packets, 42 tests pass
 
-**`(count)` is a non-terminating action.** It increments a counter but does NOT
-stop the DFS walk. The packet continues being evaluated against other rules.
+### ✅ 4b. Bitmask & Byte Matching Predicates
 
-```clojure
-;; Count SYN packets without dropping them
-((and (= proto 6) (= tcp-flags 2))
- =>
- {:action (count :name "syn-packets")})
+What started as a simple bitmask predicate evolved into a comprehensive
+three-tiered matching system.
 
-;; Separately, rate-limit actual attacks
-((and (= proto 6) (= tcp-flags 2) (= dst-port 9999))
- =>
- {:action (rate-limit 100), :priority 200})
-```
-
-### Implementation Approach
-
-**eBPF side:**
-
-New action type `ACT_COUNT = 3`. In `tree_walk_step`, when a terminal node has
-`action == ACT_COUNT`:
-1. Increment the counter in a new `TREE_COUNTERS` map (HashMap<u32, u64>,
-   keyed by counter name hash)
-2. Do NOT set `best_action` or update priority — the count doesn't compete
-   with terminating actions
-3. Continue the DFS (don't stop walking)
-
-**New BPF map:**
-
-```rust
-static TREE_COUNTERS: HashMap<u32, u64> = HashMap::with_max_entries(100_000, 0);
-```
-
-**Userspace reads:** Sidecar can read `TREE_COUNTERS` to report counts per
-named counter. This is observability-only — no enforcement effect.
-
-**DFS change:** Currently `tree_walk_step` updates `best_action` when
-`node.has_action && node.priority > best_prio`. For count nodes, skip the
-priority comparison and just increment the counter. The node should still be
-"terminal" (has_action = true) so the DFS knows it found something, but the
-count action should not participate in conflict resolution.
-
-Simplest approach: add a flag `ACT_COUNT` that the DFS recognizes as
-"increment and continue" rather than "record as candidate."
-
-**Files to change:**
-
-- `filter-ebpf/src/main.rs` — Add `ACT_COUNT`, `TREE_COUNTERS` map, handle in `tree_walk_step`
-- `filter/src/lib.rs` — Add `RuleAction::Count`, update `ACT_*` constants
-- `filter/src/tree.rs` — Compiler handles count nodes (same as other actions in tree structure)
-- `sidecar/src/main.rs` — Read and log counter values
-
----
-
-## 4. Predicate Extensions
-
-### Status
-
-The `Predicate` enum already has placeholder comments for all planned variants.
-The tree architecture supports them — each is a new way to test a field value
-at a tree node.
-
-### ✅ 4a. Range Predicates (Gt, Lt, Gte, Lte) [COMPLETED 2026-02-14]
-
-**Status:** ✅ Implemented with eBPF runtime evaluation (Approach B: node annotation).
-
-**Implementation:** Range predicates are a third type of edge in the decision tree,
-alongside specific edges and wildcard children. Each `TreeNode` has up to 2 range
-edge slots (`range_op_0/1`, `range_val_0/1`, `range_child_0/1`). The eBPF DFS
-walker evaluates `packet_value OP threshold` at runtime and pushes matching range
-children onto the stack. Priority competition is handled naturally by the existing
-best-match DFS logic.
-
-Key design: `compile_recursive` does 3-way partitioning at each dimension:
-- Eq predicates → specific edges (HashMap lookup)
-- Range predicates → range edges (runtime comparison)
-- No constraint → wildcard child
-
-No expansion needed — `(> dst-port 1000)` is a single range edge, not 64K rules.
-Verified with eBPF verifier, 42 tests pass, live tested with ~27M packets.
-
-### ✅ 4b. Bitmask & Byte Matching Predicates [COMPLETED 2026-02-14]
-
-**Status:** ✅ Implemented far beyond the original spec. What started as a simple
-bitmask predicate evolved into a comprehensive three-tiered matching system.
-
-#### Implementation Summary
-
-The original `(mask tcp-flags 2)` with `!= 0` semantics was replaced with
-**`MaskEq`** using `(value & mask) == expected` semantics, which is strictly
-more powerful. This was then extended to support arbitrary L4 byte matching.
-
-**Three-tiered matching system:**
+**Three tiers:**
 
 1. **`MaskEq` guard edges** on pre-extracted fields (1-2 bytes).
-   Reuses range edge slots with `RANGE_OP_MASK_EQ = 5`.
+   `(value & mask) == expected` semantics via `RANGE_OP_MASK_EQ = 5`.
    - `(mask-eq <field> <mask> <expected>)` — generic on any field
    - `(protocol-match <match> <mask>)` — sugar for protocol field
    - `(tcp-flags-match <match> <mask>)` — sugar for TCP flags field
@@ -441,483 +140,99 @@ more powerful. This was then extended to support arbitrary L4 byte matching.
 
 3. **`PatternGuard` edges** referencing `BYTE_PATTERNS` BPF map (5-64 bytes).
    Byte-by-byte comparison against pre-copied `DfsState.pattern_data`.
-   Match/mask bytes are pre-shifted at compile time to avoid runtime offset
-   arithmetic (eBPF verifier compliance).
+   Match/mask bytes are pre-shifted at compile time for verifier compliance.
    - `(l4-match <offset> "<hex-match>" "<hex-mask>")` where len 5-64
 
 **Key eBPF innovations:**
-- `DfsState.pattern_data: [u8; 64]` — pre-copies transport payload in
-  `veth_filter` (which has verified packet access) so `tree_walk_step`
-  can match without raw packet pointer issues
-- Custom dimensions extracted from `pattern_data` via `extract_custom_dim_from_data`
-  (avoids variable-offset packet access that the verifier rejects)
-- Pre-shifted `BytePattern.match_bytes` and `mask_bytes` eliminate runtime
-  offset arithmetic in `check_byte_pattern`
+- `DfsState.pattern_data: [u8; 64]` — pre-copies transport payload
+- Custom dimensions extracted via `extract_custom_dim_from_data`
+- Pre-shifted `BytePattern` eliminates runtime offset arithmetic
+- `BTreeSet` for deterministic custom dimension assignment (stable `rule_id`s)
 
-**Per-rule metrics and manifest:**
-- All action types (PASS, DROP, RATE-LIMIT, COUNT) support `:name ["ns" "metric"]`
-- DROP and PASS actions increment `TREE_COUNTERS` for per-rule attribution
+### ✅ 4c. Set Membership (In)
+
+`(in src-port 53 123 5353)` works via compile-time expansion into multiple
+Eq rules. The DAG compiler's Rc sharing ensures the shared child subtree
+is not duplicated. Zero eBPF changes.
+
+### ✅ Per-Rule Metrics Manifest
+
+All action types support `:name` and per-rule counter attribution.
+
+- **DROP and PASS** actions increment `TREE_COUNTERS` for per-rule attribution
 - Compiler returns authoritative `RuleManifestEntry` manifest mapping
   `rule_id` to action type and label
-- `resolve_l4byte_refs` uses `BTreeSet` for deterministic custom dimension
-  assignment, ensuring stable `rule_id`s across recompilations
+- Sidecar reports separate sections for Count, Rate-Limit, Drop, and Pass actions
 
 **Comprehensive integration test:** 9 rules covering every predicate type
 and every action variant, verified with live traffic across 3 traffic types.
 See `veth-lab/scenarios/comprehensive-predicate-test.edn`.
 
-### ✅ 4c. Set Membership (In) [COMPLETED 2026-02-13]
-
-**Status:** ✅ Implemented. `(in src-port 53 123 5353)` works via compile-time
-expansion into multiple Eq rules. The DAG compiler's Rc sharing ensures the
-shared child subtree is not duplicated. Zero eBPF changes.
-
-### 4d. Negation (Not)
-
-**Example:** `(not (= proto 6))` — match anything that's NOT TCP.
-
-**Compilation:** Tricky. The tree structure is built around "follow the edge
-that matches." Negation means "follow all edges EXCEPT this one." Options:
-
-1. **Expansion:** For `(not (= proto 6))`, expand to `(in proto 1 17 ...)` —
-   all proto values except 6. Only works for small-domain fields.
-
-2. **Wildcard with exclusion:** The DFS already follows wildcard branches.
-   A negation could be compiled as "this rule lives in the wildcard subtree
-   but has an exclusion list." The DFS would need to check exclusions.
-
-3. **Inversion flag on edges:** An edge with `inverted: true` means "follow
-   this edge for any value EXCEPT the one specified."
-
-**Recommendation:** Defer negation. It's the most complex to get right and
-the least common use case. When needed, expansion (option 1) works for
-small-domain fields (proto, df_bit). For large-domain fields (ports, IPs),
-negation is better handled by priority — have a specific-match rule at higher
-priority and a wildcard catch-all at lower priority.
-
-### 4e. Disjunction (Or)
-
-**Example:** `(or (= proto 6) (= proto 17))` — match TCP or UDP.
-
-**Compilation:** An OR of predicates on the same field is equivalent to set
-membership: `(or (= proto 6) (= proto 17))` = `(in proto 6 17)`. Implement
-`In` first.
-
-An OR across different fields is harder: `(or (= proto 6) (= dst-port 80))`.
-This would require the rule to appear in multiple tree positions (one under
-proto=6, one under dst-port=80 wildcard path). The DAG compiler can handle
-this by duplicating the rule spec.
-
-**Recommendation:** Implement `In` (same-field OR) first. Cross-field OR is
-a compiler challenge but doesn't require eBPF changes — it's rule duplication
-at compile time.
-
-### Implementation Order
-
-1. **`In` (set membership)** — compiler only, zero eBPF changes, highest value
-2. **Range (Gt/Lt/Gte/Lte)** — start with expansion, optimize to node annotation
-3. **Mask** — node annotation, one AND instruction in eBPF
-4. **Or (cross-field)** — compiler-side rule duplication
-5. **Not** — defer, use priority-based workarounds
-
 ---
 
-## 5. Sets and Prefix Sets
+## Implementation Progress Summary
 
-### Problem
-
-A common operational need: "block these 500K source IPs" or "rate-limit
-traffic from these 10K CIDRs." Currently each IP would be a separate rule.
-500K rules each constraining src-addr works but is wasteful — they all share
-the same action and priority.
-
-### 5a. IP Sets
-
-**Concept:** A named set of IPs that can be referenced in a rule:
-
-```clojure
-;; Define a set (userspace concept, not in s-expr)
-(defset bad-sources ["10.0.0.200" "10.0.0.201" "10.1.0.0/16" ...])
-
-;; Reference it in a rule
-((in-set src-addr bad-sources)
- =>
- {:action (drop), :priority 200})
-```
-
-**Implementation options:**
-
-**A. Compile-time expansion:** Expand `(in-set src-addr bad-sources)` into
-N rules, one per IP/prefix. The DAG compiler deduplicates shared subtrees.
-Simple, correct, works with existing eBPF.
-
-**B. Separate BPF map for sets:** Create a `BPF_MAP_TYPE_HASH` or
-`BPF_MAP_TYPE_LPM_TRIE` for IP sets. The tree node references the set by ID,
-and the DFS checks membership via a map lookup instead of an edge lookup.
-
-**Recommendation for near-term:** Compile-time expansion (option A). It
-works today with zero eBPF changes. The DAG compiler's memoization handles
-shared subtrees well. At 500K IPs, the tree grows by ~1M nodes — within
-the 2.5M slot budget.
-
-**Recommendation for scale (1M+ IPs):** Option B with `BPF_MAP_TYPE_LPM_TRIE`.
-This is the kernel's native longest-prefix-match data structure, built for
-exactly this use case. It would require:
-
-1. A new BPF map: `static IP_SETS: HashMap<SetKey, u32>` or LPM trie
-2. A new predicate: `InSet(FieldRef, SetId)`
-3. A new check in `tree_walk_step`: if the node has a set check, do a map
-   lookup instead of an edge lookup
-4. Userspace management of set contents (add/remove IPs without recompiling tree)
-
-The LPM trie approach is particularly interesting because it handles CIDRs
-natively — `10.0.0.0/8` is a single entry, not 16M entries.
-
-### 5b. Bloom Filters
-
-**Concept:** For very large sets (millions of entries) where some false
-positives are acceptable, a bloom filter in eBPF can answer "is this IP
-possibly in the set?" in O(1).
-
-```
-BPF_MAP_TYPE_BLOOM_FILTER  (kernel 5.16+)
-```
-
-The kernel has native bloom filter support as a BPF map type. Usage:
-
-1. Userspace inserts IPs into the bloom filter map
-2. eBPF program checks `bloom_filter.contains(src_ip)`
-3. If positive, apply the rule (with awareness of false positive rate)
-
-**When to use:** Bloom filters make sense when:
-- Set is very large (>1M entries)
-- Some false positives are acceptable (e.g., rate-limiting, not hard DROP)
-- The set changes frequently (bloom filter rebuild is cheaper than tree rebuild)
-
-**Recommendation:** This is a later optimization. Start with LPM tries for
-prefix sets. Bloom filters are the escape hatch for extreme scale.
-
----
-
-## 6. Workflow: Planning vs Implementation
-
-### The Handoff Pattern
-
-1. **Deep planning (Opus):** Architectural decisions, eBPF verifier strategies,
-   algorithm design, tradeoff analysis. Output: a design section in this doc
-   with clear struct definitions, file lists, and implementation order.
-
-2. **Implementation (Sonnet):** Given a specific section from this doc,
-   implement it. Each section is designed to be self-contained: what structs
-   to change, what files to touch, what the eBPF impact is, what tests to write.
-
-3. **Review (Opus):** If Sonnet hits a wall (verifier issues, architectural
-   questions), escalate back for analysis.
-
-### Implementation Priority
-
-| Feature | Complexity | eBPF Changes | Value |
+| Feature | Complexity | eBPF Changes | Status |
 |---|---|---|---|
-| RHS syntax redesign | Low | None | High (cleaner foundation) |
-| Named rate limiters | Low | None (bucket key change only) | High |
-| Count action | Medium | New map + action type | Medium |
-| `In` predicate (set membership) | Low | None (compiler only) | High |
-| Range predicates | Medium | Node annotation or expansion | Medium |
-| Bitmask predicate | Medium | Node annotation | Medium |
-| LPM trie prefix sets | High | New map type + predicate | High |
-| Negation | High | Compiler complexity | Low |
-| Bloom filters | Medium | New map type | Low (niche) |
-
-### Suggested Implementation Order
-
-**Batch 1 — Foundation (no eBPF changes):**
-1. RHS syntax redesign (struct changes, formatting, JSON parsing)
-2. Named rate limiters (bucket key derivation)
-3. `In` predicate (compiler-only, multi-edge to shared child)
-
-**Batch 2 — eBPF extensions:**
-4. Count action (new map, new action type in walker)
-5. Range predicates (start with expansion, then node annotation)
-6. Bitmask predicate (node annotation)
-
-**Batch 3 — Scale features:**
-7. LPM trie prefix sets
-8. Cross-field OR (compiler rule duplication)
-9. Bloom filters (if needed)
-
-Each batch should be a commit or small PR. Tests first for each feature.
+| EDN rule language | Medium | None | ✅ Done |
+| RHS syntax redesign | Low | None | ✅ Done |
+| Named rate limiters | Low | None (bucket key only) | ✅ Done |
+| Compound naming | Low | None | ✅ Done |
+| Count action | Medium | New map + action type | ✅ Done |
+| `In` predicate | Low | None (compiler only) | ✅ Done |
+| Range predicates | Medium | Node annotation | ✅ Done |
+| Bitmask & byte matching | High | Custom dims + pattern map | ✅ Done |
+| Per-rule metrics manifest | Medium | TREE_COUNTERS for all actions | ✅ Done |
+| Negation (`not`) | High | Compiler complexity | Planned |
+| Disjunction (cross-field `or`) | Medium | Compiler rule duplication | Planned |
+| LPM trie prefix sets | High | New map type + predicate | Planned |
+| Bloom filters | Medium | New map type | Planned |
+| Metrics pipeline | Medium | Read-only | Planned |
+| HyperLogLog (eBPF) | Medium | Small array | Planned |
+| Vector-native cardinality | Low | None | Planned |
+| Holon primitive integration | Low-Medium | None | Planned |
 
 ---
 
-## 7. Metrics Collection and Emission
+# Part II — Planned: Predicate Extensions
 
-### Problem
+## 5. Negation (Not)
 
-We have counters scattered across BPF maps (STATS, TREE_COUNTERS, rate limiter
-state) but no systematic way to collect, aggregate, and export them. The sidecar
-currently reads stats inline during the detection loop, but there's no dedicated
-metrics pipeline.
+### Syntax
 
-### Design: Async Reactor Loop
-
-A dedicated async task in the sidecar that periodically:
-
-1. **Drains counters** from BPF maps (STATS, TREE_COUNTERS, rate state)
-2. **Aggregates** per-CPU values into totals
-3. **Computes deltas** (rate of change since last collection)
-4. **Emits** to one or more sinks (log, file, socket, prometheus endpoint)
-
-```rust
-// Runs alongside the detection loop
-async fn metrics_reactor(filter: Arc<VethFilter>, interval: Duration) {
-    let mut ticker = tokio::time::interval(interval);
-    let mut prev_stats = FilterStats::default();
-
-    loop {
-        ticker.tick().await;
-
-        let stats = filter.stats().await?;
-        let counters = filter.read_counters().await?;  // TREE_COUNTERS
-        let rate_states = filter.read_rate_states().await?;  // TREE_RATE_STATE
-
-        let delta = stats.delta(&prev_stats);
-        prev_stats = stats.clone();
-
-        // Emit to configured sinks
-        emit_metrics(&delta, &counters, &rate_states).await;
-    }
-}
-```
-
-**Collection interval:** 1–5 seconds. Independent of detection window cadence.
-
-### Emission Sinks (Pick One to Start)
-
-| Sink | Complexity | Integration |
-|---|---|---|
-| **Structured JSON log file** | Low | grep/jq friendly |
-| **Unix socket (line protocol)** | Low | Telegraf/Vector compatible |
-| **Prometheus `/metrics` endpoint** | Medium | Industry standard |
-| **StatsD UDP** | Low | Broad ecosystem |
-
-**Recommendation:** Start with structured JSON log (one line per collection).
-Add Prometheus endpoint later — it's the most useful but requires an HTTP
-server dependency.
-
-### Counter Draining
-
-The `TREE_COUNTERS` map should be **read-and-reset** — atomically read the
-value and set it to 0. This prevents counter overflow and gives clean deltas.
-BPF has no atomic read-and-reset, but we can:
-
-1. Read the value
-2. Delete the key (or write 0)
-3. Accept a small race window (packets between read and reset are lost from
-   this collection cycle, counted in the next)
-
-For high-fidelity: use a per-CPU counter map and sum across CPUs in userspace
-(same as STATS today). Per-CPU maps avoid cross-CPU contention entirely.
-
----
-
-## 8. Compound Naming (Namespaces)
-
-### Problem
-
-As the system grows multi-tenant or multi-concern, flat names like
-`"syn-flood"` will collide. We need namespaced identifiers.
-
-### Design: Compound Keys
-
-Names become tuples: `[namespace, name]`.
-
-```clojure
-;; Tenant-scoped rate limiter
-((and (= proto 6) (= tcp-flags 2) (= dst-addr 10.0.0.1))
- =>
- {:action (rate-limit 500 :name ["tenant-1" "syn-limit"])
-  :priority 200})
-
-;; Tenant-scoped counter
-((and (= proto 17) (= src-port 53))
- =>
- {:action (count :name ["tenant-1" "dns-responses"])})
-```
-
-### Implementation
-
-**Userspace:** The name is a `Vec<String>` or `(String, String)`. The hash
-for the BPF map key is computed from the concatenation:
-
-```rust
-fn compound_key(namespace: &str, name: &str) -> u32 {
-    let mut hasher = DefaultHasher::new();
-    namespace.hash(&mut hasher);
-    name.hash(&mut hasher);
-    (hasher.finish() & 0xFFFFFFFF) as u32
-}
-```
-
-**eBPF side:** No change. The map key is still a u32. The compound-ness is
-a userspace abstraction over the hash.
-
-**JSON format:**
-
-```json
-{
-  "actions": [
-    {"type": "rate-limit", "pps": 500, "name": ["tenant-1", "syn-limit"]}
-  ]
-}
-```
-
-**Backward compat:** A plain string `"syn-limit"` is treated as `["", "syn-limit"]`
-(empty namespace).
-
-### Metrics Integration
-
-The metrics reactor uses compound names for grouping:
-
-```json
-{"ts": "2026-02-13T...", "namespace": "tenant-1", "counter": "dns-responses", "value": 4281, "delta": 127}
-{"ts": "2026-02-13T...", "namespace": "tenant-1", "limiter": "syn-limit", "tokens": 342, "drops": 18}
-```
-
-This naturally supports per-tenant dashboards and alerting.
-
----
-
-## 9. Dynamic Prefix Lists (Lazy Accumulation)
-
-### Problem
-
-Instead of expressing 10K individual `(= src-addr ...)` rules, accumulate
-"bad" source addresses into a prefix list that rules reference by name. The
-list grows lazily as the system detects new offenders, and entries expire
-after a TTL.
-
-### Design
-
-```clojure
-;; Rule references a dynamic prefix list by name
-((in-prefix-list src-addr "bad-sources")
- =>
- {:action (rate-limit 100), :priority 200})
-```
-
-The prefix list `"bad-sources"` is populated by the detection engine:
-
-```rust
-// When Holon detects a concentrated src-addr in anomalous traffic:
-prefix_lists.insert("bad-sources", src_addr, ttl: Duration::from_secs(3600));
-```
-
-### Implementation: LPM Trie with TTL
-
-**BPF map:** `BPF_MAP_TYPE_LPM_TRIE` — the kernel's native longest-prefix-match
-structure. Supports CIDR lookups natively.
-
-```rust
-// Key: prefix + address
-struct LpmKey {
-    prefix_len: u32,  // e.g., 32 for /32, 24 for /24
-    addr: u32,        // IP address
-}
-
-static PREFIX_LISTS: HashMap<u32, LpmTrie<LpmKey, u8>> = ...;
-// Outer key: hash of list name
-// Inner: LPM trie of prefixes → action flags
-```
-
-**Actually, BPF doesn't support map-in-map with LPM tries directly.** Simpler
-approach: one LPM trie per list, pre-created at startup:
-
-```rust
-static BAD_SOURCES: LpmTrie<LpmKey, u64> = LpmTrie::with_max_entries(1_000_000, 0);
-// Value: expiry timestamp (or 0 for permanent)
-```
-
-**eBPF lookup:** In `tree_walk_step`, when a node has a prefix-list check:
-
-```rust
-let key = LpmKey { prefix_len: 32, addr: src_ip };
-if let Some(entry) = BAD_SOURCES.get(&key) {
-    if *entry == 0 || *entry > now_ns { /* match */ }
-}
-```
-
-**Userspace management:**
-- Insert: `lpm_trie.insert(LpmKey { prefix_len: 32, addr: ip }, expiry_ts)`
-- Eviction: Periodic sweep deleting entries where `expiry_ts < now`
-- No tree recompilation needed — the prefix list is checked at runtime
-
-**This is powerful.** The tree says "check prefix list X for src-addr" and the
-prefix list is managed independently. Adding 10K IPs to the list is 10K map
-updates, not a tree recompile. Entries auto-expire.
-
-### Interaction with Holon
-
-When Holon detects anomalous traffic concentrated on a source address:
-1. Instead of (or in addition to) generating a tree rule, insert the source
-   IP into the `"bad-sources"` prefix list with a 1-hour TTL
-2. A single tree rule `(in-prefix-list src-addr "bad-sources")` handles all
-   current and future entries
-3. As IPs expire, they stop matching without any tree recompilation
-
-This is the **separation of policy (tree rule) from data (prefix list).**
-
----
-
-## 10. Negation Syntax
-
-### Clojure Precedent
-
-In Clojure:
-- `(not (= x y))` — composable, wraps any predicate
-- `(not= x y)` — shorthand, common but only for equality
-
-For a rule language where `not` should wrap ANY predicate (not just `=`), the
-composable form is better:
+Following the Clojure composable form — `(not ...)` wraps any predicate:
 
 ```clojure
 ;; Negate equality
 (not (= dst-port 9999))
 
-;; Negate set membership (future)
+;; Negate set membership
 (not (in src-port 53 123))
 
-;; Negate range (future)
+;; Negate range
 (not (> ttl 200))
 ```
 
-`(not ...)` is the Clojure way. It's a higher-order form that wraps any
-predicate. This is more composable than dedicated `!=`, `not-in`, etc.
-
-### The SYN Counter Example
+### Use Case: The SYN Counter Example
 
 ```clojure
 ;; Count SYN packets that AREN'T hitting the game server
-((and (= proto 6)
-      (= tcp-flags 2)
-      (not (= dst-port 9999)))
- =>
- {:action (count :name ["monitoring" "non-game-syns"])})
+{:constraints [(= proto 6)
+               (= tcp-flags 2)
+               (not (= dst-port 9999))]
+ :actions [(count :name ["monitoring" "non-game-syns"])]}
 
 ;; Rate-limit SYNs TO the game server
-((and (= proto 6)
-      (= tcp-flags 2)
-      (= dst-port 9999))
- =>
- {:action (rate-limit 100 :name ["game" "syn-limit"])
-  :priority 200})
+{:constraints [(= proto 6)
+               (= tcp-flags 2)
+               (= dst-port 9999)]
+ :actions [(rate-limit 100 :name ["game" "syn-limit"])]
+ :priority 200}
 ```
 
-### Compilation Strategy for Negation
+### Compilation Strategy
 
 For `(not (= dst-port 9999))`:
-
-**In the tree:** The rule needs to match when `dst-port != 9999`. At the
-dst-port dimension in the tree:
 
 1. The rule lives in the **wildcard branch** (matches any dst-port value)
 2. But has an **exclusion**: if `dst-port == 9999`, skip this rule
@@ -940,20 +255,327 @@ One comparison per node. Minimal verifier impact. Supports single-value
 negation. Multi-value negation (`(not (in ...))`) would need an exclusion
 set, but single-value covers 90% of use cases.
 
+**Alternative for small-domain fields:** Expansion. `(not (= proto 6))`
+expands to `(in proto 1 17 ...)`. Only works for fields with small value
+domains. For large-domain fields (ports, IPs), negation is better handled
+by priority — a specific-match rule at higher priority with a wildcard
+catch-all at lower priority.
+
+**Recommendation:** Defer negation until needed. It's the most complex
+predicate to get right and the least common use case.
+
+**Files to change:**
+- `filter/src/lib.rs` — `Predicate` enum, add `Not` variant
+- `filter/src/tree.rs` — Compiler handles exclusion placement in wildcard branches
+- `filter-ebpf/src/main.rs` — `exclude_value` field on `TreeNode`, skip logic
+
 ---
 
-## 11. HyperLogLog for Cardinality Estimation
+## 6. Disjunction (Or)
 
-### What You're Thinking Of
+**Same-field OR** is equivalent to set membership (already implemented):
+`(or (= proto 6) (= proto 17))` = `(in proto 6 17)`
 
-A **HyperLogLog (HLL)** estimates the number of **distinct** elements in a
-stream. "How many unique source IPs are hitting port 443?" — HLL answers this
-in ~1.2KB of memory with ~2% error, regardless of whether the answer is 50
-or 50 million.
+**Cross-field OR** is harder: `(or (= proto 6) (= dst-port 80))`.
+The rule must appear in multiple tree positions (one under proto=6, one
+under dst-port=80 wildcard path). The DAG compiler can handle this by
+duplicating the rule spec at compile time.
 
-This isn't an anti-bloom filter (that would be a cuckoo filter or counting
-bloom filter). HLL is specifically for **cardinality estimation** — counting
-unique things without storing them.
+**No eBPF changes needed.** Cross-field OR is purely a compiler transformation.
+
+**Recommendation:** Implement only when there's a concrete use case.
+
+---
+
+# Part III — Planned: Sets & Prefix Lists
+
+## 7. IP Sets & LPM Tries
+
+### Problem
+
+A common operational need: "block these 500K source IPs" or "rate-limit
+traffic from these 10K CIDRs." Currently each IP would be a separate rule.
+
+### Approach A: Compile-Time Expansion (Near-Term)
+
+Expand `(in-set src-addr bad-sources)` into N rules, one per IP/prefix.
+The DAG compiler deduplicates shared subtrees. Works today with zero eBPF
+changes. At 500K IPs, the tree grows by ~1M nodes — within the 2.5M slot
+budget.
+
+### Approach B: LPM Trie (Scale)
+
+For 1M+ IPs, use `BPF_MAP_TYPE_LPM_TRIE` — the kernel's native
+longest-prefix-match data structure. Handles CIDRs natively
+(`10.0.0.0/8` is a single entry, not 16M entries).
+
+```rust
+// Key: prefix + address
+struct LpmKey {
+    prefix_len: u32,  // e.g., 32 for /32, 24 for /24
+    addr: u32,        // IP address
+}
+
+static BAD_SOURCES: LpmTrie<LpmKey, u64> = LpmTrie::with_max_entries(1_000_000, 0);
+```
+
+**eBPF lookup:** Tree node references a set by ID, DFS checks membership via
+map lookup instead of edge lookup:
+
+```rust
+let key = LpmKey { prefix_len: 32, addr: src_ip };
+if let Some(entry) = BAD_SOURCES.get(&key) {
+    if *entry == 0 || *entry > now_ns { /* match */ }
+}
+```
+
+**Requires:**
+1. New BPF map (LPM trie)
+2. New predicate: `InSet(FieldRef, SetId)`
+3. New check in `tree_walk_step`: map lookup at set-check nodes
+4. Userspace management of set contents (add/remove without recompiling tree)
+
+### Bloom Filters (Extreme Scale)
+
+For very large sets (>1M entries) where some false positives are acceptable:
+
+```
+BPF_MAP_TYPE_BLOOM_FILTER  (kernel 5.16+)
+```
+
+Usage: Userspace inserts IPs into bloom filter map. eBPF checks
+`bloom_filter.contains(src_ip)`. Best for rate-limiting (not hard DROP)
+where false positives are tolerable.
+
+**Recommendation:** Start with compile-time expansion. Graduate to LPM tries
+for prefix sets. Bloom filters are the escape hatch for extreme scale.
+
+**Files to change:**
+- `filter-ebpf/src/main.rs` — New LPM trie map, set-check logic in DFS
+- `filter/src/lib.rs` — `Predicate::InSet`, set registry
+- `filter/src/tree.rs` — Compiler handles set-check nodes
+- `sidecar/src/main.rs` — Set management, parsing `(in-set ...)` syntax
+
+---
+
+## 8. Dynamic Prefix Lists (Lazy Accumulation)
+
+### Problem
+
+Instead of expressing 10K individual `(= src-addr ...)` rules, accumulate
+"bad" source addresses into a prefix list that rules reference by name. The
+list grows lazily as the system detects new offenders, and entries expire
+after a TTL.
+
+### Design
+
+```clojure
+;; Rule references a dynamic prefix list by name
+{:constraints [(in-prefix-list src-addr "bad-sources")]
+ :actions [(rate-limit 100)]
+ :priority 200}
+```
+
+The prefix list is populated by the detection engine:
+
+```rust
+// When Holon detects a concentrated src-addr in anomalous traffic:
+prefix_lists.insert("bad-sources", src_addr, ttl: Duration::from_secs(3600));
+```
+
+### Implementation: LPM Trie with TTL
+
+One LPM trie per list, pre-created at startup. Value stores expiry timestamp:
+
+```rust
+static BAD_SOURCES: LpmTrie<LpmKey, u64> = LpmTrie::with_max_entries(1_000_000, 0);
+// Value: expiry_ns (0 = permanent)
+```
+
+**Userspace management:**
+- Insert: `lpm_trie.insert(LpmKey { prefix_len: 32, addr: ip }, expiry_ts)`
+- Eviction: Periodic sweep deleting entries where `expiry_ts < now`
+- No tree recompilation needed — the prefix list is checked at runtime
+
+**This is powerful.** The tree says "check prefix list X for src-addr" and
+the prefix list is managed independently. Adding 10K IPs is 10K map updates,
+not a tree recompile. Entries auto-expire.
+
+### Interaction with Holon
+
+When Holon detects anomalous traffic concentrated on a source address:
+1. Insert the source IP into `"bad-sources"` with a 1-hour TTL
+2. A single tree rule `(in-prefix-list src-addr "bad-sources")` handles all
+   current and future entries
+3. As IPs expire, they stop matching without any tree recompilation
+
+This is the **separation of policy (tree rule) from data (prefix list).**
+
+---
+
+## 9. Blue/Green Prefix Lists
+
+### Design
+
+**Double-buffered LPM tries** — same pattern as tree blue/green:
+
+```rust
+static PREFIX_LIST_A: LpmTrie<LpmKey, PrefixEntry> = LpmTrie::with_max_entries(1_000_000, 0);
+static PREFIX_LIST_B: LpmTrie<LpmKey, PrefixEntry> = LpmTrie::with_max_entries(1_000_000, 0);
+static PREFIX_LIST_ACTIVE: Array<u32> = Array::with_max_entries(1, 0);  // 0 = A, 1 = B
+```
+
+**Swap protocol:**
+1. Load new prefix data into the inactive list (B)
+2. Atomic write to `PREFIX_LIST_ACTIVE`: 0 → 1
+3. eBPF reads `PREFIX_LIST_ACTIVE` to choose which trie to query
+4. Old list (A) is now available for the next update
+
+**Alternative:** `BPF_MAP_TYPE_ARRAY_OF_MAPS` — outer array holds references
+to inner LPM tries. Cleaner but more complex to set up with aya.
+
+### Update Modes
+
+**Full swap (blue/green):** Replace entire list atomically. Best for batch
+updates from threat intel feeds that provide complete lists.
+
+**Incremental updates:** Insert/delete individual entries in the active list.
+Best for real-time feeds (Holon adding IPs as it detects them). Individual
+map updates are atomic at the entry level.
+
+The two modes coexist: incremental for Holon's live detections, full swap
+for periodic bulk loads from external sources.
+
+---
+
+## 10. ipset-Style Features
+
+### netfilter ipset Features Worth Emulating
+
+**Timeout/TTL:**
+```bash
+ipset create bad-sources hash:ip timeout 3600  # entries expire after 1 hour
+ipset add bad-sources 10.0.0.200 timeout 600   # this one expires in 10 minutes
+```
+Our design includes TTL on prefix list entries via `PrefixEntry.expiry_ns`.
+
+**Counters:** Store `{expiry_ts, packet_count, byte_count}` in prefix list
+entries. eBPF atomically increments on match. Per-IP observability without
+separate counter rules.
+
+**Comment/metadata:** Userspace-only metadata stored in a sidecar HashMap
+alongside the BPF entry. Useful for audit trails ("why is this IP blocked?").
+
+### Set Types
+
+| ipset Type | Our Equivalent | Implementation |
+|---|---|---|
+| `hash:ip` | LPM trie with /32 prefixes | `BPF_MAP_TYPE_LPM_TRIE` |
+| `hash:net` | LPM trie with variable prefixes | Same, native CIDR support |
+| `hash:ip,port` | Compound key in HashMap | `BPF_MAP_TYPE_HASH` |
+| `hash:net,port` | Two-stage: LPM trie + edge | LPM for net, then tree edge for port |
+| `bitmap:port` | BPF array (65536 entries) | `BPF_MAP_TYPE_ARRAY` — O(1) lookup |
+
+### Eviction Strategies
+
+| Strategy | Approach |
+|---|---|
+| Timeout (TTL) | Store `expiry_ts`, periodic sweep |
+| LRU | Touch timestamp on match, evict oldest |
+| Max size | Reject inserts beyond capacity |
+| Forceadd | On full, evict random entry to make room |
+
+**Recommendation:** TTL + max size first. Forceadd is useful for Holon's live
+detection where we'd rather evict a stale entry than fail to block a new
+attacker. LRU requires write amplification in eBPF (update entry on every match).
+
+### PrefixEntry Struct
+
+```rust
+#[repr(C)]
+struct PrefixEntry {
+    expiry_ns: u64,      // 0 = permanent, else ktime_get_ns() deadline
+    packets: u64,         // atomically incremented on match
+    bytes: u64,           // atomically incremented on match
+    action: u8,           // ACT_DROP, ACT_RATE_LIMIT, etc.
+    flags: u8,            // reserved
+    _pad: [u8; 6],
+}
+```
+
+32 bytes per entry. At 1M entries in an LPM trie, ~32MB. Comfortable.
+
+---
+
+# Part IV — Planned: Observability
+
+## 11. Metrics Collection & Emission Pipeline
+
+### Problem
+
+We have counters scattered across BPF maps (STATS, TREE_COUNTERS, rate
+limiter state) but no systematic way to collect, aggregate, and export them.
+The sidecar currently reads stats inline during the detection loop, but
+there's no dedicated metrics pipeline.
+
+### Design: Async Reactor Loop
+
+A dedicated async task in the sidecar that periodically:
+
+1. **Drains counters** from BPF maps (STATS, TREE_COUNTERS, rate state)
+2. **Aggregates** per-CPU values into totals
+3. **Computes deltas** (rate of change since last collection)
+4. **Emits** to one or more sinks (log, file, socket, prometheus endpoint)
+
+```rust
+async fn metrics_reactor(filter: Arc<VethFilter>, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    let mut prev_stats = FilterStats::default();
+
+    loop {
+        ticker.tick().await;
+
+        let stats = filter.stats().await?;
+        let counters = filter.read_counters().await?;  // TREE_COUNTERS
+        let rate_states = filter.read_rate_states().await?;  // TREE_RATE_STATE
+
+        let delta = stats.delta(&prev_stats);
+        prev_stats = stats.clone();
+
+        emit_metrics(&delta, &counters, &rate_states).await;
+    }
+}
+```
+
+**Collection interval:** 1–5 seconds. Independent of detection window cadence.
+
+### Emission Sinks
+
+| Sink | Complexity | Integration |
+|---|---|---|
+| **Structured JSON log file** | Low | grep/jq friendly |
+| **Unix socket (line protocol)** | Low | Telegraf/Vector compatible |
+| **Prometheus `/metrics` endpoint** | Medium | Industry standard |
+| **StatsD UDP** | Low | Broad ecosystem |
+
+**Recommendation:** Start with structured JSON log (one line per collection).
+Add Prometheus endpoint later.
+
+### Counter Draining
+
+`TREE_COUNTERS` should be **read-and-reset**: read the value and write 0.
+Accept a small race window (packets between read and reset counted in next
+cycle). For high-fidelity: per-CPU counter map (same as STATS today).
+
+---
+
+## 12. HyperLogLog for Cardinality Estimation
+
+### What It Does
+
+A **HyperLogLog (HLL)** estimates distinct elements in a stream.
+"How many unique source IPs are hitting port 443?" — HLL answers this
+in ~256 bytes of memory with ~5% error.
 
 ### Why This Matters for DDoS
 
@@ -964,12 +586,9 @@ unique things without storing them.
 | Low source cardinality + high PPS | Amplification attack (few sources, huge volume) |
 | Source port cardinality | Randomized vs fixed source ports |
 
-Holon already detects drift, but HLL gives a **specific, interpretable metric**:
-"unique source count jumped 1000x." This feeds directly into rule generation.
+### Implementation in eBPF
 
-### Implementation
-
-**BPF doesn't have a native HLL map type.** But HLL is simple enough to
+BPF doesn't have a native HLL map type, but HLL is simple enough to
 implement in a BPF array:
 
 ```rust
@@ -991,324 +610,81 @@ fn hll_observe(value: u32) {
 }
 ```
 
-**Userspace reads the 256 registers and computes the estimate:**
+**Userspace reads 256 registers and computes the estimate:**
 
 ```rust
 fn hll_count(registers: &[u8; 256]) -> f64 {
     let m = 256.0;
-    let alpha = 0.7213 / (1.0 + 1.079 / m);  // bias correction
+    let alpha = 0.7213 / (1.0 + 1.079 / m);
     let sum: f64 = registers.iter().map(|&r| 2.0_f64.powi(-(r as i32))).sum();
-    let estimate = alpha * m * m / sum;
-    // Small/large range corrections omitted for brevity
-    estimate
+    alpha * m * m / sum
 }
 ```
 
-**256 bytes per HLL counter.** We could have dozens of them:
-- `HLL_SRC_IP` — unique source IPs
-- `HLL_DST_PORT` — unique destination ports
-- `HLL_SRC_PORT` — unique source ports
-- Per-prefix HLLs (unique sources hitting a specific destination)
-
-**Integration with metrics reactor:**
-The metrics loop reads HLL registers every N seconds, computes cardinality
-estimates, and emits them. Cardinality changes between cycles are a powerful
-anomaly signal that complements Holon's drift detection.
-
-**Integration with rules:**
-HLL cardinality could feed into rule generation heuristics:
-
-```
-if hll_src_ip_cardinality > 10_000 && drift > 0.7 {
-    // Botnet detected — generate broad rate-limit rule
-}
-if hll_src_ip_cardinality < 5 && pps > 100_000 {
-    // Amplification — generate per-source drop rules
-}
-```
-
-**Reset:** HLLs need periodic reset (or decay) to track *recent* cardinality.
-The metrics reactor can zero the registers at configurable intervals.
+**256 bytes per HLL counter.** We could have dozens:
+`HLL_SRC_IP`, `HLL_DST_PORT`, `HLL_SRC_PORT`, per-prefix HLLs.
 
 ### BPF Verifier Feasibility
 
 The `hll_observe` function is ~10 instructions: one hash, one AND, one
-shift, one leading_zeros (CLZ instruction), one array lookup, one compare,
-one conditional store. Trivially verified. Can run in `veth_filter` alongside
-sampling, before the tail call.
+shift, one leading_zeros, one array lookup, one compare, one conditional
+store. Trivially verified. Can run in `veth_filter` alongside sampling.
+
+**Reset:** HLLs need periodic reset (or decay) to track *recent*
+cardinality. The metrics reactor can zero the registers at configurable
+intervals.
+
+**Integration:** Metrics reactor reads HLL registers, computes cardinality
+estimates, and emits them. Cardinality changes between cycles are a
+powerful anomaly signal that complements Holon's drift detection.
 
 ---
 
-## 12. EDN as the Rule Language
+# Part V — Planned: Holon Primitive Integration
 
-### Why EDN Over JSON
-
-[EDN (Extensible Data Notation)](https://github.com/edn-format/edn) is
-Clojure's data format. JSON is a subset of what EDN can express, but EDN
-adds:
-
-| Feature | JSON | EDN |
-|---|---|---|
-| Keywords | No | `:action`, `:priority` |
-| Sets | No (`[]` only) | `#{53 123 5353}` |
-| Symbols | No | `rate-limit`, `drop` |
-| Tagged literals | No | `#inst "2026-..."`, `#cidr "10.0.0.0/8"` |
-| Comments | No | `; this is a comment` |
-| Commas optional | Required | Whitespace-separated |
-
-Sets are a native EDN type — perfect for `(in src-port #{53 123 5353})`.
-Tagged literals let us define `#cidr "10.0.0.0/8"` as a first-class value.
-Keywords make the RHS map natural: `{:action (drop) :priority 200}`.
-
-### What Rules Look Like in EDN
-
-```clojure
-;; Current JSON (verbose, no comments)
-[{"constraints": [{"field": "proto", "value": 17}], "action": "drop"}]
-
-;; EDN equivalent (native, composable)
-[{:constraints [(= proto 17)]
-  :action      (drop)}]
-
-;; Full rule with all features
-{:constraints [(= proto 6)
-               (= tcp-flags 2)
-               (not (= dst-port 9999))]
- :actions     [(rate-limit 500 :name ["game" "syn-limit"])
-               (count :name ["monitoring" "non-game-syns"])]
- :priority    200}
-
-;; Prefix set reference with tagged literal
-{:constraints [(in-prefix-list src-addr "bad-sources")
-               (= proto 17)]
- :actions     [(rate-limit 100)]
- :priority    150}
-
-;; Set membership with native EDN set
-{:constraints [(in src-port #{53 123 5353})]
- :actions     [(rate-limit 300 :name "dns-ntp-amp")]}
-```
-
-### Rust EDN Libraries
-
-Three options exist:
-
-| Crate | Version | Notes |
-|---|---|---|
-| `edn-format` | 3.3.0 | Most mature, good docs, parse/emit |
-| `edn-rs` | 0.18.0 | Serde-like macros (`map!`, `set!`), deser traits |
-| `rsedn` | 0.2.0 | Two-stage lex+parse, lower-level |
-
-**Recommendation:** `edn-rs` for its serde integration — we already use serde
-for JSON parsing. Evaluating `edn-format` as a fallback if `edn-rs` doesn't
-handle our nested s-expression predicates cleanly.
-
-### Migration Path
-
-1. Add `edn-rs` (or `edn-format`) dependency to sidecar
-2. Write an EDN rule parser alongside the existing JSON parser
-3. Auto-detect format: if file starts with `[{` → JSON, if `[{:` or `({` → EDN
-4. Keep JSON support permanently (it's a subset, costs nothing)
-5. Log emitted rules in EDN format (more readable than JSON s-exprs)
-6. Eventually: rules API accepts EDN over the wire
-
-**Files to change:**
-- `sidecar/Cargo.toml` — add `edn-rs` or `edn-format`
-- `sidecar/src/main.rs` — new `parse_rules_edn()` alongside `parse_rules_file()`
-- `filter/src/lib.rs` — `to_edn()` emitter on `RuleSpec`
-
----
-
-## 13. Blue/Green Prefix Lists
-
-### Question
-
-If prefix lists are loaded from external sources (compute cluster, user API,
-threat intel feed), can we do atomic swaps on them too?
-
-### Answer: Yes, Same Pattern as the Tree
-
-**Double-buffered LPM tries.** Create two LPM trie maps per prefix list:
-
-```rust
-static PREFIX_LIST_A: LpmTrie<LpmKey, PrefixEntry> = LpmTrie::with_max_entries(1_000_000, 0);
-static PREFIX_LIST_B: LpmTrie<LpmKey, PrefixEntry> = LpmTrie::with_max_entries(1_000_000, 0);
-static PREFIX_LIST_ACTIVE: Array<u32> = Array::with_max_entries(1, 0);  // 0 = A, 1 = B
-```
-
-**Swap protocol (same as tree blue/green):**
-
-1. Load new prefix data into the inactive list (B)
-2. Atomic write to `PREFIX_LIST_ACTIVE`: 0 → 1
-3. eBPF reads `PREFIX_LIST_ACTIVE` to choose which trie to query
-4. Old list (A) is now available for the next update
-
-**Alternatively: map-in-map.** BPF supports `BPF_MAP_TYPE_ARRAY_OF_MAPS` and
-`BPF_MAP_TYPE_HASH_OF_MAPS`. Create an outer array map that holds references
-to inner LPM tries. Swap by updating the outer map entry to point to the new
-inner trie. This is cleaner than named A/B maps but more complex to set up
-with aya.
-
-**Recommendation:** Start with the simple A/B pattern (matches what we already
-do for tree nodes). Graduate to map-in-map if we need many independent
-prefix lists (the A/B approach requires 2 maps per list).
-
-### Incremental Updates vs Full Swaps
-
-For prefix lists fed by external sources, two update modes:
-
-**Full swap (blue/green):** Replace the entire list atomically. Best for
-batch updates from threat intel feeds that provide complete lists.
-
-**Incremental updates:** Insert/delete individual entries in the active list.
-Best for real-time feeds (e.g., Holon adding IPs as it detects them). No swap
-needed — individual map updates are atomic at the entry level.
-
-The two modes aren't mutually exclusive. Use incremental for Holon's live
-detections, full swap for periodic bulk loads from external sources.
-
----
-
-## 14. Prefix Lists: ipset Inspiration
-
-### netfilter ipset Features Worth Emulating
-
-Linux `ipset` is the gold standard for kernel-space IP set management. Key
-features we should study and selectively adopt:
-
-**Timeout/TTL (ipset has this):**
-```bash
-ipset create bad-sources hash:ip timeout 3600  # entries expire after 1 hour
-ipset add bad-sources 10.0.0.200 timeout 600   # this one expires in 10 minutes
-```
-
-Our design already includes TTL on prefix list entries. The `PrefixEntry`
-value in the LPM trie stores an expiry timestamp.
-
-**Counters (ipset has this):**
-```bash
-ipset create tracked hash:ip counters
-# Each entry tracks packets and bytes matched
-```
-
-We should store `{expiry_ts, packet_count, byte_count}` in prefix list
-entries. The eBPF walker atomically increments counters when an entry matches.
-This gives per-IP observability without separate counter rules.
-
-**Comment/metadata (ipset has this):**
-```bash
-ipset add bad-sources 10.0.0.200 comment "detected by holon window 42"
-```
-
-Userspace-only metadata — store in a sidecar HashMap alongside the BPF entry.
-Useful for audit trails ("why is this IP blocked?").
-
-**Set types we should support:**
-
-| ipset Type | Our Equivalent | Implementation |
-|---|---|---|
-| `hash:ip` | LPM trie with /32 prefixes | `BPF_MAP_TYPE_LPM_TRIE` |
-| `hash:net` | LPM trie with variable prefixes | Same, native CIDR support |
-| `hash:ip,port` | Compound key in HashMap | `BPF_MAP_TYPE_HASH` |
-| `hash:net,port` | Two-stage: LPM trie + edge | LPM for net, then tree edge for port |
-| `bitmap:port` | BPF array (65536 entries) | `BPF_MAP_TYPE_ARRAY` — O(1) lookup |
-
-**Eviction strategies beyond TTL:**
-
-| Strategy | ipset | Our Approach |
-|---|---|---|
-| Timeout (TTL) | Native | Store expiry_ts, periodic sweep |
-| LRU | Not native | Touch timestamp on match, evict oldest |
-| Max size | `maxelem` flag | Reject inserts beyond capacity |
-| Forceadd | `forceadd` flag | On full, evict random entry to make room |
-
-**Recommendation:** Implement TTL + max size first. LRU is a nice-to-have
-but requires updating the entry on every match (write amplification in eBPF).
-Forceadd is useful for Holon's live detection where we'd rather evict a stale
-entry than fail to block a new attacker.
-
-### PrefixEntry Struct
-
-```rust
-#[repr(C)]
-struct PrefixEntry {
-    expiry_ns: u64,      // 0 = permanent, else ktime_get_ns() deadline
-    packets: u64,         // atomically incremented on match
-    bytes: u64,           // atomically incremented on match
-    action: u8,           // ACT_DROP, ACT_RATE_LIMIT, etc.
-    flags: u8,            // reserved
-    _pad: [u8; 6],
-}
-```
-
-32 bytes per entry. At 1M entries in an LPM trie, ~32MB. Comfortable.
-
----
-
-## 15. Vector-Native Cardinality & Field Diversity
-
-### Revision Note
-
-The original version of this section dismissed cardinality estimation as
-"not a VSA operation." That was wrong. The magnitude-based rate derivation
-already proved that accumulator geometry encodes traffic properties beyond
-what standard VSA/HDC literature describes. The same principles extend to
-cardinality estimation and far richer signals.
+## 13. Vector-Native Cardinality & Field Diversity
 
 ### The Core Insight: Magnitude Encodes Diversity
 
-In bipolar VSA, binding produces near-orthogonal vectors for different filler
-values. When you accumulate (sum) bound vectors:
+In bipolar VSA, binding produces near-orthogonal vectors for different
+filler values. When you accumulate (sum) bound vectors:
 
 - **N copies of the SAME vector:** magnitude ≈ N (linear growth)
 - **N ORTHOGONAL vectors:** magnitude ≈ √N (square-root growth)
-- **Mix:** magnitude is between √N and N
 
-The **magnitude-to-count ratio** of an accumulator is a cardinality signal:
+The **magnitude-to-count ratio** is a cardinality signal:
 
-| Scenario | Packets | Unique Sources | Magnitude | Ratio (mag/count) |
+| Scenario | Packets | Unique Sources | Magnitude | Ratio |
 |---|---|---|---|---|
 | Amplification | 1000 | 1 | ~1000 | ~1.0 |
 | Mixed | 1000 | 10 | ~316 | ~0.316 |
 | Botnet | 1000 | 1000 | ~31.6 | ~0.032 |
 
-High ratio → low cardinality (amplification: few sources, high volume).
-Low ratio → high cardinality (botnet: many unique sources).
-
-**This falls out of the existing algebra.** No new data structure. No HLL.
-The accumulator you already have IS a cardinality estimator.
+**No new data structure.** The accumulator you already have IS a cardinality
+estimator.
 
 ### Per-Field Cardinality via Unbinding
 
-The full packet accumulator contains ALL fields superimposed. Because binding
-is its own inverse in bipolar VSA (`bind(A, bind(A, X)) ≈ X`), you can
-**query the accumulator for field-specific information:**
+Because binding is its own inverse in bipolar VSA, you can **query the
+accumulator for field-specific information:**
 
 ```rust
 // "What does the accumulator say about source IPs specifically?"
 let src_ip_component = Primitives::bind(&accumulator_normalized, &role_src_ip);
-
-// Magnitude of this component reflects src_ip diversity
 let src_ip_diversity = src_ip_component.norm();
 ```
 
-Unbinding with `role_src_ip` extracts the subspace contributed by source IP
-bindings. Cross-terms from other fields (dst_port, proto, etc.) are
-near-orthogonal to this subspace and contribute only noise.
-
-**One accumulator. Any field. On demand.** No per-field counters, no per-field
-HLLs, no per-field maps. Just unbind and measure.
+**One accumulator. Any field. On demand.** No per-field counters, no
+per-field HLLs, no per-field maps. Just unbind and measure.
 
 ### Magnitude Spectrum: Per-Field Diversity Profile
 
-Unbind the accumulator with EVERY role vector to get a full diversity profile:
+Unbind with EVERY role vector to get a full diversity profile:
 
 ```rust
-fn magnitude_spectrum(
-    acc: &Vector,
-    roles: &[(&str, &Vector)],
-    count: usize,
-) -> Vec<(String, f64)> {
+fn magnitude_spectrum(acc: &Vector, roles: &[(&str, &Vector)], count: usize)
+    -> Vec<(String, f64)>
+{
     roles.iter().map(|(name, role)| {
         let component = Primitives::bind(acc, role);
         let diversity = component.norm() / count as f64;
@@ -1317,27 +693,21 @@ fn magnitude_spectrum(
 }
 
 // Example output during a DNS amplification attack:
-// [("src_ip",   0.95),    ← very few unique sources (amplification!)
-//  ("dst_port", 0.97),    ← one destination port (targeted)
+// [("src_ip",   0.95),    ← very few unique sources
+//  ("dst_port", 0.97),    ← one destination port
 //  ("proto",    0.99),    ← one protocol (UDP)
-//  ("src_port", 0.03),    ← many source ports (randomized by reflectors)
+//  ("src_port", 0.03),    ← many source ports (randomized)
 //  ("dst_ip",   0.98)]    ← one destination IP (victim)
 ```
 
-**Flat spectrum** = diverse traffic across all fields (normal).
+**Flat spectrum** = diverse traffic (normal).
 **Spiky spectrum** = concentration in specific fields (attack).
-
-This is richer than the current binary concentration metric. It gives a
-**continuous diversity measure per field** from a single vector operation.
 
 ### Accumulator Difference as Continuous Attribution
 
-The current approach uses `similarity_profile(recent, baseline)` for
-per-dimension agreement/disagreement. The **raw accumulator difference**
-preserves more information:
+The raw accumulator difference preserves more information than similarity:
 
 ```rust
-// Difference accumulator (what changed?)
 let delta: Vec<f64> = recent_acc.sums.iter()
     .zip(baseline_acc.sums.iter())
     .map(|(r, b)| r - b)
@@ -1345,60 +715,30 @@ let delta: Vec<f64> = recent_acc.sums.iter()
 
 // Unbind delta with each role to get per-field change magnitude
 let src_ip_change = bind_f64(&delta, &role_src_ip).norm();
-let dst_port_change = bind_f64(&delta, &role_dst_port).norm();
-let proto_change = bind_f64(&delta, &role_proto).norm();
-
 // "Source IPs changed a lot, destination port barely changed"
-// → New sources hitting the same service = botnet recruitment
+// → New sources hitting same service = botnet recruitment
 ```
-
-Unbinding the DIFFERENCE gives "how much did this specific field change?" —
-a continuous attribution metric instead of "concentrated or not."
 
 ### Interference Detection: Correlated Concurrent Attacks
 
-When two independent attacks overlap in time, their vectors superimpose. If
-the attacks are truly independent (different sources, different targets, no
-shared fields), their contributions are orthogonal and magnitudes add in
-quadrature:
+When two independent attacks overlap, their vectors superimpose. If
+independent, magnitudes add in quadrature:
 
 ```
 ||attack_A + attack_B|| ≈ √(||attack_A||² + ||attack_B||²)
 ```
 
-If the observed magnitude EXCEEDS this (super-additive), the attacks share
-structure — same botnet, same reflectors, correlated command-and-control.
+If observed magnitude EXCEEDS this (super-additive), the attacks share
+structure — same botnet, same reflectors, correlated C2.
 
 ```rust
-fn detect_attack_correlation(
-    combined_magnitude: f64,
-    individual_estimates: &[f64],  // magnitudes of suspected independent attacks
-) -> f64 {
-    let independent_expected = individual_estimates.iter()
-        .map(|m| m * m)
-        .sum::<f64>()
-        .sqrt();
-
-    // correlation_signal > 1.0 means attacks share structure
-    combined_magnitude / independent_expected
+fn detect_attack_correlation(combined_magnitude: f64, individual: &[f64]) -> f64 {
+    let independent = individual.iter().map(|m| m * m).sum::<f64>().sqrt();
+    combined_magnitude / independent  // > 1.0 means correlated
 }
 ```
 
-Two independent SYN flood + DNS amplification → correlation ~1.0.
-Same botnet running both → correlation > 1.0 (shared source IPs reinforce).
-
-This is a signal NO per-field counter can give you. It emerges from the
-superposition properties of the vector space itself.
-
 ### Where eBPF HLL Still Fits
-
-The vector-native approach operates on **sampled** packets (1-in-100). It
-gives rich compositional signals but with sample-rate noise.
-
-eBPF-side HLL operates on **every packet.** It gives ground-truth cardinality
-as a crisp number: "42,187 unique source IPs this window."
-
-**They serve different purposes:**
 
 | Signal | Source | What It Gives |
 |---|---|---|
@@ -1408,155 +748,65 @@ as a crisp number: "42,187 unique source IPs this window."
 | Rate derivation | Accumulator magnitude | Already implemented |
 | Phase detection | Window vector sequence | Already implemented |
 
-**Recommendation:** Implement vector-native cardinality FIRST (zero new
-infrastructure). Add eBPF HLL later as a metrics feature if you need exact
-counts for dashboards or external alerting systems.
+**Recommendation:** Vector-native cardinality FIRST (zero new infrastructure).
+Add eBPF HLL later for exact counts.
 
-### Implementation: Vector-Native Cardinality
+### Novel VSA/HDC Contributions
 
-**New sidecar analysis (no eBPF changes, no new maps):**
+These techniques appear novel in the VSA/HDC literature:
 
-```rust
-/// Per-field diversity profile from accumulator unbinding.
-fn analyze_field_diversity(&self) -> FieldDiversityProfile {
-    let roles = self.holon.role_vectors();  // pre-computed role vectors
-    let acc_vec = self.recent_acc_normalized();
-    let count = self.window_packet_count;
-
-    let mut profile = FieldDiversityProfile::new();
-
-    for (field_name, role_vec) in roles {
-        // Unbind to extract field-specific component
-        let component = Primitives::bind(&acc_vec, role_vec);
-        let diversity = component.norm();
-
-        // Compare to baseline diversity for this field
-        let baseline_div = self.baseline_field_diversity.get(field_name);
-        let change = diversity / baseline_div.max(1e-10);
-
-        profile.insert(field_name.clone(), FieldDiversity {
-            diversity,
-            baseline_ratio: change,
-            cardinality_class: classify_cardinality(diversity, count),
-        });
-    }
-
-    profile
-}
-
-fn classify_cardinality(diversity: f64, count: usize) -> CardinalityClass {
-    let ratio = diversity / (count as f64).max(1.0);
-    if ratio > 0.8      { CardinalityClass::VeryLow }   // 1-3 unique values
-    else if ratio > 0.3 { CardinalityClass::Low }        // handful
-    else if ratio > 0.05 { CardinalityClass::Medium }    // tens to hundreds
-    else                 { CardinalityClass::High }       // thousands+
-}
-```
-
-**Integration with rule generation:**
-
-```rust
-// During anomaly detection, after drift exceeds threshold:
-let diversity = self.analyze_field_diversity();
-
-if diversity["src_ip"].cardinality_class == CardinalityClass::VeryLow {
-    // Few unique sources → per-IP drop rules
-    // (amplification pattern)
-} else if diversity["src_ip"].cardinality_class == CardinalityClass::High {
-    // Many unique sources → rate-limit on dst_port or proto
-    // (botnet pattern — can't enumerate sources)
-}
-```
+1. **Magnitude as volume proxy** — accumulator norm for rate derivation (implemented)
+2. **Unbinding as cardinality estimator** — magnitude of unbound component
+3. **Magnitude spectrum** — per-field diversity from systematic unbinding
+4. **Interference detection** — super-additive magnitude as correlation signal
+5. **Difference unbinding** — per-field attribution from accumulator delta
 
 **Files to change:**
 - `sidecar/src/main.rs` — new `analyze_field_diversity()` in detection loop
 - `holon-rs/src/primitives.rs` — possibly add `unbind_spectrum()` convenience
 
-**No eBPF changes. No new maps. No new data structures.** Just new questions
-asked of the accumulator that already exists.
-
-### Novel VSA/HDC Contributions
-
-These techniques appear to be novel in the VSA/HDC literature:
-
-1. **Magnitude as volume proxy** — using accumulator norm for rate derivation
-   (already implemented, already novel)
-
-2. **Unbinding as cardinality estimator** — magnitude of unbound component as
-   field-specific diversity signal
-
-3. **Magnitude spectrum** — per-field diversity profile from systematic
-   unbinding of a single accumulator
-
-4. **Interference detection** — super-additive magnitude as a correlated
-   attack signal
-
-5. **Difference unbinding** — per-field attribution from accumulator delta
-
-All are consequences of bipolar VSA algebra applied to network traffic
-characterization. Worth documenting as contributions.
+**No eBPF changes. No new maps. No new data structures.**
 
 ---
 
-## 16. Holon Primitive Integration — Untapped Toolkit
+## 14. Holon Primitive Applications
 
-These are holon-rs primitives we're not using that have direct, pragmatic
-applications in the detection loop. No eBPF changes for any of them.
+These are holon-rs primitives we're not using that have direct applications
+in the detection loop. No eBPF changes for any of them.
 
-### 16a. Accumulator Decay (Continuous Detection)
+### 14a. Accumulator Decay (Continuous Detection)
 
 **What it does:** `accumulator.decay(factor)` multiplies all sums by a
 factor (e.g., 0.99). Old observations lose weight exponentially.
 
-**Current approach:** Fixed 2-second windows. Accumulate, normalize, compare,
-reset. Detection is discrete — drift is computed once per window.
+**Current approach:** Fixed 2-second windows. Discrete detection.
 
-**With decay:** No window resets. The accumulator runs continuously. Every
-N packets (or every M milliseconds), decay by a factor and compute drift.
-Detection becomes continuous — no 2-second blind spots.
+**With decay:** No window resets. Continuous accumulation with exponential
+forgetting. Detection becomes continuous — no blind spots at window
+boundaries.
 
 ```rust
-// Instead of: accumulate for 2s, check, reset
-// Do: continuously accumulate with exponential forgetting
 loop {
     let sample = receive_sample().await;
     let vec = holon.encode_walkable(&sample);
-
     recent_acc.add(&vec);
     packet_count += 1;
 
-    // Decay every 100 packets (tuneable)
     if packet_count % 100 == 0 {
         recent_acc.decay(0.95);  // 5% forgetting per cycle
-
-        // Continuous drift check
-        let recent_vec = recent_acc.normalize();
-        let drift = holon.similarity(&recent_vec, &baseline_vec);
-
-        if drift < threshold {
-            // Anomaly detected — no window boundary needed
-        }
+        let drift = holon.similarity(&recent_acc.normalize(), &baseline_vec);
+        if drift < threshold { /* anomaly — no window boundary needed */ }
     }
 }
 ```
 
-**Benefits:**
-- No window duration to tune (the decay factor replaces it)
-- No "missed" attacks that start in the middle of a window
-- Drift signal is smoother (no discrete jumps at window boundaries)
-- Naturally adapts: fast attacks show up fast, slow attacks show up slow
+**Benefits:** No window duration to tune. No missed attacks that start
+mid-window. Smoother drift signal. Naturally adapts to attack speed.
 
-**Trade-off:** Harder to reason about "how many packets contributed to this
-signal." The effective window is `1 / (1 - decay_factor)` packets (for
-decay=0.95, the effective window is ~20 packets before 50% contribution).
+**Trade-off:** Harder to reason about effective window size. The effective
+window is `1 / (1 - decay_factor)` packets.
 
-**Implementation:**
-- `sidecar/src/main.rs` — replace window-based loop with continuous loop
-- Can coexist: keep window-based for logging/metrics, add continuous for detection
-- The magnitude-based rate derivation still works: `||recent_acc||` still
-  correlates with volume, just with exponential weighting
-
-### 16b. Negate (Attack Peeling)
+### 14b. Negate (Attack Peeling)
 
 **What it does:** `Primitives::negate(superposition, component)` removes
 a known component from a superposition.
@@ -1565,121 +815,65 @@ a known component from a superposition.
 a hidden attack B underneath.
 
 ```rust
-// Detected DNS amplification, generated rule for it
-let dns_attack_profile = compute_attack_profile(&anomalous_packets);
-
-// Remove the known attack from the recent accumulator
 let cleaned = Primitives::negate(&recent_vec, &dns_attack_profile);
-
-// Does the cleaned signal still drift from baseline?
 let residual_drift = holon.similarity(&cleaned, &baseline_vec);
 
 if residual_drift < threshold {
     // Second attack detected! The DNS amp was masking it.
-    // Repeat: analyze `cleaned` for concentrated fields, generate rules
-    let second_anomaly = analyze_concentrated_fields(&cleaned, &baseline_vec);
 }
 ```
 
-**This is iterative peeling.** Detect → mitigate → peel → detect again.
-It can find N layered attacks, one at a time, by removing each detected
-pattern and looking at what remains.
+**Iterative peeling:** Detect → mitigate → peel → detect again. Finds N
+layered attacks by removing each detected pattern.
 
-**Implementation:**
-- `sidecar/src/main.rs` — add peeling loop after initial anomaly detection
-- Store detected attack profiles for peeling
-- Max peeling depth (e.g., 3 layers) to prevent infinite loops on noise
-
-### 16c. Prototype (Robust Attack Profiling)
+### 14c. Prototype (Robust Attack Profiling)
 
 **What it does:** `Primitives::prototype(vectors, threshold)` extracts the
 common pattern across multiple vectors using majority agreement.
 
-**Current approach:** Each anomalous window generates rules independently.
-If an attack spans 5 windows, you get 5 slightly different rule sets.
-
-**With prototype:** Accumulate anomalous window vectors, then extract the
-common pattern:
+**Application:** Accumulate anomalous window vectors, then extract stable
+attack profile:
 
 ```rust
-let mut anomalous_windows: Vec<Vector> = vec![];
-
-// Collect several anomalous windows
-if drift < threshold {
-    anomalous_windows.push(recent_vec.clone());
-}
-
-// After 3+ anomalous windows, extract stable attack profile
 if anomalous_windows.len() >= 3 {
-    let refs: Vec<&Vector> = anomalous_windows.iter().collect();
     let attack_prototype = Primitives::prototype(&refs, 0.5);
-
     // Generate rules from prototype (more stable than any single window)
-    let concentrated = analyze_concentrated_fields(&attack_prototype, &baseline_vec);
 }
 ```
 
-**Benefits:**
-- Rules are more stable (based on consensus across windows, not one snapshot)
-- Noisy single-window artifacts get filtered out
-- The prototype is the "essence" of the attack
+**Benefits:** Rules based on consensus across windows, not one snapshot.
+Noisy single-window artifacts filtered out.
 
-**Implementation:**
-- `sidecar/src/main.rs` — buffer anomalous windows, apply prototype before rule gen
-- Threshold parameter controls how much agreement is needed (0.5 = majority)
-
-### 16d. Resonance (Anomaly Isolation)
+### 14d. Resonance (Anomaly Isolation)
 
 **What it does:** `Primitives::resonance(vec, reference)` keeps only
-dimensions where `vec` and `reference` agree. Everything else is zeroed.
+dimensions where `vec` and `reference` agree.
 
-**Application:** Separate the "normal part" of traffic from the "anomalous
-part":
+**Application:** Separate normal traffic component from anomalous:
 
 ```rust
-// Extract what's normal about the recent window
 let normal_component = Primitives::resonance(&recent_vec, &baseline_vec);
-
-// The anomaly is everything that DOESN'T agree with baseline
 let anomaly_signal = Primitives::difference(&recent_vec, &normal_component);
-
-// Analyze the pure anomaly signal (baseline noise removed)
-let concentrated = analyze_concentrated_fields(&anomaly_signal, &zero_vec);
+// Analyze pure anomaly signal with baseline noise removed
 ```
 
-**Benefits:**
-- Cleaner anomaly signal (baseline noise removed)
-- More precise concentration analysis (only looks at what changed)
-- Works even when the attack is a small fraction of total traffic
+### 14e. Complexity (Baseline-Free Anomaly Signal)
 
-### 16e. Complexity (Baseline-Free Anomaly Signal)
+**What it does:** `Primitives::complexity(vec)` returns 0.0–1.0 measure
+of how "mixed" a vector is.
 
-**What it does:** `Primitives::complexity(vec)` returns a 0.0–1.0 measure
-of how "mixed" a vector is (density × balance of active dimensions).
-
-**Application:** A single-number anomaly signal that doesn't need a baseline:
+**Application:** Single-number anomaly signal without needing a baseline:
 
 ```rust
-let recent_vec = recent_acc.normalize();
 let c = Primitives::complexity(&recent_vec);
-
 // Low complexity = homogeneous traffic = likely attack
 // High complexity = diverse traffic = likely normal
-if c < 0.3 {
-    warn!("Low complexity ({:.2}) — traffic is unusually homogeneous", c);
-}
 ```
 
-**Benefits:**
-- Works from packet 1 (no warmup needed)
-- Complementary to drift (drift needs a baseline, complexity doesn't)
-- Good for the warmup period when baseline isn't established yet
+Works from packet 1 (no warmup needed). Good for the warmup period when
+baseline isn't established yet.
 
-**Implementation:**
-- Add to detection loop as an auxiliary signal
-- Could trigger early detection during warmup windows
-
-### 16f. Sequence Encoding (Flow-Level Detection)
+### 14f. Sequence Encoding (Flow-Level Detection)
 
 **What it does:** `encode_sequence(items, Ngram { n: 3 })` encodes
 3-element windows of a sequence, capturing local ordering patterns.
@@ -1687,127 +881,67 @@ if c < 0.3 {
 **Application:** Encode packet *flows* instead of individual packets:
 
 ```rust
-// Maintain a sliding window of recent packet vectors
-let mut flow_window: VecDeque<Vector> = VecDeque::with_capacity(3);
+// Encode 3-packet motifs
+let trigram = holon.encode_sequence(&packet_window, SequenceMode::Ngram { n: 3 });
+flow_acc.add(&trigram);
 
-for sample in samples {
-    let vec = holon.encode_walkable(&sample);
-    flow_window.push_back(vec);
-
-    if flow_window.len() == 3 {
-        // Encode the 3-packet motif
-        let refs: Vec<&Vector> = flow_window.iter().collect();
-        let trigram = holon.encode_sequence(&refs, SequenceMode::Ngram { n: 3 });
-
-        flow_acc.add(&trigram);
-        flow_window.pop_front();
-    }
-}
-
-// Compare flow patterns to baseline flow patterns
+// Compare flow patterns to baseline
 let flow_drift = holon.similarity(&flow_acc.normalize(), &baseline_flow_vec);
 ```
 
-**What this detects that per-packet can't:**
-- SYN→RST→SYN→RST loops (individual SYNs and RSTs are normal)
-- Slow scans (SYN to port A → SYN to port B → SYN to port C)
-- Protocol anomalies (data before handshake completes)
+**Detects what per-packet can't:** SYN→RST→SYN→RST loops, slow scans,
+protocol anomalies (data before handshake).
 
-**Implementation:**
-- Add flow accumulator alongside packet accumulator in detection loop
-- Separate drift threshold for flow-level anomalies
-- Higher latency (needs 3 packets to form a trigram) but deeper signal
-
-### 16g. Weighted Bundle (Confidence-Weighted Accumulation)
+### 14g. Weighted Bundle (Confidence-Weighted Accumulation)
 
 **What it does:** `accumulator.add_weighted(example, weight)` adds a
 vector with a weight factor.
 
-**Application:** Not all sampled packets are equally informative. Weight by:
-- **Packet size:** Larger packets carry more information
-- **Novelty:** Packets dissimilar to the accumulator get higher weight
-- **Recency within window:** Later packets may be more relevant
+**Application:** Weight by novelty — dissimilar packets get higher weight:
 
 ```rust
-// Weight by novelty: dissimilar packets get higher weight
 let sim = holon.similarity(&vec, &recent_acc.normalize());
-let novelty_weight = 1.0 - sim.abs();  // high when dissimilar
+let novelty_weight = 1.0 - sim.abs();
 recent_acc.add_weighted(&vec, novelty_weight);
 ```
 
-**Benefits:**
-- Novel traffic patterns are amplified (detected faster)
-- Redundant traffic is dampened (less noise)
-- Attack onset shows up sooner (first anomalous packets get high weight)
+Attack onset shows up sooner (first anomalous packets get high weight).
 
 ---
 
-## Updated Priority Table
+# Appendix — Workflow Notes
 
-| Feature | Complexity | eBPF Changes | Value |
-|---|---|---|---|
-| RHS syntax redesign | Low | None | High |
-| EDN rule parser | Low | None | High |
-| Named rate limiters | Low | None | High |
-| Compound naming | Low | None | Medium |
-| Count action | Medium | New map + action type | Medium |
-| Metrics reactor | Medium | Read-only (new reads) | High |
-| Vector-native cardinality | Low | None | **Very High** |
-| Magnitude spectrum | Low | None | **Very High** |
-| Accumulator decay | Low | None | **Very High** |
-| Attack peeling (negate) | Low | None | High |
-| Prototype (robust profiling) | Low | None | High |
-| Resonance (anomaly isolation) | Low | None | Medium |
-| Complexity (baseline-free) | Low | None | Medium |
-| Weighted accumulation | Low | None | Medium |
-| Sequence/n-gram detection | Medium | None | High |
-| `In` predicate | Low | None (compiler only) | High |
-| Negation (`not`) | Medium | Exclusion field on TreeNode | Medium |
-| Range predicates | Medium | Node annotation or expansion | Medium |
-| Bitmask predicate | Medium | Node annotation | Medium |
-| Dynamic prefix lists (LPM) | High | New map type + predicate | High |
-| Blue/green prefix lists | Medium | Double-buffered LPM tries | Medium |
-| ipset-style counters/TTL | Medium | PrefixEntry struct in LPM | High |
-| HyperLogLog (eBPF) | Medium | Small array + observe fn | Medium |
-| Bloom filters | Medium | New map type | Low (niche) |
+## Planning & Implementation Handoff
 
-### Updated Implementation Order
+1. **Deep planning (Opus):** Architectural decisions, eBPF verifier strategies,
+   algorithm design, tradeoff analysis. Output: a design section in this doc.
 
-**Batch 1 — Foundation (no eBPF changes):**
-1. RHS syntax redesign (struct changes, formatting, JSON parsing)
-2. EDN parser integration (`edn-rs` or `edn-format`)
-3. Named rate limiters + compound naming
-4. `In` predicate (compiler-only, multi-edge to shared child)
+2. **Implementation (Sonnet):** Given a specific section, implement it. Each
+   section is self-contained: structs to change, files to touch, eBPF impact.
 
-**Batch 2 — Holon detection enrichment (no eBPF changes):**
-5. TTL + tcp_window log-scale encoding (fuzzy field clustering)
-6. Accumulator decay (continuous detection, no window resets)
-7. Complexity as auxiliary signal (baseline-free, works during warmup)
-8. Attack peeling via negate (layered attack detection)
-9. Prototype for robust attack profiling (consensus across windows)
-10. Resonance for anomaly isolation (remove baseline noise)
-11. Weighted accumulation (novelty-weighted packets)
+3. **Review (Opus):** If Sonnet hits a wall (verifier issues, architectural
+   questions), escalate back for analysis.
 
-**Batch 3 — Vector-native intelligence (no eBPF changes):**
-12. Vector-native cardinality (unbinding as diversity estimator)
-13. Magnitude spectrum (per-field diversity profile)
-14. Interference detection (correlated attack signal)
-15. Cardinality-aware rule generation (botnet vs amplification strategy)
-16. Sequence/n-gram flow detection (packet motif anomalies)
+## Suggested Implementation Order
 
-**Batch 4 — eBPF observability:**
-17. Count action (new map, new action type in walker)
-18. Metrics reactor (async collection + emission loop)
-19. HyperLogLog in `veth_filter` (ground-truth cardinality for dashboards)
+**Next batch — Scale features (eBPF map extensions):**
+1. Dynamic prefix lists (LPM tries with TTL + counters)
+2. Blue/green prefix list swaps
+3. Holon integration (auto-populate prefix lists from detection)
 
-**Batch 5 — eBPF predicates:**
-20. Negation (exclusion field on TreeNode)
-21. Range predicates (start with expansion, then node annotation)
-22. Bitmask predicate (node annotation)
+**Holon detection enrichment (no eBPF changes):**
+4. Vector-native cardinality (unbinding as diversity estimator)
+5. Magnitude spectrum (per-field diversity profile)
+6. Accumulator decay (continuous detection)
+7. Attack peeling via negate (layered attack detection)
+8. Prototype for robust attack profiling
+9. Complexity as auxiliary signal (baseline-free, works during warmup)
 
-**Batch 6 — Scale features (prefix lists):**
-23. Dynamic prefix lists (LPM tries with ipset-style TTL + counters)
-24. Blue/green prefix list swaps
-25. Holon integration (auto-populate prefix lists from detection)
-26. Cross-field OR (compiler rule duplication)
-27. Bloom filters (if needed)
+**eBPF observability:**
+10. Metrics reactor (async collection + emission pipeline)
+11. HyperLogLog in `veth_filter` (ground-truth cardinality for dashboards)
+
+**Later:**
+12. Negation predicate (exclusion field on TreeNode)
+13. Cross-field OR (compiler rule duplication)
+14. Bloom filters (if needed)
