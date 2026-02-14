@@ -478,6 +478,35 @@ impl RuleSpec {
         if h == 0 { 1 } else { h }
     }
 
+    /// Compute the rate limiter bucket key for this rule.
+    /// 
+    /// Named rate limiters (e.g., `(rate-limit 1000 :name "dns-amp")`) share a bucket
+    /// across all rules with the same name. Unnamed rate limiters get a per-rule bucket
+    /// keyed by the rule's canonical hash.
+    /// 
+    /// Returns the bucket key (u32) for the first rate-limit action, or None if no rate-limit.
+    pub fn bucket_key(&self) -> Option<u32> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        // Find first rate-limit action
+        for action in &self.actions {
+            if let RuleAction::RateLimit { pps: _, name } = action {
+                if let Some(name) = name {
+                    // Named bucket: hash the name string
+                    let mut hasher = DefaultHasher::new();
+                    name.hash(&mut hasher);
+                    let h = hasher.finish() as u32;
+                    return Some(if h == 0 { 1 } else { h });
+                } else {
+                    // Unnamed bucket: use rule's canonical hash
+                    return Some(self.canonical_hash());
+                }
+            }
+        }
+        None
+    }
+
     /// Whether this rule needs Phase 2 fields
     pub fn needs_phase2(&self) -> bool {
         self.constraints.iter().any(|p| {
@@ -1536,6 +1565,8 @@ mod tests {
             constraints: vec![],
             actions: vec![RuleAction::Pass],
             priority: 100,
+            comment: None,
+            label: None,
         };
         assert_eq!(spec.to_sexpr(), "(() => (pass))");
     }

@@ -97,7 +97,7 @@ fn compile_recursive(rules: &[RuleSpec], dim_idx: usize) -> Rc<ShadowNode> {
                     action: first_action.action_type(),
                     priority: best.priority,
                     rate_pps: first_action.rate_pps().unwrap_or(0),
-                    rule_id: best.canonical_hash(),
+                    rule_id: best.bucket_key().unwrap_or_else(|| best.canonical_hash()),
                 });
             }
         }
@@ -151,7 +151,7 @@ fn compile_recursive(rules: &[RuleSpec], dim_idx: usize) -> Rc<ShadowNode> {
                 action: first_action.action_type(),
                 priority: best.priority,
                 rate_pps: first_action.rate_pps().unwrap_or(0),
-                rule_id: best.canonical_hash(),
+                rule_id: best.bucket_key().unwrap_or_else(|| best.canonical_hash()),
             });
         }
     }
@@ -255,7 +255,18 @@ fn flatten_recursive(
 
     let (has_action, action, priority, rate_pps, rule_id) = if let Some(a) = &shadow.action {
         if a.action == ACT_RATE_LIMIT && a.rate_pps > 0 {
-            if !flat.rate_buckets.iter().any(|(id, _)| *id == a.rule_id) {
+            // Check if bucket already exists (for named buckets shared across rules)
+            if let Some(existing) = flat.rate_buckets.iter_mut().find(|(id, _)| *id == a.rule_id) {
+                // Bucket exists - update with latest PPS (last definer wins)
+                if existing.1.rate_pps != a.rate_pps {
+                    eprintln!("WARN: Named bucket {} has conflicting PPS: {} -> {}. Using last-defined: {}",
+                              a.rule_id, existing.1.rate_pps, a.rate_pps, a.rate_pps);
+                    // Last definer wins
+                    existing.1.rate_pps = a.rate_pps;
+                    existing.1.tokens = a.rate_pps;
+                }
+            } else {
+                // New bucket - insert it
                 flat.rate_buckets.push((a.rule_id, TokenBucket {
                     rate_pps: a.rate_pps,
                     tokens: a.rate_pps,

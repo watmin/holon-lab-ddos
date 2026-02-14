@@ -110,7 +110,51 @@ limiters share the same bucket key derived from the name, not the rule hash.
 
 ---
 
-## 2. Named Rate Limiters (Shared Buckets)
+## ✅ 2. Named Rate Limiters (Shared Buckets) [COMPLETED 2026-02-13]
+
+**Status:** ✅ Implemented and tested.
+
+### Implementation Summary
+
+Successfully implemented named rate limiter buckets with:
+- ✅ `bucket_key()` method on `RuleSpec` for computing bucket keys
+- ✅ Named buckets hash the name string to derive key
+- ✅ Unnamed buckets use rule's canonical hash (backward compatible)
+- ✅ Tree compilation uses `bucket_key()` instead of `canonical_hash()` for rate limiters
+- ✅ PPS conflict handling: last-defined value wins, with warning
+- ✅ Test rules generated and verified (5 buckets from 10 rate-limit rules)
+
+### Behavior
+
+When multiple rules share the same named bucket:
+1. They all reference the same token bucket in the eBPF map
+2. Tokens are shared across all rules with that name
+3. If PPS values differ, the last-defined value wins (with warning)
+4. Unnamed rate limiters continue to use per-rule buckets
+
+### Example
+
+```edn
+;; These three rules share "dns-amp" bucket
+{:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.100")] 
+ :actions [(rate-limit 1000 :name "dns-amp")]}
+
+{:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.101")] 
+ :actions [(rate-limit 1000 :name "dns-amp")]}
+
+{:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.102")] 
+ :actions [(rate-limit 1000 :name "dns-amp")]}
+
+;; This rule has its own per-rule bucket (unnamed)
+{:constraints [(= proto 17) (= src-addr "10.0.0.200")] 
+ :actions [(rate-limit 100)]}
+```
+
+Result: 2 buckets instead of 4 (3 rules share 1 named bucket + 1 unnamed).
+
+---
+
+## 3. Attack Pattern Library (Holon-Generated Rules)
 
 ### Problem
 
