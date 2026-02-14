@@ -19,7 +19,7 @@ use aya::Ebpf;
 use tracing::info;
 
 use crate::{
-    EdgeKey, FieldDim, RuleSpec, TokenBucket, TreeNode,
+    EdgeKey, FieldDim, FieldRef, Predicate, RuleSpec, TokenBucket, TreeNode,
     ACT_PASS, ACT_RATE_LIMIT, DIM_LEAF, NUM_DIMENSIONS, TREE_SLOT_SIZE,
 };
 
@@ -77,7 +77,51 @@ struct ShadowAction {
 /// Wildcard rules live only in the wildcard_child branch.
 /// The eBPF walker explores both specific and wildcard paths via DFS.
 fn compile_tree(rules: &[RuleSpec]) -> Rc<ShadowNode> {
-    compile_recursive(rules, 0)
+    // Expand In predicates into multiple rules
+    let expanded_rules = expand_in_predicates(rules);
+    compile_recursive(&expanded_rules, 0)
+}
+
+/// Expand In predicates into multiple Eq-based rules.
+/// (in proto 6 17) becomes two rules: one with (= proto 6), one with (= proto 17)
+pub fn expand_in_predicates(rules: &[RuleSpec]) -> Vec<RuleSpec> {
+    let mut expanded = Vec::new();
+    
+    for rule in rules {
+        // Check if this rule has any In predicates
+        let has_in = rule.constraints.iter().any(|p| matches!(p, Predicate::In(_, _)));
+        
+        if !has_in {
+            // No In predicates - keep as-is
+            expanded.push(rule.clone());
+            continue;
+        }
+        
+        // Expand: create one rule per combination of In values
+        let mut current_rules = vec![rule.clone()];
+        
+        for (pred_idx, pred) in rule.constraints.iter().enumerate() {
+            if let Predicate::In(field_ref, values) = pred {
+                let mut new_rules = Vec::new();
+                
+                // For each existing rule, create N variants (one per value in the In set)
+                for base_rule in &current_rules {
+                    for val in values {
+                        let mut new_rule = base_rule.clone();
+                        // Replace the In predicate with an Eq predicate
+                        new_rule.constraints[pred_idx] = Predicate::Eq(field_ref.clone(), *val);
+                        new_rules.push(new_rule);
+                    }
+                }
+                
+                current_rules = new_rules;
+            }
+        }
+        
+        expanded.extend(current_rules);
+    }
+    
+    expanded
 }
 
 fn compile_recursive(rules: &[RuleSpec], dim_idx: usize) -> Rc<ShadowNode> {
@@ -398,11 +442,31 @@ impl TreeManager {
         }
 
         // 5. Write rate buckets to TREE_RATE_STATE
-        // Only write NEW buckets (don't overwrite existing state to preserve tokens)
+        // Clear old buckets and write new ones
         {
             let mut rate_map: AyaHashMap<_, u32, TokenBucket> = bpf
                 .map_mut("TREE_RATE_STATE").context("TREE_RATE_STATE not found")?
                 .try_into()?;
+            
+            // Collect current bucket IDs from new rules
+            let new_bucket_ids: std::collections::HashSet<u32> = 
+                flat.rate_buckets.iter().map(|(id, _)| *id).collect();
+            
+            // Remove stale buckets (not in new rule set)
+            let all_keys: Vec<u32> = rate_map.keys().filter_map(|k| k.ok()).collect();
+            let mut removed_count = 0;
+            for key in all_keys {
+                if !new_bucket_ids.contains(&key) {
+                    if rate_map.remove(&key).is_ok() {
+                        removed_count += 1;
+                    }
+                }
+            }
+            if removed_count > 0 {
+                info!("Cleaned up {} expired rate limiter bucket(s) from eBPF map", removed_count);
+            }
+            
+            // Insert/update buckets (preserve tokens for buckets that still exist)
             for &(rule_id, ref bucket) in &flat.rate_buckets {
                 // Only insert if not already present (preserves token state across flips)
                 if rate_map.get(&rule_id, 0).is_err() {

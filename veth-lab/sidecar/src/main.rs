@@ -927,16 +927,35 @@ fn parse_edn_predicate(edn: &Edn) -> Result<Option<Predicate>> {
     }
     
     let op = list[0].to_string();
-    if op != "=" {
-        anyhow::bail!("Only = predicates supported for now, got: {}", op);
-    }
-    
     let field = list[1].to_string();
     let dim = parse_field_name(&field)?;
     
-    let value = parse_field_value(&list[2], dim)?;
-    
-    Ok(Some(Predicate::eq(dim, value)))
+    match op.as_str() {
+        "=" => {
+            // (= field value)
+            if list.len() != 3 {
+                anyhow::bail!("= predicate requires exactly 3 elements, got {}", list.len());
+            }
+            let value = parse_field_value(&list[2], dim)?;
+            Ok(Some(Predicate::eq(dim, value)))
+        }
+        "in" => {
+            // (in field val1 val2 ...)
+            if list.len() < 3 {
+                anyhow::bail!("in predicate requires at least 3 elements (op field value...)");
+            }
+            let mut values = Vec::new();
+            for i in 2..list.len() {
+                let val = parse_field_value(&list[i], dim)?;
+                values.push(val);
+            }
+            if values.is_empty() {
+                anyhow::bail!("in predicate must have at least one value");
+            }
+            Ok(Some(Predicate::In(veth_filter::FieldRef::Dim(dim), values)))
+        }
+        _ => anyhow::bail!("Unsupported predicate operator: {}", op),
+    }
 }
 
 /// Parse field name from EDN symbol
@@ -1246,6 +1265,10 @@ async fn main() -> Result<()> {
     let rate_limiter_names: Arc<RwLock<std::collections::HashMap<u32, (String, String)>>> = 
         Arc::new(RwLock::new(std::collections::HashMap::new()));
 
+    // Map bucket_key → RuleSpec for display (handles unnamed limiters after In expansion)
+    let bucket_key_to_spec: Arc<RwLock<std::collections::HashMap<u32, RuleSpec>>> = 
+        Arc::new(RwLock::new(std::collections::HashMap::new()));
+
     // ── Pre-load rules from file if specified ──
     if let Some(ref rules_path) = args.rules_file {
         let start = Instant::now();
@@ -1257,11 +1280,29 @@ async fn main() -> Result<()> {
             let mut rules = active_rules.write().await;
             let mut counter_map = counter_names.write().await;
             let mut rate_map = rate_limiter_names.write().await;
+            let mut bucket_map = bucket_key_to_spec.write().await;
             
-            // Build counter and rate limiter name maps for logging
-            for spec in &preloaded {
+            // Expand In predicates before populating maps
+            let expanded = veth_filter::tree::expand_in_predicates(&preloaded);
+            
+            // Build counter, rate limiter name maps, and bucket_key→spec map for logging
+            for spec in &expanded {
+                // Store ALL rules with rate limiters or counters in bucket_map
+                // This handles unnamed limiters whose bucket_key = canonical_hash
+                for action in &spec.actions {
+                    match action {
+                        veth_filter::RuleAction::RateLimit { .. } | veth_filter::RuleAction::Count { .. } => {
+                            if let Some(key) = spec.bucket_key() {
+                                bucket_map.entry(key).or_insert_with(|| spec.clone());
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                
                 if let Some(key) = spec.bucket_key() {
-                    // Check if this is a count action with a name
+                    // Check if this is a count action or named rate limiter
                     for action in &spec.actions {
                         match action {
                             veth_filter::RuleAction::Count { name: Some((ns, n)) } => {
@@ -1297,6 +1338,14 @@ async fn main() -> Result<()> {
                 info!("Configured {} rate limiters:", rate_map.len());
                 for (hash, (ns, name)) in rate_map.iter() {
                     info!("  [\"{}\" \"{}\"] → key 0x{:08x}", ns, name, hash);
+                }
+            }
+
+            // Debug: log bucket_map contents
+            if !bucket_map.is_empty() {
+                info!("Bucket map contains {} entries:", bucket_map.len());
+                for (key, spec) in bucket_map.iter() {
+                    info!("  0x{:08x} → {}", key, spec.display_label());
                 }
             }
 
@@ -1495,18 +1544,16 @@ async fn main() -> Result<()> {
                             sorted.sort_by_key(|(_, allowed, dropped)| std::cmp::Reverse(allowed + dropped));
                             
                             let rate_map = rate_limiter_names.read().await;
-                            let rules_lock = active_rules.read().await;
+                            let bucket_map = bucket_key_to_spec.read().await;
                             
                             for (key, allowed, dropped) in sorted {
                                 // First check if it's a named rate limiter
                                 if let Some((ns, name)) = rate_map.get(&key) {
                                     info!("  [{}  {}] allowed: {}  dropped: {}", ns, name, allowed, dropped);
                                 } else {
-                                    // Unnamed limiter - look up rule by canonical hash
-                                    // The key IS the canonical_hash for unnamed limiters
-                                    let label = rules_lock.values()
-                                        .find(|r| r.spec.canonical_hash() == key)
-                                        .map(|r| r.spec.display_label())
+                                    // Unnamed limiter - look up rule by bucket_key
+                                    let label = bucket_map.get(&key)
+                                        .map(|spec| spec.display_label())
                                         .unwrap_or_else(|| format!("unknown-0x{:08x}", key));
                                     info!("  {} allowed: {}  dropped: {}", label, allowed, dropped);
                                 }
@@ -1573,6 +1620,13 @@ async fn main() -> Result<()> {
                                 spec: spec.clone(),
                                 preloaded: false,
                             });
+                            
+                            // Update bucket_key_to_spec map for observability
+                            if let Some(bk) = spec.bucket_key() {
+                                let mut bmap = bucket_key_to_spec.write().await;
+                                bmap.entry(bk).or_insert_with(|| spec.clone());
+                            }
+                            
                             tree_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
 

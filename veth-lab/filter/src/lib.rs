@@ -237,13 +237,14 @@ pub enum FieldRef {
 pub enum Predicate {
     /// Exact equality: field == value
     Eq(FieldRef, u32),
+    /// Set membership: field in [val1, val2, ...]
+    In(FieldRef, Vec<u32>),
     // Future:
     // Gt(FieldRef, u32),
     // Lt(FieldRef, u32),
     // Gte(FieldRef, u32),
     // Lte(FieldRef, u32),
     // Mask(FieldRef, u32),
-    // In(FieldRef, Vec<u32>),
     // Not(Box<Predicate>),
     // Or(Vec<Predicate>),
 }
@@ -255,10 +256,18 @@ impl Predicate {
     }
 
     /// Extract (FieldDim, value) if this is an Eq on a Dim ref.
-    /// Returns `None` for future predicate variants.
+    /// Returns `None` for In and future predicate variants.
     pub fn as_eq_dim(&self) -> Option<(FieldDim, u32)> {
         match self {
             Predicate::Eq(FieldRef::Dim(dim), value) => Some((*dim, *value)),
+            Predicate::In(_, _) => None,
+        }
+    }
+
+    /// Get the field dimension this predicate tests (works for Eq and In)
+    pub fn field_dim(&self) -> Option<FieldDim> {
+        match self {
+            Predicate::Eq(FieldRef::Dim(dim), _) | Predicate::In(FieldRef::Dim(dim), _) => Some(*dim),
         }
     }
 
@@ -267,6 +276,12 @@ impl Predicate {
         match self {
             Predicate::Eq(FieldRef::Dim(dim), value) => {
                 format!("(= {} {})", dim.sexpr_name(), dim.sexpr_value(*value))
+            }
+            Predicate::In(FieldRef::Dim(dim), values) => {
+                let vals: Vec<String> = values.iter()
+                    .map(|v| dim.sexpr_value(*v))
+                    .collect();
+                format!("(in {} {})", dim.sexpr_name(), vals.join(" "))
             }
         }
     }
@@ -444,15 +459,28 @@ impl RuleSpec {
         use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
         
-        // Sort constraints for canonical ordering (Eq predicates by dim then value)
-        let mut sorted: Vec<(u8, u32)> = self.constraints.iter()
-            .filter_map(|p| p.as_eq_dim())
-            .map(|(d, v)| (d as u8, v))
-            .collect();
-        sorted.sort();
-        for (dim, val) in &sorted {
-            dim.hash(&mut hasher);
-            val.hash(&mut hasher);
+        // Sort constraints for canonical ordering
+        // Build a representation that includes dim + predicate type + values
+        let mut sorted_parts: Vec<String> = Vec::new();
+        for pred in &self.constraints {
+            match pred {
+                Predicate::Eq(FieldRef::Dim(dim), val) => {
+                    sorted_parts.push(format!("eq-{}-{}", *dim as u8, val));
+                }
+                Predicate::In(FieldRef::Dim(dim), vals) => {
+                    let mut sorted_vals = vals.clone();
+                    sorted_vals.sort();
+                    let vals_str = sorted_vals.iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    sorted_parts.push(format!("in-{}-{}", *dim as u8, vals_str));
+                }
+            }
+        }
+        sorted_parts.sort();
+        for part in &sorted_parts {
+            part.hash(&mut hasher);
         }
         
         // Hash all actions (sorted by type first, then by fields)
@@ -528,35 +556,57 @@ impl RuleSpec {
         // Sort constraints by dimension for canonical ordering
         let mut sorted: Vec<&Predicate> = self.constraints.iter().collect();
         sorted.sort_by_key(|p| {
-            p.as_eq_dim().map(|(d, _)| d as u8).unwrap_or(255)
+            p.field_dim().map(|d| d as u8).unwrap_or(255)
         });
         
         for pred in sorted {
-            if let Some((dim, val)) = pred.as_eq_dim() {
-                let (dim_name, val_str) = match dim {
-                    FieldDim::Proto => ("proto", val.to_string()),
-                    FieldDim::SrcIp => {
-                        // IP addresses are stored in network byte order (big-endian)
-                        let ip = std::net::Ipv4Addr::from(val.to_be());
-                        ("src-ip", ip.to_string())
-                    }
-                    FieldDim::DstIp => {
-                        // IP addresses are stored in network byte order (big-endian)
-                        let ip = std::net::Ipv4Addr::from(val.to_be());
-                        ("dst-ip", ip.to_string())
-                    }
-                    FieldDim::L4Word0 => ("src-port", val.to_string()),
-                    FieldDim::L4Word1 => ("dst-port", val.to_string()),
-                    FieldDim::TcpFlags => ("tcp-flags", val.to_string()),
-                    FieldDim::Ttl => ("ttl", val.to_string()),
-                    FieldDim::DfBit => ("df-bit", val.to_string()),
-                    FieldDim::TcpWindow => ("tcp-window", val.to_string()),
-                };
-                parts.push(format!("(= {} {})", dim_name, val_str));
+            match pred {
+                Predicate::Eq(FieldRef::Dim(dim), val) => {
+                    let (dim_name, val_str) = Self::format_dim_value(*dim, *val);
+                    parts.push(format!("(= {} {})", dim_name, val_str));
+                }
+                Predicate::In(FieldRef::Dim(dim), vals) => {
+                    let dim_name = Self::dim_name(*dim);
+                    let val_strs: Vec<String> = vals.iter()
+                        .map(|v| Self::format_dim_value(*dim, *v).1)
+                        .collect();
+                    parts.push(format!("(in {} {})", dim_name, val_strs.join(" ")));
+                }
             }
         }
         
         format!("[{}]", parts.join(" "))
+    }
+
+    /// Helper: format dimension name
+    fn dim_name(dim: FieldDim) -> &'static str {
+        match dim {
+            FieldDim::Proto => "proto",
+            FieldDim::SrcIp => "src-ip",
+            FieldDim::DstIp => "dst-ip",
+            FieldDim::L4Word0 => "src-port",
+            FieldDim::L4Word1 => "dst-port",
+            FieldDim::TcpFlags => "tcp-flags",
+            FieldDim::Ttl => "ttl",
+            FieldDim::DfBit => "df-bit",
+            FieldDim::TcpWindow => "tcp-window",
+        }
+    }
+
+    /// Helper: format dimension value (handles IP byte order, etc.)
+    fn format_dim_value(dim: FieldDim, val: u32) -> (&'static str, String) {
+        let dim_name = Self::dim_name(dim);
+        let val_str = match dim {
+            FieldDim::Proto => val.to_string(),
+            FieldDim::SrcIp | FieldDim::DstIp => {
+                // IP addresses are stored in network byte order (big-endian)
+                let ip = std::net::Ipv4Addr::from(val.to_be());
+                ip.to_string()
+            }
+            FieldDim::L4Word0 | FieldDim::L4Word1 | FieldDim::TcpFlags |
+            FieldDim::Ttl | FieldDim::DfBit | FieldDim::TcpWindow => val.to_string(),
+        };
+        (dim_name, val_str)
     }
 
     /// Get the display label for this rule.

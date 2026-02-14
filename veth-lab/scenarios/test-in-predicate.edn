@@ -1,0 +1,11 @@
+;; Test In predicate with rate limiters that will actually fire
+;; Traffic goes to port 9999 from 10.0.0.100
+
+;; Rate-limit UDP to common attack ports AND port 9999 (the test port)
+{:constraints [(= proto 17) (in dst-port 53 123 9999)] :actions [(rate-limit 5000)] :priority 200 :comment "Rate-limit UDP to DNS/NTP/test-port"}
+
+;; Count all UDP traffic for observability
+{:constraints [(= proto 17)] :actions [(count :name ["test" "all-udp"])] :priority 50 :comment "Count all UDP"}
+
+;; Count TCP+UDP on multiple ports using In
+{:constraints [(in proto 6 17) (in dst-port 80 443 9999)] :actions [(count :name ["test" "web-and-game"])] :priority 50 :comment "Count web and game traffic"}
