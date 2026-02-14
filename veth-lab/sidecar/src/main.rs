@@ -1775,7 +1775,7 @@ async fn main() -> Result<()> {
                             for (key, allowed, dropped) in sorted {
                                 // First check if it's a named rate limiter
                                 if let Some((ns, name)) = rate_map.get(&key) {
-                                    info!("  [{}  {}] allowed: {}  dropped: {}", ns, name, allowed, dropped);
+                                    info!("  [{} {}] allowed: {}  dropped: {}", ns, name, allowed, dropped);
                                 } else {
                                     // Unnamed limiter - look up rule by bucket_key
                                     let label = bucket_map.get(&key)
