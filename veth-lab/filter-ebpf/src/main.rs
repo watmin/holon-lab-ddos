@@ -76,6 +76,7 @@ pub struct RuleValue {
 const ACT_PASS: u8 = 0;
 const ACT_DROP: u8 = 1;
 const ACT_RATE_LIMIT: u8 = 2;
+const ACT_COUNT: u8 = 3;
 
 /// Rule metadata: action + rate limit config. Indexed by bit position (0-63).
 #[repr(C)]
@@ -246,6 +247,10 @@ static TREE_ROOT: Array<u32> = Array::with_max_entries(1, 0);
 /// Rate limit state for tree rules (keyed by stable rule_id, survives flips).
 #[map]
 static TREE_RATE_STATE: HashMap<u32, TokenBucket> = HashMap::with_max_entries(2_000_000, 0);
+
+/// Per-counter packet counts for Count actions (keyed by counter name hash)
+#[map]
+static TREE_COUNTERS: HashMap<u32, u64> = HashMap::with_max_entries(100_000, 0);
 
 // =============================================================================
 // Tree Rete Tail-Call DFS Maps
@@ -1011,11 +1016,28 @@ fn try_tree_walk_step(ctx: &XdpContext) -> Result<u32, ()> {
     // ---------------------------------------------------------------
     // Check if this node carries an action (priority-based best match)
     // ---------------------------------------------------------------
-    if node.has_action != 0 && node.priority >= state.best_prio {
-        state.matched = 1;
-        state.best_prio = node.priority;
-        state.best_action = node.action;
-        state.best_rule_id = node.rule_id;
+    if node.has_action != 0 {
+        // ACT_COUNT is non-terminating: increment counter and continue
+        if node.action == ACT_COUNT {
+            // Increment counter for this rule_id
+            match TREE_COUNTERS.get_ptr_mut(&node.rule_id) {
+                Some(ptr) => {
+                    let count = unsafe { &mut *ptr };
+                    *count += 1;
+                }
+                None => {
+                    // First packet for this counter - initialize to 1
+                    let _ = TREE_COUNTERS.insert(&node.rule_id, &1, 0);
+                }
+            }
+            // Don't update best_action - continue walking
+        } else if node.priority >= state.best_prio {
+            // Terminating actions (PASS, DROP, RATE_LIMIT) compete on priority
+            state.matched = 1;
+            state.best_prio = node.priority;
+            state.best_action = node.action;
+            state.best_rule_id = node.rule_id;
+        }
     }
 
     // ---------------------------------------------------------------

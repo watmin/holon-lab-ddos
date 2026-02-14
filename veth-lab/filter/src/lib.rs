@@ -53,7 +53,7 @@ impl RuleAction {
             RuleAction::Pass => ACT_PASS,
             RuleAction::Drop => ACT_DROP,
             RuleAction::RateLimit { .. } => ACT_RATE_LIMIT,
-            RuleAction::Count { .. } => 3, // ACT_COUNT (to be added to eBPF later)
+            RuleAction::Count { .. } => ACT_COUNT,
         }
     }
 
@@ -316,6 +316,7 @@ pub const DIM_LEAF: u8 = 0xFF;
 pub const ACT_PASS: u8 = 0;
 pub const ACT_DROP: u8 = 1;
 pub const ACT_RATE_LIMIT: u8 = 2;
+pub const ACT_COUNT: u8 = 3;
 
 /// Node in the decision tree (must match eBPF TreeNode exactly).
 #[repr(C)]

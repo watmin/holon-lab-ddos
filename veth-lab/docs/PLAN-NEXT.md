@@ -261,7 +261,70 @@ needs to set `rule_id` to the named bucket key instead of the rule hash.
 
 ---
 
-## 3. Count Action (Non-Terminating)
+## ✅ 3. Count Action (Non-Terminating) [COMPLETED 2026-02-13]
+
+**Status:** ✅ Implemented and tested.
+
+### Implementation Summary
+
+Successfully implemented non-terminating Count actions:
+- ✅ Added `ACT_COUNT = 3` constant to both userspace and eBPF
+- ✅ Added `TREE_COUNTERS` HashMap in eBPF for counter storage (100k max)
+- ✅ Modified `tree_walk_step` to handle Count as non-terminating
+- ✅ Count actions increment counter but don't stop DFS walk
+- ✅ Uses namespaced names like rate limiters: `["namespace", "name"]`
+
+### Behavior
+
+**Count actions are non-terminating:**
+- When a Count node is matched, the counter is incremented
+- The DFS continues walking - other rules can still match
+- Count actions don't compete on priority with terminating actions
+- Perfect for observability without affecting packet forwarding
+
+**Example:**
+```edn
+;; Count all SYN packets (non-terminating)
+{:constraints [(= proto 6) (= tcp-flags 2)]
+ :actions [(count :name ["monitor", "syn-packets"])]}
+
+;; Separately, rate-limit SYN floods to port 9999 (terminating)
+{:constraints [(= proto 6) (= tcp-flags 2) (= dst-port 9999)]
+ :actions [(rate-limit 100)]
+ :priority 200}
+```
+
+Result: Every SYN packet increments the counter. SYN packets to port 9999 ALSO hit the rate-limiter.
+
+### Counter Storage
+
+- **eBPF Map**: `TREE_COUNTERS: HashMap<u32, u64>` (100k max entries)
+- **Key**: Hash of `[namespace, name]` tuple (same as rate limiter buckets)
+- **Value**: Packet count (u64)
+- **Userspace**: Can read `TREE_COUNTERS` for observability (future enhancement)
+
+### Implementation Details
+
+**eBPF `tree_walk_step` logic:**
+```rust
+if node.has_action != 0 {
+    if node.action == ACT_COUNT {
+        // Non-terminating: increment and continue
+        TREE_COUNTERS.increment(node.rule_id);
+        // Don't update best_action - keep walking
+    } else if node.priority >= state.best_prio {
+        // Terminating: compete on priority
+        state.best_action = node.action;
+        state.best_prio = node.priority;
+    }
+}
+```
+
+All tests pass. Ready for production use.
+
+---
+
+## 4. Predicate Extensions
 
 ### Problem
 
