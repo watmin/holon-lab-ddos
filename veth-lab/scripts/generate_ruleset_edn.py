@@ -60,13 +60,21 @@ def format_edn_rule(constraints, actions, priority=None, comment=None):
             pps = action.get("pps", 1000)
             name = action.get("name")
             if name:
-                action_strs.append(f'(rate-limit {pps} :name "{name}")')
+                # name MUST be a tuple (namespace, name)
+                if not isinstance(name, tuple) or len(name) != 2:
+                    raise ValueError(f"rate-limit name must be a 2-tuple (namespace, name), got: {name}")
+                ns, n = name
+                action_strs.append(f'(rate-limit {pps} :name ["{ns}", "{n}"])')
             else:
                 action_strs.append(f'(rate-limit {pps})')
         elif action["type"] == "count":
             name = action.get("name")
             if name:
-                action_strs.append(f'(count :name "{name}")')
+                # name MUST be a tuple (namespace, name)
+                if not isinstance(name, tuple) or len(name) != 2:
+                    raise ValueError(f"count name must be a 2-tuple (namespace, name), got: {name}")
+                ns, n = name
+                action_strs.append(f'(count :name ["{ns}", "{n}"])')
             else:
                 action_strs.append("(count)")
     

@@ -1019,27 +1019,49 @@ fn parse_edn_action(edn: &Edn) -> Result<Option<RuleAction>> {
             let pps = list[1].to_string().parse::<u32>()
                 .with_context(|| "rate-limit PPS must be a number")?;
             
-            // Check for optional :name keyword
+            // Check for optional :name keyword - MUST be [namespace, name] vector
             let name = if list.len() >= 4 && list[2].to_string() == ":name" {
-                let name_str = list[3].to_string();
-                Some(name_str.trim_matches('"').to_string())
+                match &list[3] {
+                    Edn::Vector(vec) => {
+                        // Parse as [namespace, name]
+                        let items = vec.clone().to_vec();
+                        if items.len() != 2 {
+                            anyhow::bail!(":name must be [namespace, name] with exactly 2 elements");
+                        }
+                        let ns = items[0].to_string().trim_matches('"').to_string();
+                        let n = items[1].to_string().trim_matches('"').to_string();
+                        Some((ns, n))
+                    }
+                    _ => anyhow::bail!(":name must be a vector [namespace, name], got: {:?}", list[3]),
+                }
             } else {
                 None
             };
             
-                Ok(Some(RuleAction::RateLimit { pps, name }))
-            }
-            "count" => {
-                // Check for optional :name keyword
-                let name = if list.len() >= 3 && list[1].to_string() == ":name" {
-                    let name_str = list[2].to_string();
-                    Some(name_str.trim_matches('"').to_string())
-                } else {
-                    None
-                };
-                
-                Ok(Some(RuleAction::Count { name }))
-            }
+            Ok(Some(RuleAction::RateLimit { pps, name }))
+        }
+        "count" => {
+            // Check for optional :name keyword - MUST be [namespace, name] vector
+            let name = if list.len() >= 3 && list[1].to_string() == ":name" {
+                match &list[2] {
+                    Edn::Vector(vec) => {
+                        // Parse as [namespace, name]
+                        let items = vec.clone().to_vec();
+                        if items.len() != 2 {
+                            anyhow::bail!(":name must be [namespace, name] with exactly 2 elements");
+                        }
+                        let ns = items[0].to_string().trim_matches('"').to_string();
+                        let n = items[1].to_string().trim_matches('"').to_string();
+                        Some((ns, n))
+                    }
+                    _ => anyhow::bail!(":name must be a vector [namespace, name], got: {:?}", list[2]),
+                }
+            } else {
+                None
+            };
+            
+            Ok(Some(RuleAction::Count { name }))
+        }
             other => anyhow::bail!("Unknown action type: {}", other),
         }
 }

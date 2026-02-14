@@ -42,8 +42,8 @@ pub enum RuleType {
 pub enum RuleAction {
     Pass,
     Drop,
-    RateLimit { pps: u32, name: Option<String> },
-    Count { name: Option<String> },
+    RateLimit { pps: u32, name: Option<(String, String)> },  // name: (namespace, name)
+    Count { name: Option<(String, String)> },
 }
 
 impl RuleAction {
@@ -65,11 +65,11 @@ impl RuleAction {
         }
     }
 
-    /// Get the name if this action has one
-    pub fn name(&self) -> Option<&str> {
+    /// Get the name tuple (namespace, name) if this action has one
+    pub fn name(&self) -> Option<&(String, String)> {
         match self {
             RuleAction::RateLimit { name, .. } | RuleAction::Count { name } => {
-                name.as_deref()
+                name.as_ref()
             }
             _ => None,
         }
@@ -458,10 +458,16 @@ impl RuleSpec {
                 RuleAction::Pass => "pass".to_string(),
                 RuleAction::Drop => "drop".to_string(),
                 RuleAction::RateLimit { pps, name } => {
-                    format!("ratelimit:{}:{}", pps, name.as_deref().unwrap_or(""))
+                    let name_str = name.as_ref()
+                        .map(|(ns, n)| format!("{}:{}", ns, n))
+                        .unwrap_or_default();
+                    format!("ratelimit:{}:{}", pps, name_str)
                 }
                 RuleAction::Count { name } => {
-                    format!("count:{}", name.as_deref().unwrap_or(""))
+                    let name_str = name.as_ref()
+                        .map(|(ns, n)| format!("{}:{}", ns, n))
+                        .unwrap_or_default();
+                    format!("count:{}", name_str)
                 }
             }
         }).collect();
@@ -480,8 +486,8 @@ impl RuleSpec {
 
     /// Compute the rate limiter bucket key for this rule.
     /// 
-    /// Named rate limiters (e.g., `(rate-limit 1000 :name "dns-amp")`) share a bucket
-    /// across all rules with the same name. Unnamed rate limiters get a per-rule bucket
+    /// Named rate limiters (e.g., `(rate-limit 1000 :name ["attack" "dns-amp"])`) share a bucket
+    /// across all rules with the same namespace and name. Unnamed rate limiters get a per-rule bucket
     /// keyed by the rule's canonical hash.
     /// 
     /// Returns the bucket key (u32) for the first rate-limit action, or None if no rate-limit.
@@ -492,14 +498,15 @@ impl RuleSpec {
         // Find first rate-limit action
         for action in &self.actions {
             if let RuleAction::RateLimit { pps: _, name } = action {
-                if let Some(name) = name {
-                    // Named bucket: hash the name string
+                if let Some((namespace, name)) = name {
+                    // Named bucket: hash namespace + name
                     let mut hasher = DefaultHasher::new();
+                    namespace.hash(&mut hasher);
                     name.hash(&mut hasher);
                     let h = hasher.finish() as u32;
                     return Some(if h == 0 { 1 } else { h });
                 } else {
-                    // Unnamed bucket: use rule's canonical hash
+                    // Unnamed bucket: use rule's canonical hash (default behavior)
                     return Some(self.canonical_hash());
                 }
             }
@@ -602,14 +609,14 @@ impl RuleSpec {
             RuleAction::RateLimit { pps, name: None } => {
                 format!("(rate-limit {})", pps)
             }
-            RuleAction::RateLimit { pps, name: Some(n) } => {
-                format!("(rate-limit {} :name \"{}\")", pps, n)
+            RuleAction::RateLimit { pps, name: Some((ns, n)) } => {
+                format!("(rate-limit {} :name [\"{}\", \"{}\"])", pps, ns, n)
             }
             RuleAction::Count { name: None } => {
                 "(count)".to_string()
             }
-            RuleAction::Count { name: Some(n) } => {
-                format!("(count :name \"{}\")", n)
+            RuleAction::Count { name: Some((ns, n)) } => {
+                format!("(count :name [\"{}\", \"{}\"])", ns, n)
             }
         }
     }

@@ -112,45 +112,69 @@ limiters share the same bucket key derived from the name, not the rule hash.
 
 ## ✅ 2. Named Rate Limiters (Shared Buckets) [COMPLETED 2026-02-13]
 
-**Status:** ✅ Implemented and tested.
+**Status:** ✅ Implemented and tested with namespaced bucket names.
 
 ### Implementation Summary
 
-Successfully implemented named rate limiter buckets with:
+Successfully implemented namespaced rate limiter buckets with:
 - ✅ `bucket_key()` method on `RuleSpec` for computing bucket keys
-- ✅ Named buckets hash the name string to derive key
-- ✅ Unnamed buckets use rule's canonical hash (backward compatible)
+- ✅ Named buckets use `[namespace, name]` tuple format
+- ✅ Bucket key derived by hashing namespace + name
+- ✅ Unnamed buckets use rule's canonical hash (per-rule behavior)
 - ✅ Tree compilation uses `bucket_key()` instead of `canonical_hash()` for rate limiters
 - ✅ PPS conflict handling: last-defined value wins, with warning
 - ✅ Test rules generated and verified (5 buckets from 10 rate-limit rules)
 
 ### Behavior
 
+**Named buckets** (namespaced):
+- Format: `:name ["namespace", "name"]` (MUST be 2-tuple)
+- All rules with same namespace+name share one token bucket
+- Bucket key = hash(namespace + name)
+- Example: `["attack", "dns-amp"]` - all rules with this share tokens
+
+**Unnamed buckets** (per-rule):
+- Format: no `:name` field
+- Each rule gets its own token bucket
+- Bucket key = rule's canonical hash
+- Traditional behavior (backward compatible)
+
 When multiple rules share the same named bucket:
 1. They all reference the same token bucket in the eBPF map
 2. Tokens are shared across all rules with that name
 3. If PPS values differ, the last-defined value wins (with warning)
-4. Unnamed rate limiters continue to use per-rule buckets
 
 ### Example
 
 ```edn
-;; These three rules share "dns-amp" bucket
+;; These three rules share the ["attack", "dns-amp"] bucket
 {:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.100")] 
- :actions [(rate-limit 1000 :name "dns-amp")]}
+ :actions [(rate-limit 1000 :name ["attack", "dns-amp"])]}
 
 {:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.101")] 
- :actions [(rate-limit 1000 :name "dns-amp")]}
+ :actions [(rate-limit 1000 :name ["attack", "dns-amp"])]}
 
 {:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.102")] 
- :actions [(rate-limit 1000 :name "dns-amp")]}
+ :actions [(rate-limit 1000 :name ["attack", "dns-amp"])]}
+
+;; Different namespace - separate bucket
+{:constraints [(= proto 17) (= dst-port 123) (= src-addr "10.0.0.110")] 
+ :actions [(rate-limit 500 :name ["attack", "ntp-amp"])]}
 
 ;; This rule has its own per-rule bucket (unnamed)
 {:constraints [(= proto 17) (= src-addr "10.0.0.200")] 
  :actions [(rate-limit 100)]}
 ```
 
-Result: 2 buckets instead of 4 (3 rules share 1 named bucket + 1 unnamed).
+Result: 3 buckets (["attack", "dns-amp"], ["attack", "ntp-amp"], and 1 unnamed).
+
+### Namespace Organization
+
+Suggested namespaces:
+- `"attack"` - shared limits for attack mitigation rules
+- `"monitor"` - counting/monitoring actions
+- `"test"` - temporary test rules
+- `"manual"` - operator-defined rules
 
 ---
 
