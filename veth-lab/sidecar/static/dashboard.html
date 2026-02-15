@@ -262,8 +262,8 @@
 
         .legend {
             position: absolute;
-            bottom: 10px;
-            left: 10px;
+            bottom: 40px;
+            left: 70px;
             background: rgba(0, 0, 0, 0.85);
             padding: 10px 12px;
             border-radius: 4px;
@@ -406,7 +406,7 @@
         // State Management
         // =============================================================================
 
-        const MAX_TIMELINE_POINTS = 600;  // 600 points at 500ms = 5 minutes
+        const MAX_TIMELINE_POINTS = 240;  // 240 points at 500ms = 2 minutes
         const MAX_RULE_SERIES = 5;  // Show top 5 rules as series
         const state = {
             connected: false,
@@ -702,7 +702,7 @@
                         time: true,
                         range: (self, dataMin, dataMax) => {
                             const now = Date.now() / 1000;
-                            return [now - 300, now];
+                            return [now - 120, now];
                         },
                     },
                     y: {
@@ -978,10 +978,10 @@
                 scales: {
                     x: {
                         time: true,
-                        // Fixed time window (5 minutes at 500ms intervals = 600 points)
+                        // Fixed time window (2 minutes at 500ms intervals = 240 points)
                         range: (self, dataMin, dataMax) => {
                             const now = Date.now() / 1000;
-                            return [now - 300, now];  // Always show last 5 minutes
+                            return [now - 120, now];  // Always show last 2 minutes
                         },
                     },
                     y: {

@@ -1,0 +1,17 @@
+{
+  "name": "Stress Test",
+  "description": "Rapid attack cycles to stress test detection and rule application",
+  "baseline_pps": 10000,
+  "attack_pps": 500000,
+  "phases": [
+    {"name": "warmup",  "duration_secs": 30,  "type": "normal", "description": "30s baseline"},
+    {"name": "burst1",  "duration_secs": 10,  "type": "attack", "description": "10s burst"},
+    {"name": "gap1",    "duration_secs": 20,  "type": "normal", "description": "20s gap"},
+    {"name": "burst2",  "duration_secs": 15,  "type": "attack", "description": "15s burst"},
+    {"name": "gap2",    "duration_secs": 15,  "type": "normal", "description": "15s gap"},
+    {"name": "burst3",  "duration_secs": 20,  "type": "attack", "description": "20s burst"},
+    {"name": "gap3",    "duration_secs": 10,  "type": "normal", "description": "10s gap"},
+    {"name": "burst4",  "duration_secs": 30,  "type": "attack", "description": "30s sustained"},
+    {"name": "recover", "duration_secs": 10,  "type": "normal", "description": "10s recovery"}
+  ]
+}
