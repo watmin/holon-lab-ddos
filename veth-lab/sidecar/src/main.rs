@@ -451,6 +451,13 @@ impl FieldTracker {
             // p0f-level fields (raw numeric)
             ("ttl", sample.ttl.to_string()),
             ("df_bit", sample.df_bit.to_string()),
+            // IPv4 header fingerprinting fields (raw numeric)
+            ("ip_id", sample.ip_id.to_string()),
+            ("ip_len", sample.ip_len.to_string()),
+            ("dscp", sample.dscp.to_string()),
+            ("ecn", sample.ecn.to_string()),
+            ("mf_bit", sample.mf_bit.to_string()),
+            ("frag_offset", sample.frag_offset.to_string()),
         ];
         // TCP-only p0f fields
         if sample.protocol == 6 {
@@ -767,6 +774,19 @@ impl Detection {
                 .map(|df| Predicate::eq(FieldDim::DfBit, df as u32)),
             "tcp_window" => self.value.parse::<u16>().ok()
                 .map(|win| Predicate::eq(FieldDim::TcpWindow, win as u32)),
+            // IPv4 header fingerprinting fields
+            "ip_id" => self.value.parse::<u16>().ok()
+                .map(|id| Predicate::eq(FieldDim::IpId, id as u32)),
+            "ip_len" => self.value.parse::<u16>().ok()
+                .map(|len| Predicate::eq(FieldDim::IpLen, len as u32)),
+            "dscp" => self.value.parse::<u8>().ok()
+                .map(|d| Predicate::eq(FieldDim::Dscp, d as u32)),
+            "ecn" => self.value.parse::<u8>().ok()
+                .map(|e| Predicate::eq(FieldDim::Ecn, e as u32)),
+            "mf_bit" => self.value.parse::<u8>().ok()
+                .map(|mf| Predicate::eq(FieldDim::MfBit, mf as u32)),
+            "frag_offset" => self.value.parse::<u16>().ok()
+                .map(|fo| Predicate::eq(FieldDim::FragOffset, fo as u32)),
             _ => None,
         }
     }
@@ -1236,6 +1256,13 @@ fn parse_field_name(name: &str) -> Result<FieldDim> {
         "ttl" => Ok(FieldDim::Ttl),
         "df" => Ok(FieldDim::DfBit),
         "tcp-window" => Ok(FieldDim::TcpWindow),
+        // IPv4 header fingerprinting fields
+        "ip-id" => Ok(FieldDim::IpId),
+        "ip-len" => Ok(FieldDim::IpLen),
+        "dscp" => Ok(FieldDim::Dscp),
+        "ecn" => Ok(FieldDim::Ecn),
+        "mf" => Ok(FieldDim::MfBit),
+        "frag-offset" => Ok(FieldDim::FragOffset),
         other => anyhow::bail!("Unknown field: {}", other),
     }
 }

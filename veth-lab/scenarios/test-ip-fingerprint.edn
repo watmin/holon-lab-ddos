@@ -1,0 +1,109 @@
+;; IP Header Fingerprinting Test Rules
+;;
+;; Demonstrates all 6 new IPv4 header fields (ip-id, ip-len, dscp, ecn, mf, frag-offset)
+;; in rule expressions. These fields enable OS fingerprinting and surgical mitigation
+;; of botnet/spoofed traffic.
+;;
+;; Field semantics (data-first, byte-level):
+;;   ip-id:       IP Identification (u16, 0-65535)
+;;                  0 = spoofed/botnet, random = Windows, sequential = Linux
+;;   ip-len:      IP Total Length (u16, bytes)
+;;                  Useful for flood detection (tiny packets or jumbo frames)
+;;   dscp:        Differentiated Services Code Point (0-63)
+;;                  46 = EF (voice), 0 = best effort (default)
+;;   ecn:         Explicit Congestion Notification (0-3)
+;;                  0 = not-ECT, 3 = CE (congestion experienced)
+;;   mf:          More Fragments bit (0 or 1)
+;;                  1 = more fragments coming (fragment flood indicator)
+;;   frag-offset: Fragment offset (0-8191, in 8-byte units)
+;;                  >0 = fragmented packet (fragments bypass L4 matching)
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Rule 1: Drop spoofed/botnet traffic (IP ID = 0)
+;; Strong botnet indicator. Windows/Linux use random or sequential IP IDs.
+;; ──────────────────────────────────────────────────────────────────────
+{:constraints [(= proto 17) (= ip-id 0)]
+ :actions [(drop :name ["fingerprint" "spoofed-ip-id"])]
+ :priority 200
+ :comment "Block UDP with IP ID=0 (botnet/spoofed traffic)"}
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Rule 2: Drop fragmented packets (frag-offset > 0)
+;; Fragments bypass L4 port matching and are often used in evasion.
+;; ──────────────────────────────────────────────────────────────────────
+{:constraints [(= proto 17) (> frag-offset 0)]
+ :actions [(drop :name ["fingerprint" "fragmented"])]
+ :priority 200
+ :comment "Block fragmented UDP (evasion technique)"}
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Rule 3: Drop packets with More Fragments flag (fragment flood)
+;; MF=1 means more fragments are coming. Sustained MF=1 = fragment flood.
+;; ──────────────────────────────────────────────────────────────────────
+{:constraints [(= proto 17) (= mf 1)]
+ :actions [(drop :name ["fingerprint" "more-fragments"])]
+ :priority 200
+ :comment "Block UDP with MF flag (fragment flood)"}
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Rule 4: Rate-limit unusual DSCP marking (DSCP 46 = EF voice class)
+;; Game/web traffic should be DSCP 0 (best effort). DSCP 46 is anomalous.
+;; ──────────────────────────────────────────────────────────────────────
+{:constraints [(= proto 17) (= dscp 46)]
+ :actions [(rate-limit 500 :name ["fingerprint" "dscp-ef"])]
+ :priority 150
+ :comment "Rate-limit UDP with DSCP 46 (unusual for game traffic)"}
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Rule 5: Count ECN Congestion Experienced (ECN = 3)
+;; ECN CE marking is rare in UDP games. High concentration = network issue.
+;; ──────────────────────────────────────────────────────────────────────
+{:constraints [(= proto 17) (= ecn 3)]
+ :actions [(count :name ["fingerprint" "ecn-ce"])]
+ :priority 100
+ :comment "Count UDP with ECN CE (congestion signal)"}
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Rule 6: Count tiny packets (IP len < 40 bytes = IP+UDP headers only)
+;; Minimum UDP packet is 28 bytes (20 IP + 8 UDP). <40 = tiny/crafted.
+;; ──────────────────────────────────────────────────────────────────────
+{:constraints [(= proto 17) (< ip-len 40)]
+ :actions [(count :name ["fingerprint" "tiny-packets"])]
+ :priority 100
+ :comment "Count suspiciously small UDP packets"}
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Rule 7: Count jumbo packets (IP len > 1500)
+;; Standard MTU is 1500 bytes. >1500 = jumbo frames (unusual in DDoS).
+;; ──────────────────────────────────────────────────────────────────────
+{:constraints [(= proto 17) (> ip-len 1500)]
+ :actions [(count :name ["fingerprint" "jumbo-frames"])]
+ :priority 100
+ :comment "Count UDP jumbo frames (>MTU)"}
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Compound rule: Linux botnet fingerprint (TTL=64, IP ID sequential)
+;; Linux VPS botnets typically use TTL=64. We check for sequential IP IDs
+;; in a range (e.g., 1000-2000). In a real scenario, Holon would detect
+;; concentration in this range and auto-generate this rule.
+;; ──────────────────────────────────────────────────────────────────────
+{:constraints [(= proto 17) (= ttl 64) (>= ip-id 1000) (<= ip-id 2000)]
+ :actions [(rate-limit 1000 :name ["fingerprint" "linux-botnet"])]
+ :priority 180
+ :comment "Rate-limit suspected Linux VPS botnet (TTL=64, sequential IP ID)"}
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Background: Rate-limit all UDP as baseline safety net
+;; ──────────────────────────────────────────────────────────────────────
+{:constraints [(= proto 17)]
+ :actions [(rate-limit 100000 :name ["global" "udp-baseline"])]
+ :priority 10
+ :comment "Baseline UDP rate limit"}
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Background: Drop all ICMP (exercises multi-proto tree branches)
+;; ──────────────────────────────────────────────────────────────────────
+{:constraints [(= proto 1)]
+ :actions [(drop :name ["global" "icmp-block"])]
+ :priority 10
+ :comment "Block ICMP entirely"}

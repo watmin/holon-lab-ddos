@@ -105,29 +105,44 @@ impl RuleManifestEntry {
 // Field Dimension Types
 // =============================================================================
 
-/// Dispatch dimension identifiers
+/// Dispatch dimension identifiers.
+///
+/// Indices 0-14 are static (pre-extracted) packet header fields.
+/// Indices 16-22 are dynamic custom dimensions for l4-match byte extraction.
+/// Index 15 and 23-31 are reserved for future use.
+///
+/// The DfsState.fields array is [u32; 32], indexed by these discriminants.
+/// The eBPF walker masks with `& 0x1F` to prove bounds for the verifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum FieldDim {
-    // Phase 1
+    // Phase 1: L3/L4 header fields (unconditional extraction)
     Proto = 0,
     SrcIp = 1,
     DstIp = 2,
     L4Word0 = 3,   // src_port or icmp type/code
     L4Word1 = 4,   // dst_port or icmp checksum
-    // Phase 2
+    // Phase 2: extended header fields (extracted alongside phase 1)
     TcpFlags = 5,
     Ttl = 6,
     DfBit = 7,
     TcpWindow = 8,
+    // IPv4 header fingerprinting fields (bytes 1-7 of IP header)
+    IpId = 9,        // bytes 4-5: IP Identification (u16, OS fingerprint)
+    IpLen = 10,      // bytes 2-3: IP Total Length (u16, flood detection)
+    Dscp = 11,       // byte 1 upper 6 bits: Differentiated Services Code Point (0-63)
+    Ecn = 12,        // byte 1 lower 2 bits: Explicit Congestion Notification (0-3)
+    MfBit = 13,      // byte 6 bit 13: More Fragments flag (0 or 1)
+    FragOffset = 14,  // bytes 6-7 lower 13 bits: Fragment offset (0-8191, in 8-byte units)
     // Dynamic custom dimensions for l4-match (1-4 byte fan-out)
-    Custom0 = 9,
-    Custom1 = 10,
-    Custom2 = 11,
-    Custom3 = 12,
-    Custom4 = 13,
-    Custom5 = 14,
-    Custom6 = 15,
+    // Gap at 15 (reserved) separates static from custom dims.
+    Custom0 = 16,
+    Custom1 = 17,
+    Custom2 = 18,
+    Custom3 = 19,
+    Custom4 = 20,
+    Custom5 = 21,
+    Custom6 = 22,
 }
 
 impl FieldDim {
@@ -143,6 +158,12 @@ impl FieldDim {
             FieldDim::Ttl => "ttl",
             FieldDim::DfBit => "df_bit",
             FieldDim::TcpWindow => "tcp_window",
+            FieldDim::IpId => "ip_id",
+            FieldDim::IpLen => "ip_len",
+            FieldDim::Dscp => "dscp",
+            FieldDim::Ecn => "ecn",
+            FieldDim::MfBit => "mf_bit",
+            FieldDim::FragOffset => "frag_offset",
             FieldDim::Custom0 => "custom0",
             FieldDim::Custom1 => "custom1",
             FieldDim::Custom2 => "custom2",
@@ -159,18 +180,20 @@ impl FieldDim {
             FieldDim::Proto, FieldDim::SrcIp, FieldDim::DstIp,
             FieldDim::L4Word0, FieldDim::L4Word1,
             FieldDim::TcpFlags, FieldDim::Ttl, FieldDim::DfBit, FieldDim::TcpWindow,
+            FieldDim::IpId, FieldDim::IpLen, FieldDim::Dscp,
+            FieldDim::Ecn, FieldDim::MfBit, FieldDim::FragOffset,
         ]
     }
 
     /// Check if this is a custom (dynamic) dimension
     pub fn is_custom(&self) -> bool {
-        (*self as u8) >= 9
+        (*self as u8) >= 16
     }
 
     /// Get the custom dim slot index (0-6), or None if static
     pub fn custom_index(&self) -> Option<usize> {
         let idx = *self as u8;
-        if idx >= 9 && idx <= 15 { Some((idx - 9) as usize) } else { None }
+        if idx >= 16 && idx <= 22 { Some((idx - 16) as usize) } else { None }
     }
 
     /// Get a custom dim from a slot index (0-6)
@@ -201,7 +224,21 @@ impl FieldDim {
                 v => format!("{}", v),
             },
             FieldDim::TcpFlags => format!("0x{:02x}", value),
-            FieldDim::DfBit => if value == 1 { "DF".to_string() } else { "!DF".to_string() },
+            FieldDim::DfBit | FieldDim::MfBit => {
+                if value == 1 {
+                    if matches!(self, FieldDim::DfBit) { "DF".to_string() } else { "MF".to_string() }
+                } else {
+                    if matches!(self, FieldDim::DfBit) { "!DF".to_string() } else { "!MF".to_string() }
+                }
+            }
+            FieldDim::Dscp => format!("dscp:{}", value),
+            FieldDim::Ecn => match value {
+                0 => "not-ECT".to_string(),
+                1 => "ECT(1)".to_string(),
+                2 => "ECT(0)".to_string(),
+                3 => "CE".to_string(),
+                v => format!("{}", v),
+            },
             d if d.is_custom() => format!("0x{:x}", value),
             _ => format!("{}", value),
         }
@@ -219,6 +256,12 @@ impl FieldDim {
             FieldDim::Ttl => "ttl",
             FieldDim::DfBit => "df",
             FieldDim::TcpWindow => "tcp-window",
+            FieldDim::IpId => "ip-id",
+            FieldDim::IpLen => "ip-len",
+            FieldDim::Dscp => "dscp",
+            FieldDim::Ecn => "ecn",
+            FieldDim::MfBit => "mf",
+            FieldDim::FragOffset => "frag-offset",
             FieldDim::Custom0 => "custom0",
             FieldDim::Custom1 => "custom1",
             FieldDim::Custom2 => "custom2",
@@ -415,13 +458,14 @@ impl Predicate {
     }
 }
 
-/// Number of static (fixed) dispatch dimensions
-pub const NUM_DIMENSIONS: usize = 9;
+/// Number of static (fixed) dispatch dimensions (Proto..FragOffset = 0..14)
+pub const NUM_DIMENSIONS: usize = 15;
 
-/// Maximum dimension index (0-15, supporting up to 7 custom dims)
-pub const MAX_DIM: u8 = 16;
+/// Maximum dimension index (0-31, fits DfsState.fields[u32; 32])
+/// eBPF walker masks with `& 0x1F` to prove bounds for the verifier.
+pub const MAX_DIM: u8 = 32;
 
-/// Number of custom dimension slots available for l4-match fan-out
+/// Number of custom dimension slots available for l4-match fan-out (slots 16-22)
 pub const NUM_CUSTOM_DIMS: usize = 7;
 
 /// Token bucket state (must match eBPF struct)
@@ -852,7 +896,9 @@ impl RuleSpec {
                 ip.to_string()
             }
             FieldDim::L4Word0 | FieldDim::L4Word1 | FieldDim::TcpFlags |
-            FieldDim::Ttl | FieldDim::DfBit | FieldDim::TcpWindow => val.to_string(),
+            FieldDim::Ttl | FieldDim::DfBit | FieldDim::TcpWindow |
+            FieldDim::IpId | FieldDim::IpLen | FieldDim::Dscp |
+            FieldDim::Ecn | FieldDim::MfBit | FieldDim::FragOffset => val.to_string(),
             d if d.is_custom() => format!("0x{:x}", val),
             _ => val.to_string(),
         };
@@ -1125,6 +1171,15 @@ pub struct PacketSample {
     pub ttl: u8,
     pub df_bit: u8,
     pub tcp_window: u16,
+    // IPv4 header fingerprinting fields
+    pub ip_id: u16,
+    pub ip_len: u16,
+    pub dscp: u8,
+    pub ecn: u8,
+    pub mf_bit: u8,
+    pub _pad_fp: u8,
+    pub frag_offset: u16,
+    pub _pad_fp2: u16,
     pub data: [u8; SAMPLE_DATA_SIZE],
 }
 
@@ -1223,6 +1278,13 @@ impl Walkable for PacketSample {
             // p0f-level fields (raw numeric values)
             ("ttl", WalkableValue::Scalar(ScalarValue::Int(self.ttl as i64))),
             ("df_bit", WalkableValue::Scalar(ScalarValue::Int(self.df_bit as i64))),
+            // IPv4 header fingerprinting fields
+            ("ip_id", WalkableValue::Scalar(ScalarValue::Int(self.ip_id as i64))),
+            ("ip_len", WalkableValue::Scalar(ScalarValue::log(self.ip_len as f64))),
+            ("dscp", WalkableValue::Scalar(ScalarValue::Int(self.dscp as i64))),
+            ("ecn", WalkableValue::Scalar(ScalarValue::Int(self.ecn as i64))),
+            ("mf_bit", WalkableValue::Scalar(ScalarValue::Int(self.mf_bit as i64))),
+            ("frag_offset", WalkableValue::Scalar(ScalarValue::Int(self.frag_offset as i64))),
         ];
         // TCP-only fields
         if self.protocol == 6 {
@@ -1248,6 +1310,13 @@ impl Walkable for PacketSample {
         // p0f-level fields (raw numeric values)
         visitor("ttl", WalkableRef::int(self.ttl as i64));
         visitor("df_bit", WalkableRef::int(self.df_bit as i64));
+        // IPv4 header fingerprinting fields
+        visitor("ip_id", WalkableRef::int(self.ip_id as i64));
+        visitor("ip_len", WalkableRef::Scalar(ScalarRef::log(self.ip_len as f64)));
+        visitor("dscp", WalkableRef::int(self.dscp as i64));
+        visitor("ecn", WalkableRef::int(self.ecn as i64));
+        visitor("mf_bit", WalkableRef::int(self.mf_bit as i64));
+        visitor("frag_offset", WalkableRef::int(self.frag_offset as i64));
         // TCP-only fields
         if self.protocol == 6 {
             visitor("tcp_flags", WalkableRef::int(self.tcp_flags as i64));
@@ -1637,8 +1706,10 @@ mod tests {
     #[test]
     fn test_field_dim_all() {
         let all = FieldDim::all();
-        assert_eq!(all.len(), 9);
+        assert_eq!(all.len(), 15);
         assert_eq!(all[0], FieldDim::Proto);
         assert_eq!(all[8], FieldDim::TcpWindow);
+        assert_eq!(all[9], FieldDim::IpId);
+        assert_eq!(all[14], FieldDim::FragOffset);
     }
 }

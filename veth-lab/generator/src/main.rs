@@ -147,6 +147,17 @@ struct Phase {
     /// Protocol: "udp" (default) or "tcp_syn"
     #[serde(default)]
     proto: Option<String>,
+    /// OS fingerprint profile: "windows", "linux", "spoofed"
+    /// Sets TTL, IP ID, DF, DSCP defaults. Per-field overrides (ttl, df, ip_id, dscp)
+    /// take precedence over the profile.
+    #[serde(default)]
+    os_profile: Option<String>,
+    /// IP Identification field override (u16). If not set, uses os_profile or random.
+    #[serde(default)]
+    ip_id: Option<u16>,
+    /// DSCP value override (0-63). Default: 0 (best effort).
+    #[serde(default)]
+    dscp: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
@@ -296,6 +307,7 @@ fn run_scenario_file(
     bytes_sent: Arc<AtomicU64>,
 ) -> Result<()> {
     let mut rng = rand::rngs::StdRng::from_entropy();
+    let mut linux_ip_id_counter: u16 = rng.gen(); // Sequential IP ID counter for "linux" profile
     
     // Log scenario timeline
     info!("=== SCENARIO: {} ===", config.name);
@@ -383,6 +395,9 @@ fn run_scenario_file(
         while running.load(Ordering::Relaxed) && phase_start.elapsed() < phase_duration {
             let src_port: u16 = rng.gen_range(10000..60000);
 
+            // Build IP fingerprint from os_profile + per-field overrides
+            let fp = build_fingerprint(&mut rng, phase, &mut linux_ip_id_counter);
+
             let packet = match phase.phase_type {
                 PhaseType::Normal => {
                     let src_ip = Ipv4Addr::new(192, 168, rng.gen_range(1..255), rng.gen_range(1..255));
@@ -390,7 +405,7 @@ fn run_scenario_file(
                     let dst = custom_dst_ip.unwrap_or(target_ip);
                     craft_udp_packet(
                         src_mac, dst_mac, src_ip, dst,
-                        src_port, dst_port, b"VETH-LAB-TEST", 64, true,
+                        src_port, dst_port, b"VETH-LAB-TEST", &fp,
                     )
                 }
                 PhaseType::Attack => {
@@ -398,7 +413,7 @@ fn run_scenario_file(
                     let dst = custom_dst_ip.unwrap_or(target_ip);
                     craft_udp_packet(
                         src_mac, dst_mac, attack_src, dst,
-                        src_port, dst_port, b"VETH-LAB-TEST", 255, false,
+                        src_port, dst_port, b"VETH-LAB-TEST", &fp,
                     )
                 }
                 PhaseType::SynFlood => {
@@ -406,14 +421,12 @@ fn run_scenario_file(
                     let dst = custom_dst_ip.unwrap_or(target_ip);
                     craft_tcp_syn_packet(
                         src_mac, dst_mac, attack_src, dst,
-                        src_port, dst_port, 128, 65535,
+                        src_port, dst_port, &fp, 65535,
                     )
                 }
                 PhaseType::Custom => {
                     let dst = custom_dst_ip.unwrap_or(target_ip);
                     let dst_port = phase.dst_port.unwrap_or(args.normal_port);
-                    let ttl = phase.ttl.unwrap_or(64);
-                    let df = phase.df.unwrap_or(true);
                     let src_ip = Ipv4Addr::new(192, 168, rng.gen_range(1..255), rng.gen_range(1..255));
                     let payload = custom_payload.as_deref().unwrap_or(b"VETH-LAB-TEST");
                     
@@ -421,12 +434,12 @@ fn run_scenario_file(
                     if is_tcp {
                         craft_tcp_syn_packet(
                             src_mac, dst_mac, src_ip, dst,
-                            src_port, dst_port, ttl, 65535,
+                            src_port, dst_port, &fp, 65535,
                         )
                     } else {
                         craft_udp_packet(
                             src_mac, dst_mac, src_ip, dst,
-                            src_port, dst_port, payload, ttl, df,
+                            src_port, dst_port, payload, &fp,
                         )
                     }
                 }
@@ -657,6 +670,7 @@ fn run_pattern_mode(
         let src_port: u16 = rng.gen_range(10000..60000);
         
         // Build and send UDP packet (legacy mode: normal fingerprint for all)
+        let fp = IpFingerprint::legacy(&mut rng, 64, true);
         let packet = craft_udp_packet(
             src_mac,
             dst_mac,
@@ -665,7 +679,7 @@ fn run_pattern_mode(
             src_port,
             dst_port,
             b"VETH-LAB-TEST",
-            64, true,
+            &fp,
         );
 
         match send_packet(socket, &packet) {
@@ -824,6 +838,73 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Build an IpFingerprint from a Phase's os_profile + per-field overrides.
+/// Per-field overrides (ttl, df, ip_id, dscp) take precedence over the profile.
+fn build_fingerprint<R: Rng>(rng: &mut R, phase: &Phase, linux_counter: &mut u16) -> IpFingerprint {
+    let base = match phase.os_profile.as_deref() {
+        Some("windows") => IpFingerprint::windows(rng),
+        Some("linux") => {
+            let fp = IpFingerprint::linux(*linux_counter);
+            *linux_counter = linux_counter.wrapping_add(1);
+            fp
+        }
+        Some("spoofed") => IpFingerprint::spoofed(),
+        _ => {
+            // No profile: use phase type defaults (backward compat)
+            let default_ttl = match phase.phase_type {
+                PhaseType::Normal | PhaseType::Custom => 64,
+                PhaseType::Attack => 255,
+                PhaseType::SynFlood => 128,
+            };
+            let default_df = !matches!(phase.phase_type, PhaseType::Attack);
+            IpFingerprint::legacy(rng, default_ttl, default_df)
+        }
+    };
+
+    // Apply per-field overrides
+    IpFingerprint {
+        ttl: phase.ttl.unwrap_or(base.ttl),
+        df: phase.df.unwrap_or(base.df),
+        ip_id: phase.ip_id.unwrap_or(base.ip_id),
+        dscp: phase.dscp.unwrap_or(base.dscp),
+        ecn: base.ecn,
+    }
+}
+
+/// IPv4 header fingerprint parameters for packet crafting.
+/// Controls the "early bytes" of the IP header that Holon uses for
+/// OS fingerprinting and surgical mitigation.
+#[derive(Debug, Clone)]
+struct IpFingerprint {
+    ttl: u8,
+    df: bool,
+    ip_id: u16,
+    dscp: u8,
+    ecn: u8,
+}
+
+impl IpFingerprint {
+    /// Windows client: TTL=128, random IP ID, DF set, DSCP=0
+    fn windows<R: Rng>(rng: &mut R) -> Self {
+        Self { ttl: 128, df: true, ip_id: rng.gen(), dscp: 0, ecn: 0 }
+    }
+
+    /// Linux client: TTL=64, sequential IP ID (caller provides), DF set, DSCP=0
+    fn linux(ip_id: u16) -> Self {
+        Self { ttl: 64, df: true, ip_id, dscp: 0, ecn: 0 }
+    }
+
+    /// Spoofed/botnet: TTL varies, IP ID=0, DF clear, DSCP=0
+    fn spoofed() -> Self {
+        Self { ttl: 64, df: false, ip_id: 0, dscp: 0, ecn: 0 }
+    }
+
+    /// Legacy default (backward compat): TTL and DF from args, random IP ID
+    fn legacy<R: Rng>(rng: &mut R, ttl: u8, df: bool) -> Self {
+        Self { ttl, df, ip_id: rng.gen(), dscp: 0, ecn: 0 }
+    }
+}
+
 fn craft_udp_packet(
     src_mac: &[u8; 6],
     dst_mac: &[u8; 6],
@@ -832,8 +913,7 @@ fn craft_udp_packet(
     src_port: u16,
     dst_port: u16,
     payload: &[u8],
-    ttl: u8,
-    df: bool,
+    fp: &IpFingerprint,
 ) -> Vec<u8> {
     let udp_len = 8 + payload.len();
     let ip_len = 20 + udp_len;
@@ -849,12 +929,12 @@ fn craft_udp_packet(
     // IP header (20 bytes)
     let ip_offset = 14;
     packet[ip_offset] = 0x45;  // Version + IHL
-    packet[ip_offset + 1] = 0x00;  // DSCP + ECN
+    packet[ip_offset + 1] = (fp.dscp << 2) | (fp.ecn & 0x03);  // DSCP + ECN
     packet[ip_offset + 2..ip_offset + 4].copy_from_slice(&(ip_len as u16).to_be_bytes());
-    packet[ip_offset + 4..ip_offset + 6].copy_from_slice(&rand::random::<u16>().to_be_bytes());  // ID
-    packet[ip_offset + 6] = if df { 0x40 } else { 0x00 };  // Flags: DF or clear
+    packet[ip_offset + 4..ip_offset + 6].copy_from_slice(&fp.ip_id.to_be_bytes());
+    packet[ip_offset + 6] = if fp.df { 0x40 } else { 0x00 };  // Flags: DF or clear
     packet[ip_offset + 7] = 0x00;  // Fragment offset
-    packet[ip_offset + 8] = ttl;
+    packet[ip_offset + 8] = fp.ttl;
     packet[ip_offset + 9] = 17;  // Protocol: UDP
     // Checksum at 10-11
     packet[ip_offset + 12..ip_offset + 16].copy_from_slice(&src_ip.octets());
@@ -884,7 +964,7 @@ fn craft_tcp_syn_packet(
     dst_ip: Ipv4Addr,
     src_port: u16,
     dst_port: u16,
-    ttl: u8,
+    fp: &IpFingerprint,
     window: u16,
 ) -> Vec<u8> {
     let tcp_hdr_len = 20;
@@ -901,12 +981,12 @@ fn craft_tcp_syn_packet(
     // IP header
     let ip_offset = 14;
     packet[ip_offset] = 0x45;  // Version + IHL
-    packet[ip_offset + 1] = 0x00;
+    packet[ip_offset + 1] = (fp.dscp << 2) | (fp.ecn & 0x03);  // DSCP + ECN
     packet[ip_offset + 2..ip_offset + 4].copy_from_slice(&(ip_len as u16).to_be_bytes());
-    packet[ip_offset + 4..ip_offset + 6].copy_from_slice(&rand::random::<u16>().to_be_bytes());
-    packet[ip_offset + 6] = 0x40;  // DF set (typical for SYN)
+    packet[ip_offset + 4..ip_offset + 6].copy_from_slice(&fp.ip_id.to_be_bytes());
+    packet[ip_offset + 6] = if fp.df { 0x40 } else { 0x00 };  // DF
     packet[ip_offset + 7] = 0x00;
-    packet[ip_offset + 8] = ttl;
+    packet[ip_offset + 8] = fp.ttl;
     packet[ip_offset + 9] = 6;  // Protocol: TCP
     packet[ip_offset + 12..ip_offset + 16].copy_from_slice(&src_ip.octets());
     packet[ip_offset + 16..ip_offset + 20].copy_from_slice(&dst_ip.octets());

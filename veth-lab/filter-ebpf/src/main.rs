@@ -59,11 +59,12 @@ pub struct TokenBucket {
 // Tree Rete Engine Types
 // =============================================================================
 
-/// Number of static field dimensions (Proto..TcpWindow = 0..8)
-const NUM_DIMS: u8 = 9;
+/// Number of static field dimensions (Proto..FragOffset = 0..14)
+const NUM_DIMS: u8 = 15;
 
-/// Maximum dimension index (0-15, includes 7 custom slots)
-const MAX_DIM: u8 = 16;
+/// Maximum dimension index (0-31, includes 7 custom slots at 16-22)
+/// eBPF walker masks with `& 0x1F` to prove index bounds for the verifier.
+const MAX_DIM: u8 = 32;
 
 /// Sentinel: dimension value meaning "this is a leaf node, no more branching"
 const DIM_LEAF: u8 = 0xFF;
@@ -219,8 +220,11 @@ pub struct DfsState {
     pub stack: [u32; 16],
     /// Stack top (number of entries)
     pub top: u32,
-    /// Pre-extracted packet field values indexed by dimension (0-8), padded to 16
-    pub fields: [u32; 16],
+    /// Pre-extracted packet field values indexed by dimension.
+    /// 0-14: static dims (Proto..FragOffset), 15: reserved,
+    /// 16-22: custom dims (l4-match), 23-31: reserved.
+    /// Walker masks with `& 0x1F` to prove index bounds for the verifier.
+    pub fields: [u32; 32],
     /// 1 if any rule matched so far
     pub matched: u8,
     /// Best matching action
@@ -285,6 +289,15 @@ pub struct PacketSample {
     pub ttl: u8,
     pub df_bit: u8,
     pub tcp_window: u16,
+    // IPv4 header fingerprinting fields
+    pub ip_id: u16,
+    pub ip_len: u16,
+    pub dscp: u8,
+    pub ecn: u8,
+    pub mf_bit: u8,
+    pub _pad_fp: u8,
+    pub frag_offset: u16,
+    pub _pad_fp2: u16,
     pub data: [u8; SAMPLE_DATA_SIZE],
 }
 
@@ -374,10 +387,20 @@ fn try_veth_filter(ctx: XdpContext) -> Result<u32, ()> {
     let should_sample = sample_rate > 0 && (total_count % sample_rate as u64 == 0);
     if should_sample {
         let p2 = extract_phase2(data_end, ip_hdr, ihl, protocol);
+        // Extract IPv4 fingerprinting fields for the sample
+        let ip_id = unsafe { u16::from_be(*((ip_hdr + 4) as *const u16)) };
+        let ip_len = unsafe { u16::from_be(*((ip_hdr + 2) as *const u16)) };
+        let tos_byte = unsafe { *((ip_hdr + 1) as *const u8) };
+        let dscp = tos_byte >> 2;
+        let ecn = tos_byte & 0x03;
+        let flags_frag = unsafe { u16::from_be(*((ip_hdr + 6) as *const u16)) };
+        let mf_bit = if (flags_frag & 0x2000) != 0 { 1u8 } else { 0u8 };
+        let frag_offset = flags_frag & 0x1FFF;
         sample_packet(
             &ctx, pkt_len, src_ip, dst_ip, sp, dp,
             protocol, false, ACT_PASS, data, data_end,
             p2.tcp_flags, p2.ttl, p2.df_bit, p2.tcp_window,
+            ip_id, ip_len, dscp, ecn, mf_bit, frag_offset,
         );
     }
 
@@ -398,7 +421,8 @@ fn try_veth_filter(ctx: XdpContext) -> Result<u32, ()> {
             // generate memset subprograms that blow up verifier state).
             state.stack[0] = root;
             state.top = 1;
-            // Fields: individual u32 writes (0-8 = static dims, 9-15 = custom dims)
+            // Fields: individual u32 writes.
+            // Static dims 0-14 from extract_all_fields:
             state.fields[0] = fields[0];
             state.fields[1] = fields[1];
             state.fields[2] = fields[2];
@@ -408,7 +432,31 @@ fn try_veth_filter(ctx: XdpContext) -> Result<u32, ()> {
             state.fields[6] = fields[6];
             state.fields[7] = fields[7];
             state.fields[8] = fields[8];
-            // Custom dims (9-15) extracted from packet below
+            state.fields[9] = fields[9];   // ip_id
+            state.fields[10] = fields[10]; // ip_len
+            state.fields[11] = fields[11]; // dscp
+            state.fields[12] = fields[12]; // ecn
+            state.fields[13] = fields[13]; // mf
+            state.fields[14] = fields[14]; // frag_offset
+            // Reserved + custom dim slots (zeroed; custom dims overwritten below)
+            state.fields[15] = 0;
+            state.fields[16] = 0;
+            state.fields[17] = 0;
+            state.fields[18] = 0;
+            state.fields[19] = 0;
+            state.fields[20] = 0;
+            state.fields[21] = 0;
+            state.fields[22] = 0;
+            state.fields[23] = 0;
+            state.fields[24] = 0;
+            state.fields[25] = 0;
+            state.fields[26] = 0;
+            state.fields[27] = 0;
+            state.fields[28] = 0;
+            state.fields[29] = 0;
+            state.fields[30] = 0;
+            state.fields[31] = 0;
+            // Custom dims (16-22) extracted from packet below
             // Match state
             state.matched = 0;
             state.best_action = ACT_PASS;
@@ -497,12 +545,14 @@ fn sample_packet(
     src_port: u16, dst_port: u16, protocol: u8,
     matched: bool, action: u8, data: usize, data_end: usize,
     tcp_flags: u8, ttl: u8, df_bit: u8, tcp_window: u16,
+    ip_id: u16, ip_len: u16, dscp: u8, ecn: u8, mf_bit: u8, frag_offset: u16,
 ) {
     let cap_len = if pkt_len as usize > SAMPLE_DATA_SIZE { SAMPLE_DATA_SIZE } else { pkt_len as usize };
     let mut sample = PacketSample {
         pkt_len, cap_len: cap_len as u32, src_ip, dst_ip, src_port, dst_port,
         protocol, matched_rule: if matched { 1 } else { 0 }, action_taken: action,
         tcp_flags, ttl, df_bit, tcp_window,
+        ip_id, ip_len, dscp, ecn, mf_bit, _pad_fp: 0, frag_offset, _pad_fp2: 0,
         data: [0u8; SAMPLE_DATA_SIZE],
     };
     let src = data as *const u8;
@@ -563,25 +613,41 @@ fn extract_phase2(data_end: usize, ip_hdr: usize, ihl: usize, proto: u8) -> PktF
 // =============================================================================
 
 /// Extract static packet field values into a flat array indexed by dimension.
-/// Custom dimensions (9-15) are extracted separately by reading directly from
-/// the packet in veth_filter (where packet pointers are verified), supporting
+/// Slots 0-14 are static dims extracted here. Custom dimensions (16-22)
+/// are extracted separately by reading directly from the packet in
+/// veth_filter (where packet pointers are verified), supporting
 /// arbitrary offsets into the transport payload.
 #[inline(always)]
 fn extract_all_fields(
     data_end: usize, ip_hdr: usize, ihl: usize, facts: &PktFacts,
-) -> [u32; 16] {
+) -> [u32; 32] {
     let facts2 = extract_phase2(data_end, ip_hdr, ihl, facts.proto);
-    let mut f = [0u32; 16];
+    let mut f = [0u32; 32];
+    // Phase 1: L3/L4 (dims 0-4)
     f[0] = facts.proto as u32;
     f[1] = facts.src_ip;
     f[2] = facts.dst_ip;
     f[3] = facts.l4_word0 as u32;
     f[4] = facts.l4_word1 as u32;
+    // Phase 2: extended header (dims 5-8)
     f[5] = facts2.tcp_flags as u32;
     f[6] = facts2.ttl as u32;
     f[7] = facts2.df_bit as u32;
     f[8] = facts2.tcp_window as u32;
-    // f[9..15] = custom dims, populated later from packet in veth_filter
+    // IPv4 header fingerprinting fields (dims 9-14)
+    // ip_id: bytes 4-5 (IP Identification, u16 big-endian)
+    f[9] = unsafe { u16::from_be(*((ip_hdr + 4) as *const u16)) } as u32;
+    // ip_len: bytes 2-3 (IP Total Length, u16 big-endian)
+    f[10] = unsafe { u16::from_be(*((ip_hdr + 2) as *const u16)) } as u32;
+    // dscp: byte 1, upper 6 bits (Differentiated Services Code Point)
+    f[11] = (unsafe { *((ip_hdr + 1) as *const u8) } >> 2) as u32;
+    // ecn: byte 1, lower 2 bits (Explicit Congestion Notification)
+    f[12] = (unsafe { *((ip_hdr + 1) as *const u8) } & 0x03) as u32;
+    // mf + frag_offset: bytes 6-7 (flags + fragment offset)
+    let flags_frag = unsafe { u16::from_be(*((ip_hdr + 6) as *const u16)) };
+    f[13] = if (flags_frag & 0x2000) != 0 { 1 } else { 0 }; // MF bit
+    f[14] = (flags_frag & 0x1FFF) as u32; // Fragment offset
+    // f[15] reserved, f[16..22] = custom dims (populated later), f[23..31] reserved
     f
 }
 
@@ -636,7 +702,7 @@ fn extract_custom_dim_from_packet(
                 }
                 _ => 0,
             };
-            state.fields[(9 + index as usize) & 0xF] = val;
+            state.fields[(16 + index as usize) & 0x1F] = val;
         }
     }
 }
@@ -691,7 +757,7 @@ fn apply_tree_token_bucket(rule_id: u32) -> bool {
 ///
 /// The BPF verifier sees this as a ~100-instruction straight-line program with
 /// 2-3 map lookups and no loops. The kernel enforces a max of 33 tail calls,
-/// giving us up to 32 DFS steps — plenty for trees with 9 dimensions.
+/// giving us up to 32 DFS steps — plenty for trees with 15 static + 7 custom dimensions.
 #[xdp]
 pub fn tree_walk_step(ctx: XdpContext) -> u32 {
     match try_tree_walk_step(&ctx) {
@@ -774,9 +840,9 @@ fn try_tree_walk_step(ctx: &XdpContext) -> Result<u32, ()> {
 
     // ---------------------------------------------------------------
     // Look up packet field value for this dimension
-    // Masked index into pre-extracted fields array
+    // Masked index into pre-extracted fields array (& 0x1F proves [0,31] for verifier)
     // ---------------------------------------------------------------
-    let fv = state.fields[(node.dimension as usize) & 0xF];
+    let fv = state.fields[(node.dimension as usize) & 0x1F];
 
     // Push wildcard child FIRST (lowest priority in LIFO order)
     if node.wildcard_child != 0 && state.top < 16 {

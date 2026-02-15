@@ -29,8 +29,22 @@ use crate::{
 // =============================================================================
 
 /// The fixed dimension order for tree levels.
-/// Proto -> SrcIp -> DstIp -> L4Word0 -> L4Word1 -> TcpFlags -> Ttl -> DfBit -> TcpWindow
+///
+/// Primary discriminators (proto, IPs, ports) are ordered first because they
+/// are constrained by the most rules and partition traffic most aggressively.
+/// This maximizes node sharing in the DAG — rules that share proto+port
+/// constraints share a single subtree.
+///
+/// IPv4 fingerprinting fields (ip-id, ip-len, dscp, ecn, mf, frag-offset)
+/// are appended after the primary dims. They are secondary discriminators:
+/// typically constrained only in refinement rules that further narrow traffic
+/// already partitioned by proto/IP/port. The compiler's skip logic
+/// (`any_constrains` check in `compile_recursive_dynamic`) means dimensions
+/// that no active rule constrains generate zero tree nodes and zero runtime
+/// cost — ordering only affects tree shape when multiple dimensions are
+/// co-constrained in the same rule set.
 const DIM_ORDER: [FieldDim; NUM_DIMENSIONS] = [
+    // Primary discriminators (most-constrained, highest fan-out reduction)
     FieldDim::Proto,
     FieldDim::SrcIp,
     FieldDim::DstIp,
@@ -40,6 +54,13 @@ const DIM_ORDER: [FieldDim; NUM_DIMENSIONS] = [
     FieldDim::Ttl,
     FieldDim::DfBit,
     FieldDim::TcpWindow,
+    // Secondary discriminators (IPv4 header fingerprinting)
+    FieldDim::IpId,
+    FieldDim::IpLen,
+    FieldDim::Dscp,
+    FieldDim::Ecn,
+    FieldDim::MfBit,
+    FieldDim::FragOffset,
 ];
 
 // =============================================================================
@@ -217,7 +238,7 @@ fn pick_guard_dim(rule: &RuleSpec) -> FieldDim {
             return dim;
         }
     }
-    // Fallback (shouldn't happen with 9 static dims)
+    // Fallback (shouldn't happen with 15 static dims)
     FieldDim::Proto
 }
 
@@ -2118,6 +2139,8 @@ mod tests {
             FieldDim::Proto, FieldDim::SrcIp, FieldDim::DstIp,
             FieldDim::L4Word0, FieldDim::L4Word1,
             FieldDim::TcpFlags, FieldDim::Ttl, FieldDim::DfBit, FieldDim::TcpWindow,
+            FieldDim::IpId, FieldDim::IpLen, FieldDim::Dscp,
+            FieldDim::Ecn, FieldDim::MfBit, FieldDim::FragOffset,
         ];
         let actions = [
             RuleAction::drop(), 
@@ -2241,6 +2264,8 @@ mod tests {
             FieldDim::Proto, FieldDim::SrcIp, FieldDim::DstIp,
             FieldDim::L4Word0, FieldDim::L4Word1,
             FieldDim::TcpFlags, FieldDim::Ttl, FieldDim::DfBit, FieldDim::TcpWindow,
+            FieldDim::IpId, FieldDim::IpLen, FieldDim::Dscp,
+            FieldDim::Ecn, FieldDim::MfBit, FieldDim::FragOffset,
         ];
         let actions = [
             RuleAction::drop(), 
@@ -3113,7 +3138,7 @@ mod tests {
                 )
             }).collect();
 
-            let (nodes, _manifest) = filter.compile_and_flip_tree(&rules_100).await
+            let (nodes, _manifest, _) = filter.compile_and_flip_tree(&rules_100).await
                 .expect("compile_and_flip failed for 100 rules");
             eprintln!("eBPF integration: 100 rules -> {} nodes", nodes);
             assert!(nodes > 0, "Expected nodes > 0 for 100 rules");
@@ -3129,13 +3154,13 @@ mod tests {
                 )
             }).collect();
 
-            let (nodes, _) = filter.compile_and_flip_tree(&rules_1k).await
+            let (nodes, _, _) = filter.compile_and_flip_tree(&rules_1k).await
                 .expect("compile_and_flip failed for 1000 rules (second flip)");
             eprintln!("eBPF integration: 1000 rules -> {} nodes (blue/green flip)", nodes);
             assert!(nodes > 0, "Expected nodes > 0 for 1000 rules");
 
             // === Third flip: back to smaller set (verifies second slot cleanup) ===
-            let (nodes, _) = filter.compile_and_flip_tree(&rules_100).await
+            let (nodes, _, _) = filter.compile_and_flip_tree(&rules_100).await
                 .expect("compile_and_flip failed on third flip");
             eprintln!("eBPF integration: back to 100 rules -> {} nodes (third flip)", nodes);
             assert!(nodes > 0);
@@ -3175,8 +3200,8 @@ mod tests {
         // The mapping should have 1 custom dim for offset=0, len=1
         assert_eq!(mapping.len(), 1, "Should have exactly 1 custom dimension");
 
-        // Dim order should have 9 static + 1 custom = 10
-        assert_eq!(dim_order.len(), 10, "Dim order should have 10 entries");
+        // Dim order should have 15 static + 1 custom = 16
+        assert_eq!(dim_order.len(), 16, "Dim order should have 16 entries");
 
         // Find which custom dim was assigned
         let custom_dim = mapping.entries[0].2;
@@ -3318,7 +3343,7 @@ mod tests {
         let flat = flatten_tree_with_dims(&shadow, 1, &dim_order);
 
         assert_eq!(mapping.len(), 2, "Should have 2 custom dimensions");
-        assert_eq!(dim_order.len(), 11, "Dim order: 9 static + 2 custom");
+        assert_eq!(dim_order.len(), 17, "Dim order: 15 static + 2 custom");
 
         let dim_a = mapping.entries[0].2; // offset=0,len=1
         let dim_b = mapping.entries[1].2; // offset=2,len=2
@@ -3632,5 +3657,240 @@ mod tests {
         let bad = [0x00u8; 8];
         let (matched, _, _, _) = simulate_walk_inner_with_bytes(&flat, &[], &bad, false);
         assert!(!matched, "Non-matching bytes should NOT match");
+    }
+
+    // =========================================================================
+    // IPv4 Header Fingerprinting Dimension Tests
+    // =========================================================================
+
+    #[test]
+    fn test_ipv4_fingerprint_basic_dims() {
+        // Test that rules using IpId, IpLen, Dscp, Ecn, MfBit, FragOffset
+        // compile correctly and evaluate as expected.
+        let rules = vec![
+            // Drop packets with IP ID = 0 (spoofed/botnet indicator)
+            RuleSpec::compound(
+                vec![Predicate::eq(FieldDim::IpId, 0)],
+                RuleAction::drop(),
+            ).with_priority(150),
+            // Drop fragmented packets (frag_offset > 0)
+            RuleSpec::compound(
+                vec![Predicate::Gt(crate::FieldRef::Dim(FieldDim::FragOffset), 0)],
+                RuleAction::drop(),
+            ).with_priority(200),
+            // Rate-limit DSCP 46 (EF marking, unusual for game traffic)
+            RuleSpec::compound(
+                vec![Predicate::eq(FieldDim::Dscp, 46)],
+                RuleAction::RateLimit { pps: 500, name: None },
+            ).with_priority(120),
+        ];
+
+        let tree = compile_tree(&rules);
+        let flat = flatten_tree(&tree, 1);
+
+        // Packet with IP ID = 0 → should match drop rule
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat, &[(FieldDim::IpId, 0)],
+        );
+        assert!(matched, "IP ID = 0 should match");
+        assert_eq!(action, crate::ACT_DROP, "IP ID = 0 should drop");
+        assert_eq!(prio, 150);
+
+        // Packet with IP ID = 12345, DSCP = 0 → no match
+        // (need FragOffset = 0 default which doesn't match Gt(0))
+        let (matched, _, _, _) = simulate_single_walk(
+            &flat, &[(FieldDim::IpId, 12345)],
+        );
+        assert!(!matched, "IP ID = 12345 should not match (DSCP defaults to 0, FragOffset defaults to 0)");
+
+        // Packet with frag_offset = 100 → should match drop (prio 200)
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat, &[(FieldDim::FragOffset, 100)],
+        );
+        assert!(matched, "frag_offset = 100 should match Gt guard");
+        assert_eq!(action, crate::ACT_DROP);
+        assert_eq!(prio, 200);
+
+        // Packet with frag_offset = 0, ip_id = 999 → should NOT match any rule
+        // (IpId != 0, FragOffset = 0, DSCP defaults to 0)
+        let (matched_frag0, _, _, _) = simulate_single_walk(
+            &flat, &[(FieldDim::FragOffset, 0), (FieldDim::IpId, 999)],
+        );
+        assert!(!matched_frag0, "frag_offset=0 + ip_id=999 should NOT match any rule");
+
+        // Packet with DSCP = 46, IpId = 999 → should match rate-limit
+        // (IpId=999 avoids the IpId=0 drop rule)
+        let (matched, action, _, _) = simulate_single_walk(
+            &flat, &[(FieldDim::Dscp, 46), (FieldDim::IpId, 999)],
+        );
+        assert!(matched, "DSCP = 46 should match");
+        assert_eq!(action, crate::ACT_RATE_LIMIT);
+
+        // Packet with DSCP = 0, IpId = 999 → no match
+        let (matched, _, _, _) = simulate_single_walk(
+            &flat, &[(FieldDim::Dscp, 0), (FieldDim::IpId, 999)],
+        );
+        assert!(!matched, "DSCP = 0 + IpId = 999 should not match");
+    }
+
+    #[test]
+    fn test_ipv4_fingerprint_compound_rule() {
+        // Compound rule: proto=17 AND ip_id=0 AND df=0 → drop (spoofed UDP botnet)
+        let rules = vec![
+            RuleSpec::compound(
+                vec![
+                    Predicate::eq(FieldDim::Proto, 17),
+                    Predicate::eq(FieldDim::IpId, 0),
+                    Predicate::eq(FieldDim::DfBit, 0),
+                ],
+                RuleAction::drop(),
+            ).with_priority(180),
+            // Background: allow all UDP
+            RuleSpec::compound(
+                vec![Predicate::eq(FieldDim::Proto, 17)],
+                RuleAction::pass(),
+            ).with_priority(50),
+        ];
+
+        let tree = compile_tree(&rules);
+        let flat = flatten_tree(&tree, 1);
+
+        // Full match: proto=17, ip_id=0, df=0 → drop
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[
+                (FieldDim::Proto, 17),
+                (FieldDim::IpId, 0),
+                (FieldDim::DfBit, 0),
+            ],
+        );
+        assert!(matched);
+        assert_eq!(action, crate::ACT_DROP);
+        assert_eq!(prio, 180);
+
+        // Partial match: proto=17, ip_id=5000, df=0 → pass (background rule)
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[
+                (FieldDim::Proto, 17),
+                (FieldDim::IpId, 5000),
+                (FieldDim::DfBit, 0),
+            ],
+        );
+        assert!(matched);
+        assert_eq!(action, crate::ACT_PASS);
+        assert_eq!(prio, 50);
+
+        // Non-UDP traffic → no match
+        let (matched, _, _, _) = simulate_single_walk(
+            &flat,
+            &[
+                (FieldDim::Proto, 6),
+                (FieldDim::IpId, 0),
+                (FieldDim::DfBit, 0),
+            ],
+        );
+        assert!(!matched);
+    }
+
+    #[test]
+    fn test_ipv4_fingerprint_ecn_mf_iplen() {
+        // Test the 3 dimensions missing from test_ipv4_fingerprint_basic_dims:
+        // IpLen, Ecn, MfBit
+        let rules = vec![
+            // Count tiny packets (IP len < 40)
+            RuleSpec::compound(
+                vec![Predicate::Lt(crate::FieldRef::Dim(FieldDim::IpLen), 40)],
+                RuleAction::Count { name: None },
+            ).with_priority(100),
+            // Drop packets with MF bit set (fragment flood)
+            RuleSpec::compound(
+                vec![Predicate::eq(FieldDim::MfBit, 1)],
+                RuleAction::drop(),
+            ).with_priority(200),
+            // Rate-limit ECN CE (congestion experienced = 3)
+            RuleSpec::compound(
+                vec![Predicate::eq(FieldDim::Ecn, 3)],
+                RuleAction::RateLimit { pps: 1000, name: None },
+            ).with_priority(150),
+        ];
+
+        let tree = compile_tree(&rules);
+        let flat = flatten_tree(&tree, 1);
+
+        // Packet with MF=1 → should match drop rule (highest priority)
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat, &[(FieldDim::MfBit, 1), (FieldDim::IpLen, 1500)],
+        );
+        assert!(matched, "MF=1 should match");
+        assert_eq!(action, crate::ACT_DROP, "MF=1 should drop");
+        assert_eq!(prio, 200);
+
+        // Packet with MF=0 → should NOT match MF rule
+        let (matched, _, _, _) = simulate_single_walk(
+            &flat, &[(FieldDim::MfBit, 0), (FieldDim::IpLen, 1500)],
+        );
+        assert!(!matched, "MF=0 + normal IpLen + ECN=0 should not match");
+
+        // Packet with ECN=3 → should match rate-limit
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat, &[(FieldDim::Ecn, 3), (FieldDim::IpLen, 1500)],
+        );
+        assert!(matched, "ECN=3 should match");
+        assert_eq!(action, crate::ACT_RATE_LIMIT, "ECN=3 should rate-limit");
+        assert_eq!(prio, 150);
+
+        // Packet with ECN=0 → should NOT match ECN rule
+        let (matched, _, _, _) = simulate_single_walk(
+            &flat, &[(FieldDim::Ecn, 0), (FieldDim::IpLen, 1500)],
+        );
+        assert!(!matched, "ECN=0 + normal IpLen should not match");
+
+        // Packet with IpLen=28 (tiny) → should match count rule
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat, &[(FieldDim::IpLen, 28)],
+        );
+        assert!(matched, "IpLen=28 (< 40) should match");
+        assert_eq!(action, crate::ACT_COUNT, "tiny packet should count");
+        assert_eq!(prio, 100);
+
+        // Packet with IpLen=40 (boundary, NOT less than) → should NOT match
+        let (matched, _, _, _) = simulate_single_walk(
+            &flat, &[(FieldDim::IpLen, 40)],
+        );
+        assert!(!matched, "IpLen=40 should NOT match Lt(40)");
+
+        // Packet with IpLen=1500 (normal) → should NOT match
+        let (matched, _, _, _) = simulate_single_walk(
+            &flat, &[(FieldDim::IpLen, 1500)],
+        );
+        assert!(!matched, "IpLen=1500 should not match");
+
+        // Compound: MF=1 AND ECN=3 → MF drop wins (prio 200 > 150)
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat, &[(FieldDim::MfBit, 1), (FieldDim::Ecn, 3), (FieldDim::IpLen, 1500)],
+        );
+        assert!(matched);
+        assert_eq!(action, crate::ACT_DROP, "MF=1 drop should win over ECN rate-limit");
+        assert_eq!(prio, 200);
+    }
+
+    #[test]
+    fn test_ipv4_dim_skipping_new_fields() {
+        // Rule constrains only FragOffset (dim index 14 in DIM_ORDER).
+        // The compiler should skip all preceding 14 dimensions.
+        let rules = vec![
+            RuleSpec::compound(
+                vec![Predicate::Gt(crate::FieldRef::Dim(FieldDim::FragOffset), 0)],
+                RuleAction::drop(),
+            ).with_priority(200),
+        ];
+
+        let tree = compile_tree(&rules);
+        // The root node should branch on FragOffset, skipping Proto..MfBit
+        assert_eq!(
+            tree.dim_index, 14,
+            "Should skip to FragOffset (dim_index 14 in DIM_ORDER)"
+        );
     }
 }

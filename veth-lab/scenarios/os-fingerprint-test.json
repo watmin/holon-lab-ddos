@@ -1,0 +1,58 @@
+{
+  "name": "OS Fingerprint Test",
+  "description": "Tests IP header fingerprinting: Windows baseline, Linux botnet attack. Holon should detect concentration in ip_id=0, dscp, and TTL band shifts.",
+  "baseline_pps": 2000,
+  "attack_pps": 20000,
+  "phases": [
+    {
+      "name": "warmup_windows",
+      "duration_secs": 30,
+      "type": "normal",
+      "os_profile": "windows",
+      "description": "30s baseline: Windows clients (TTL=128, random IP ID, DF set)"
+    },
+    {
+      "name": "linux_attack",
+      "duration_secs": 15,
+      "type": "attack",
+      "os_profile": "linux",
+      "description": "15s attack: Linux VPS botnet (TTL=64, sequential IP ID, DF set)"
+    },
+    {
+      "name": "calm1",
+      "duration_secs": 20,
+      "type": "normal",
+      "os_profile": "windows",
+      "description": "20s recovery: Windows baseline resumes"
+    },
+    {
+      "name": "spoofed_attack",
+      "duration_secs": 15,
+      "type": "attack",
+      "os_profile": "spoofed",
+      "description": "15s attack: Spoofed traffic (IP ID=0, DF clear, TTL=64)"
+    },
+    {
+      "name": "calm2",
+      "duration_secs": 20,
+      "type": "normal",
+      "os_profile": "windows",
+      "description": "20s recovery"
+    },
+    {
+      "name": "dscp_attack",
+      "duration_secs": 15,
+      "type": "attack",
+      "os_profile": "spoofed",
+      "dscp": 46,
+      "description": "15s attack: Spoofed with DSCP=46 (EF/voice marking, unusual for game traffic)"
+    },
+    {
+      "name": "final",
+      "duration_secs": 30,
+      "type": "normal",
+      "os_profile": "windows",
+      "description": "30s final calm"
+    }
+  ]
+}
