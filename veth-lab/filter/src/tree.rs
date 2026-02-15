@@ -927,8 +927,21 @@ impl TreeManager {
             
             // Insert/update buckets (preserve tokens for buckets that still exist)
             for &(rule_id, ref bucket) in &flat.rate_buckets {
-                // Only insert if not already present (preserves token state across flips)
-                if rate_map.get(&rule_id, 0).is_err() {
+                if let Ok(existing) = rate_map.get(&rule_id, 0) {
+                    // Bucket exists — update rate_pps if changed, preserve token state
+                    if existing.rate_pps != bucket.rate_pps {
+                        let updated = TokenBucket {
+                            rate_pps: bucket.rate_pps,
+                            tokens: existing.tokens,
+                            last_update_ns: existing.last_update_ns,
+                            allowed_count: existing.allowed_count,
+                            dropped_count: existing.dropped_count,
+                        };
+                        rate_map.insert(rule_id, updated, 0)?;
+                    }
+                    // else: same rate, same bucket — nothing to do
+                } else {
+                    // New bucket — insert fresh
                     rate_map.insert(rule_id, *bucket, 0)?;
                 }
             }
