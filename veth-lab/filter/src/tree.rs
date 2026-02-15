@@ -134,8 +134,10 @@ fn compile_tree(rules: &[RuleSpec]) -> Rc<ShadowNode> {
 pub(crate) fn compile_tree_full(rules: &[RuleSpec]) -> (Rc<ShadowNode>, CustomDimMapping, Vec<FieldDim>, Vec<crate::RuleManifestEntry>) {
     let mut expanded: Vec<RuleSpec> = rules.to_vec();
 
-    // Save pre-transformation labels (before resolve/allocate modify predicates)
+    // Save pre-transformation metadata (before resolve/allocate modify predicates)
     let pre_labels: Vec<String> = expanded.iter().map(|r| r.display_label()).collect();
+    let pre_constraints: Vec<String> = expanded.iter().map(|r| r.constraints_to_edn()).collect();
+    let pre_expressions: Vec<String> = expanded.iter().map(|r| r.to_edn()).collect();
 
     // Phase 2a: Resolve 1-4 byte L4Byte references to custom dimensions
     let mapping = resolve_l4byte_refs(&mut expanded);
@@ -154,18 +156,23 @@ pub(crate) fn compile_tree_full(rules: &[RuleSpec]) -> (Rc<ShadowNode>, CustomDi
     // Prefer the action's :name for the label (if set), otherwise fall back to
     // the rule-level display_label (which uses :label or constraint-based system label).
     let mut manifest_map: std::collections::HashMap<u32, crate::RuleManifestEntry> = std::collections::HashMap::new();
-    for (spec, label) in expanded.iter().zip(pre_labels.iter()) {
+    for (idx, spec) in expanded.iter().enumerate() {
+        let label = pre_labels.get(idx).cloned().unwrap_or_else(|| spec.display_label());
+        let constraints = pre_constraints.get(idx).cloned().unwrap_or_else(|| spec.constraints_to_edn());
+        let expression = pre_expressions.get(idx).cloned().unwrap_or_else(|| spec.to_edn());
         let rule_id = spec.bucket_key().unwrap_or_else(|| spec.canonical_hash());
         if let Some(action) = spec.actions.first() {
             let effective_label = if let Some((ns, name)) = action.name() {
                 format!("[{} {}]", ns, name)
             } else {
-                label.clone()
+                label
             };
             manifest_map.entry(rule_id).or_insert_with(|| crate::RuleManifestEntry {
                 rule_id,
                 action: action.clone(),
                 label: effective_label,
+                constraints,
+                expression,
             });
         }
     }
@@ -789,6 +796,8 @@ pub struct TreeManager {
     /// Edge keys written to each slot during the last compilation.
     /// Used to clean up stale edges before rewriting a slot.
     prev_edge_keys: [Vec<EdgeKey>; 2],
+    /// Last compiled DAG (serialized for visualization, to avoid storing Rc)
+    last_dag: Vec<SerializableDagNode>,
 }
 
 impl TreeManager {
@@ -796,6 +805,7 @@ impl TreeManager {
         Self {
             active_slot: 0,
             prev_edge_keys: [Vec::new(), Vec::new()],
+            last_dag: Vec::new(),
         }
     }
 
@@ -819,7 +829,7 @@ impl TreeManager {
         &mut self,
         rules: &[RuleSpec],
         bpf: &mut Ebpf,
-    ) -> Result<(usize, Vec<crate::RuleManifestEntry>)> {
+    ) -> Result<(usize, Vec<crate::RuleManifestEntry>, Vec<(u32, u64)>)> {
         let base = self.staging_base();
 
         // 1. Compile the tree (with L4Byte resolution)
@@ -843,7 +853,7 @@ impl TreeManager {
                 .try_into()?;
             root_map.set(0, 0u32, 0)?;
             self.active_slot = 1 - self.active_slot;
-            return Ok((0, manifest));
+            return Ok((0, manifest, Vec::new()));
         }
 
         // 3. Write nodes to TREE_NODES array
@@ -882,6 +892,7 @@ impl TreeManager {
 
         // 5. Write rate buckets to TREE_RATE_STATE
         // Clear old buckets and write new ones
+        let mut retired_counts: Vec<(u32, u64)> = Vec::new();
         {
             let mut rate_map: AyaHashMap<_, u32, TokenBucket> = bpf
                 .map_mut("TREE_RATE_STATE").context("TREE_RATE_STATE not found")?
@@ -891,11 +902,20 @@ impl TreeManager {
             let new_bucket_ids: std::collections::HashSet<u32> = 
                 flat.rate_buckets.iter().map(|(id, _)| *id).collect();
             
-            // Remove stale buckets (not in new rule set)
+            // Remove stale buckets (not in new rule set), capturing final counts
             let all_keys: Vec<u32> = rate_map.keys().filter_map(|k| k.ok()).collect();
             let mut removed_count = 0;
             for key in all_keys {
                 if !new_bucket_ids.contains(&key) {
+                    // Read final count before deletion
+                    if let Ok(bucket) = rate_map.get(&key, 0) {
+                        let final_total = bucket.allowed_count + bucket.dropped_count;
+                        if final_total > 0 {
+                            retired_counts.push((key, final_total));
+                            info!("  Retiring bucket {} with final count {} (allowed={} dropped={})", 
+                                  key, final_total, bucket.allowed_count, bucket.dropped_count);
+                        }
+                    }
                     if rate_map.remove(&key).is_ok() {
                         removed_count += 1;
                     }
@@ -954,7 +974,21 @@ impl TreeManager {
         info!("Tree flip complete: root={} (slot {})", flat.root_id, 1 - self.active_slot);
         self.active_slot = 1 - self.active_slot;
 
-        Ok((node_count, manifest))
+        // Serialize and store DAG for visualization
+        let manifest_by_rule_id: std::collections::HashMap<u32, crate::RuleManifestEntry> =
+            manifest.iter().cloned().map(|m| (m.rule_id, m)).collect();
+        let mut dag_nodes = Vec::new();
+        let mut node_id = 0usize;
+        serialize_shadow_recursive(
+            &shadow,
+            &mut dag_nodes,
+            &mut node_id,
+            &dim_order,
+            &manifest_by_rule_id,
+        );
+        self.last_dag = dag_nodes;
+
+        Ok((node_count, manifest, retired_counts))
     }
 
     /// Clean up the old (now-inactive) slot's entries from the edge HashMap.
@@ -1008,9 +1042,125 @@ impl TreeManager {
 
         self.active_slot = 0;
         self.prev_edge_keys = [Vec::new(), Vec::new()];
+        self.last_dag = Vec::new();
         info!("Tree cleared (both slots)");
         Ok(())
     }
+
+    /// Get the last compiled DAG for visualization
+    pub fn get_dag(&self) -> Vec<SerializableDagNode> {
+        self.last_dag.clone()
+    }
+}
+
+// =============================================================================
+// DAG Serialization (for visualization)
+// =============================================================================
+
+/// Serializable representation of a DAG node for visualization
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SerializableDagNode {
+    pub id: usize,
+    pub dim: String,
+    pub children: Vec<usize>,
+    pub specific_edges: Vec<SerializableSpecificEdge>,
+    pub range_edges: Vec<SerializableRangeEdge>,
+    pub wildcard: Option<usize>,
+    pub action: Option<String>,
+    pub action_rule_id: Option<u32>,
+    pub action_priority: Option<u8>,
+    pub label: Option<String>,
+    pub rule_constraints: Option<String>,
+    pub rule_expression: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SerializableSpecificEdge {
+    pub value: u32,
+    pub child_id: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SerializableRangeEdge {
+    pub op: u8,
+    pub value: u32,
+    pub child_id: usize,
+}
+
+fn serialize_shadow_recursive(
+    shadow: &Rc<ShadowNode>,
+    nodes: &mut Vec<SerializableDagNode>,
+    next_id: &mut usize,
+    dim_order: &[FieldDim],
+    manifest_by_rule_id: &std::collections::HashMap<u32, crate::RuleManifestEntry>,
+) -> usize {
+    let my_id = *next_id;
+    *next_id += 1;
+
+    let dim_name = if shadow.dim_index < dim_order.len() {
+        format!("{:?}", dim_order[shadow.dim_index])
+    } else {
+        "Leaf".to_string()
+    };
+
+    let action_str = shadow.action.as_ref().map(|a| {
+        match a.action {
+            crate::ACT_PASS => "PASS".to_string(),
+            crate::ACT_DROP => "DROP".to_string(),
+            crate::ACT_RATE_LIMIT => format!("RATE_LIMIT({})", a.rate_pps),
+            crate::ACT_COUNT => "COUNT".to_string(),
+            _ => format!("ACTION({})", a.action),
+        }
+    });
+
+    // Recursively serialize children
+    let mut child_ids = Vec::new();
+    let mut specific_edges = Vec::new();
+    for (val, child) in shadow.children.iter() {
+        let child_id = serialize_shadow_recursive(child, nodes, next_id, dim_order, manifest_by_rule_id);
+        child_ids.push(child_id);
+        specific_edges.push(SerializableSpecificEdge {
+            value: *val,
+            child_id,
+        });
+    }
+
+    // Serialize range-guarded children
+    let mut range_edges = Vec::new();
+    for (edge, child) in shadow.range_children.iter() {
+        let child_id = serialize_shadow_recursive(child, nodes, next_id, dim_order, manifest_by_rule_id);
+        child_ids.push(child_id);
+        range_edges.push(SerializableRangeEdge {
+            op: edge.op,
+            value: edge.value,
+            child_id,
+        });
+    }
+
+    // Serialize wildcard child
+    let wildcard_id = shadow.wildcard.as_ref().map(|child| {
+        serialize_shadow_recursive(child, nodes, next_id, dim_order, manifest_by_rule_id)
+    });
+
+    let action_rule_id = shadow.action.as_ref().map(|a| a.rule_id);
+    let manifest_entry = action_rule_id.and_then(|id| manifest_by_rule_id.get(&id));
+
+    nodes.push(SerializableDagNode {
+        id: my_id,
+        dim: dim_name,
+        children: child_ids,
+        specific_edges,
+        range_edges,
+        wildcard: wildcard_id,
+        action: action_str,
+        action_rule_id,
+        action_priority: shadow.action.as_ref().map(|a| a.priority),
+        label: manifest_entry.map(|m| m.label.clone()),
+        rule_constraints: manifest_entry.map(|m| m.constraints.clone()),
+        rule_expression: manifest_entry.map(|m| m.expression.clone()),
+    });
+
+    my_id
 }
 
 // =============================================================================

@@ -11,6 +11,8 @@
 //! - analogy() for zero-shot variant detection
 //! - Magnitude-aware encoding ($log) for packet sizes
 
+mod metrics_server;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 use clap::Parser;
@@ -23,9 +25,9 @@ use std::io::BufRead;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use veth_filter::{
     FieldDim, PacketSample, Predicate, RuleAction, RuleSpec, VethFilter,
@@ -104,6 +106,10 @@ struct Args {
     /// Set to 0 to disable the limit.
     #[arg(long, default_value = "32")]
     max_byte_matches_per_scope: usize,
+
+    /// Metrics server port (0 to disable)
+    #[arg(long, default_value = "9100")]
+    metrics_port: u16,
 }
 
 // =============================================================================
@@ -1440,6 +1446,40 @@ fn compile_compound_rule(
     })
 }
 
+/// Generate a unique key for a rule based on constraints + action type (ignoring action params like rate)
+fn rule_identity_key(spec: &RuleSpec) -> String {
+    let constraints_part = spec.constraints_to_edn();
+    let action_type = spec.actions.first().map(|a| match a {
+        RuleAction::Drop { .. } => "drop",
+        RuleAction::RateLimit { .. } => "rate-limit",
+        RuleAction::Pass { .. } => "pass",
+        RuleAction::Count { .. } => "count",
+    }).unwrap_or("none");
+    
+    format!("{}::{}", constraints_part, action_type)
+}
+
+fn attach_manifest_labels_to_dag(
+    dag_nodes: &mut [metrics_server::DagNode],
+    manifest: &[veth_filter::RuleManifestEntry],
+) {
+    let manifest_by_rule_id: HashMap<u32, veth_filter::RuleManifestEntry> = manifest
+        .iter()
+        .cloned()
+        .map(|entry| (entry.rule_id, entry))
+        .collect();
+
+    for node in dag_nodes.iter_mut() {
+        if let Some(rule_id) = node.action_rule_id {
+            if let Some(entry) = manifest_by_rule_id.get(&rule_id) {
+                node.label = Some(entry.label.clone());
+                node.rule_constraints = Some(entry.constraints.clone());
+                node.rule_expression = Some(entry.expression.clone());
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -1625,7 +1665,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 
-                let key = spec.describe();
+                let key = rule_identity_key(&spec);
                 rules.insert(key, ActiveRule {
                     last_seen: Instant::now(),
                     spec: spec.clone(),
@@ -1650,7 +1690,7 @@ async fn main() -> Result<()> {
             if args.enforce {
                 let all_specs: Vec<RuleSpec> = rules.values().map(|r| r.spec.clone()).collect();
                 let start = Instant::now();
-                let (nodes, manifest) = filter.compile_and_flip_tree(&all_specs).await?;
+                let (nodes, manifest, _retired) = filter.compile_and_flip_tree(&all_specs).await?;
                 let compile_time = start.elapsed();
                 let capacity_pct = (nodes as f64 / 2_500_000.0) * 100.0;
 
@@ -1667,6 +1707,7 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                // Note: no retired buckets on initial compile
 
                 info!("========================================");
                 info!("PRE-LOADED TREE COMPILED");
@@ -1686,6 +1727,60 @@ async fn main() -> Result<()> {
     info!("  Pre-loaded rules: {} (permanent)", preloaded_count);
     info!("  Warmup: {} windows or {} packets", args.warmup_windows, args.warmup_packets);
     info!("");
+
+    // ── Start metrics server if enabled ──
+    let metrics_state = if args.metrics_port > 0 {
+        info!("");
+        info!("========================================");
+        info!("METRICS DASHBOARD");
+        info!("  URL: http://localhost:{}", args.metrics_port);
+        info!("========================================");
+        info!("");
+        
+        // Convert ActiveRule to ActiveRuleInfo for metrics server
+        let active_rules_clone = active_rules.clone();
+        let metrics_active_rules = Arc::new(RwLock::new(HashMap::new()));
+        {
+            let src = active_rules_clone.read().await;
+            let mut dst = metrics_active_rules.write().await;
+            for (key, rule) in src.iter() {
+                dst.insert(key.clone(), metrics_server::ActiveRuleInfo {
+                    spec: rule.spec.clone(),
+                    preloaded: rule.preloaded,
+                });
+            }
+        }
+        
+        let state = metrics_server::MetricsState::new(
+            filter.clone(),
+            metrics_active_rules.clone(),
+            tree_counter_labels.clone(),
+            1000, // broadcast channel capacity
+        );
+
+        // Spawn metrics HTTP server
+        let server_state = state.clone();
+        let metrics_port = args.metrics_port;
+        tokio::spawn(async move {
+            if let Err(e) = metrics_server::run_server(server_state, metrics_port).await {
+                error!("Metrics server error: {}", e);
+            }
+        });
+
+        // Spawn metrics collector task
+        let collector_state = state.clone();
+        tokio::spawn(async move {
+            metrics_server::metrics_collector_task(
+                collector_state,
+                Duration::from_millis(500),  // unified metrics every 500ms
+            ).await;
+        });
+
+        Some(state)
+    } else {
+        info!("Metrics server disabled (--metrics-port 0)");
+        None
+    };
 
     let window_duration = Duration::from_secs(args.window);
     let mut _samples_processed = 0u64;
@@ -1943,11 +2038,39 @@ async fn main() -> Result<()> {
                     if let Some(spec) =
                         compile_compound_rule(&detections, args.rate_limit, args.sample_rate, window_count)
                     {
-                        let rule_key = spec.describe();
+                        // Use constraints + action type for the key (ignore rate value)
+                        let rule_key = rule_identity_key(&spec);
 
                         let mut rules = active_rules.write().await;
-                        if rules.contains_key(&rule_key) {
-                            rules.get_mut(&rule_key).unwrap().last_seen = Instant::now();
+                        if let Some(existing) = rules.get_mut(&rule_key) {
+                            // Refresh timestamp and update spec so action config changes
+                            // (e.g. rate-limit pps) propagate into the next tree compile.
+                            let spec_changed = existing.spec.to_edn() != spec.to_edn();
+                            existing.last_seen = Instant::now();
+                            if spec_changed {
+                                existing.spec = spec.clone();
+                            }
+
+                            if spec_changed {
+                                // Update bucket_key_to_spec map for observability
+                                if let Some(bk) = spec.bucket_key() {
+                                    let mut bmap = bucket_key_to_spec.write().await;
+                                    bmap.insert(bk, spec.clone());
+                                }
+                                tree_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+
+                            // Emit refresh event to metrics server
+                            if let Some(ref state) = metrics_state {
+                                state.broadcast(metrics_server::MetricsEvent::RuleEvent {
+                                    ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+                                    action: "refreshed".to_string(),
+                                    key: rule_key.clone(),
+                                    spec_summary: spec.to_edn(),
+                                    is_preloaded: false,
+                                    ttl_secs: 300,
+                                });
+                            }
                         } else {
                             let action_str = match &spec.actions[0] {
                                 RuleAction::Drop { .. } => "DROP",
@@ -1966,11 +2089,23 @@ async fn main() -> Result<()> {
                                 action: action_str.to_string(),
                                 rate_pps,
                             });
-                            rules.insert(rule_key, ActiveRule {
+                            rules.insert(rule_key.clone(), ActiveRule {
                                 last_seen: Instant::now(),
                                 spec: spec.clone(),
                                 preloaded: false,
                             });
+                            
+                            // Emit rule_event to metrics server
+                            if let Some(ref state) = metrics_state {
+                                state.broadcast(metrics_server::MetricsEvent::RuleEvent {
+                                    ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+                                    action: "added".to_string(),
+                                    key: rule_key.clone(),
+                                    spec_summary: spec.to_edn(),
+                                    is_preloaded: false,
+                                    ttl_secs: 300,
+                                });
+                            }
                             
                             // Update bucket_key_to_spec map for observability
                             if let Some(bk) = spec.bucket_key() {
@@ -1987,15 +2122,35 @@ async fn main() -> Result<()> {
                                 .map(|r| r.spec.clone())
                                 .collect();
                             match filter.compile_and_flip_tree(&all_specs).await {
-                                Ok((nodes, manifest)) => {
+                                Ok((nodes, manifest, retired)) => {
                                     info!("    Tree recompiled: {} rules -> {} nodes", all_specs.len(), nodes);
+                                    
+                                    // Accumulate retired bucket counts BEFORE clearing labels
+                                    // (we need the old label mapping to attribute the counts)
+                                    if let Some(ref state) = metrics_state {
+                                        state.accumulate_retired_counts(&retired).await;
+                                    }
+                                    
                                     // Refresh tree_counter_labels from manifest
                                     let mut tcl = tree_counter_labels.write().await;
                                     tcl.clear();
                                     for entry in &manifest {
                                         tcl.insert(entry.rule_id, (entry.action_kind().to_string(), entry.label.clone()));
                                     }
+                                    drop(tcl);
                                     tree_dirty.store(false, std::sync::atomic::Ordering::SeqCst);
+                                    
+                                    // Emit DAG snapshot to metrics server
+                                    if let Some(ref state) = metrics_state {
+                                        let mut dag_nodes = filter.serialize_dag().await;
+                                        attach_manifest_labels_to_dag(&mut dag_nodes, &manifest);
+                                        state.broadcast(metrics_server::MetricsEvent::DagSnapshot {
+                                            ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+                                            node_count: dag_nodes.len(),
+                                            rule_count: all_specs.len(),
+                                            nodes: dag_nodes,
+                                        });
+                                    }
                                 }
                                 Err(e) => {
                                     warn!("    Failed to compile tree: {}", e);
@@ -2070,6 +2225,18 @@ async fn main() -> Result<()> {
             for key in expired {
                 if let Some(active) = rules.remove(&key) {
                     info!("<<< EXPIRED RULE: {}", active.spec.describe());
+                    
+                    // Emit rule_event to metrics server
+                    if let Some(ref state) = metrics_state {
+                        state.broadcast(metrics_server::MetricsEvent::RuleEvent {
+                            ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+                            action: "expired".to_string(),
+                            key: key.clone(),
+                            spec_summary: active.spec.to_edn(),
+                            is_preloaded: false,
+                            ttl_secs: 300,
+                        });
+                    }
                 }
             }
 
@@ -2087,13 +2254,32 @@ async fn main() -> Result<()> {
                         .map(|r| r.spec.clone())
                         .collect();
                     match filter.compile_and_flip_tree(&all_specs).await {
-                        Ok((nodes, manifest)) => {
+                        Ok((nodes, manifest, retired)) => {
                             info!("Tree recompiled after expiry: {} rules -> {} nodes", all_specs.len(), nodes);
+                            
+                            // Accumulate retired bucket counts BEFORE clearing labels
+                            if let Some(ref state) = metrics_state {
+                                state.accumulate_retired_counts(&retired).await;
+                            }
+                            
                             // Refresh tree_counter_labels from manifest
                             let mut tcl = tree_counter_labels.write().await;
                             tcl.clear();
                             for entry in &manifest {
                                 tcl.insert(entry.rule_id, (entry.action_kind().to_string(), entry.label.clone()));
+                            }
+                            drop(tcl);
+                            
+                            // Emit DAG snapshot to metrics server
+                            if let Some(ref state) = metrics_state {
+                                let mut dag_nodes = filter.serialize_dag().await;
+                                attach_manifest_labels_to_dag(&mut dag_nodes, &manifest);
+                                state.broadcast(metrics_server::MetricsEvent::DagSnapshot {
+                                    ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+                                    node_count: dag_nodes.len(),
+                                    rule_count: all_specs.len(),
+                                    nodes: dag_nodes,
+                                });
                             }
                         }
                         Err(e) => {

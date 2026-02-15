@@ -83,6 +83,10 @@ pub struct RuleManifestEntry {
     pub rule_id: u32,
     pub action: RuleAction,
     pub label: String,
+    /// Canonical constraints from the original user rule (pre-compilation lowering)
+    pub constraints: String,
+    /// Full EDN expression from the original user rule (pre-compilation lowering)
+    pub expression: String,
 }
 
 impl RuleManifestEntry {
@@ -977,10 +981,16 @@ impl RuleSpec {
     ///
     /// Example: `{:constraints [(= proto 17) (= src-port 53)] :actions [(rate-limit 500)] :priority 190}`
     pub fn to_edn(&self) -> String {
-        let constraints_str = if self.constraints.is_empty() {
+        // Use sorted constraints for canonical ordering
+        let mut sorted: Vec<&Predicate> = self.constraints.iter().collect();
+        sorted.sort_by_key(|p| {
+            p.field_dim().map(|d| d as u8).unwrap_or(255)
+        });
+        
+        let constraints_str = if sorted.is_empty() {
             "[]".to_string()
         } else {
-            let clauses: Vec<String> = self.constraints.iter()
+            let clauses: Vec<String> = sorted.iter()
                 .map(|p| p.to_sexpr_clause())
                 .collect();
             format!("[{}]", clauses.join(" "))
@@ -1031,12 +1041,18 @@ impl RuleSpec {
         let constraint_indent = "               ";  // 15 spaces: align with first ( in ":constraints ["
         let actions_indent = "              ";      // 14 spaces: align with first ( in " :actions     ["
         
-        let constraints_str = if self.constraints.is_empty() {
+        // Use sorted constraints for canonical ordering
+        let mut sorted: Vec<&Predicate> = self.constraints.iter().collect();
+        sorted.sort_by_key(|p| {
+            p.field_dim().map(|d| d as u8).unwrap_or(255)
+        });
+        
+        let constraints_str = if sorted.is_empty() {
             "[]".to_string()
-        } else if self.constraints.len() == 1 {
-            format!("[{}]", self.constraints[0].to_sexpr_clause())
+        } else if sorted.len() == 1 {
+            format!("[{}]", sorted[0].to_sexpr_clause())
         } else {
-            let clauses: Vec<String> = self.constraints.iter()
+            let clauses: Vec<String> = sorted.iter()
                 .map(|p| p.to_sexpr_clause())
                 .collect();
             let mut s = format!("[{}", clauses[0]);
@@ -1421,10 +1437,16 @@ impl VethFilter {
     /// This is the primary API for the tree engine. The sidecar maintains
     /// its rule set and calls this whenever rules change.
     /// Returns the number of nodes in the compiled tree.
-    pub async fn compile_and_flip_tree(&self, rules: &[RuleSpec]) -> Result<(usize, Vec<RuleManifestEntry>)> {
+    pub async fn compile_and_flip_tree(&self, rules: &[RuleSpec]) -> Result<(usize, Vec<RuleManifestEntry>, Vec<(u32, u64)>)> {
         let mut bpf = self.bpf.write().await;
         let mut mgr = self.tree_manager.lock().await;
         mgr.compile_and_flip(rules, &mut bpf)
+    }
+
+    /// Serialize the last compiled DAG for visualization
+    pub async fn serialize_dag(&self) -> Vec<tree::SerializableDagNode> {
+        let mgr = self.tree_manager.lock().await;
+        mgr.get_dag()
     }
 
     /// Read TREE_COUNTERS map and return (key, value) pairs

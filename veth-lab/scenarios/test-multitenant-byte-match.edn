@@ -79,3 +79,9 @@
 ;; Shared rule: Rate-limit all UDP as a baseline safety net
 ;; ──────────────────────────────────────────────────────────────
 {:constraints [(= proto 17)] :actions [(rate-limit 50000 :name ["global" "udp-baseline"])] :priority 10}
+
+;; ──────────────────────────────────────────────────────────────
+;; Drop all ICMP (proto 1) — forces a second proto-level terminal
+;; to exercise multi-proto projection in the DAG viewer.
+;; ──────────────────────────────────────────────────────────────
+{:constraints [(= proto 1)] :actions [(drop :name ["global" "icmp-block"])] :priority 10}

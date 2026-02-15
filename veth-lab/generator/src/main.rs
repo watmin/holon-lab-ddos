@@ -81,6 +81,11 @@ struct Args {
     #[arg(long)]
     scenario_file: Option<PathBuf>,
 
+    /// PPS jitter percentage (0-100, default 5 = ±5%)
+    /// Adds random variance to packet rate for more realistic traffic
+    #[arg(long, default_value = "5")]
+    jitter_pct: u8,
+
     /// Directory for log files (also writes to stdout)
     #[arg(long, default_value = "logs")]
     log_dir: PathBuf,
@@ -442,9 +447,12 @@ fn run_scenario_file(
             // Time-based rate limiting: calculate where we SHOULD be vs where we ARE
             // This naturally accounts for send time and other overhead
             if pps > 0 {
+                // Apply jitter to target PPS for this second
+                let jittered_pps = apply_jitter(&mut rng, pps, args.jitter_pct);
+                
                 let packets_this_phase = packets_sent.load(Ordering::Relaxed) - phase_start_packets;
                 let elapsed_ns = phase_start.elapsed().as_nanos() as u64;
-                let target_ns = packets_this_phase * 1_000_000_000 / pps as u64;
+                let target_ns = packets_this_phase * 1_000_000_000 / jittered_pps as u64;
                 
                 if target_ns > elapsed_ns {
                     let sleep_ns = target_ns - elapsed_ns;
@@ -675,7 +683,10 @@ fn run_pattern_mode(
         // Time-based rate limiting (simple version for pattern mode)
         // For accurate high-PPS, use scenario files which have per-phase tracking
         if current_pps > 0 {
-            let target_interval_ns = 1_000_000_000u64 / current_pps as u64;
+            // Apply jitter to create realistic variance
+            let jittered_pps = apply_jitter(&mut rng, current_pps, args.jitter_pct);
+            let target_interval_ns = 1_000_000_000u64 / jittered_pps as u64;
+            
             if target_interval_ns >= 50_000 {
                 // Low-medium PPS (< 20k): sleep per packet works
                 std::thread::sleep(Duration::from_nanos(target_interval_ns));
@@ -956,4 +967,24 @@ fn checksum(data: &[u8]) -> u16 {
     }
     
     !(sum as u16)
+}
+
+/// Apply jitter to a PPS value
+/// jitter_pct: 0-100 (e.g., 5 = ±5%)
+fn apply_jitter<R: Rng>(rng: &mut R, pps: u32, jitter_pct: u8) -> u32 {
+    if jitter_pct == 0 || pps == 0 {
+        return pps;
+    }
+    
+    // Calculate jitter range: ±jitter_pct% of pps
+    let jitter_range = (pps as f64 * jitter_pct as f64 / 100.0) as i32;
+    if jitter_range == 0 {
+        return pps;
+    }
+    
+    // Random value in [-jitter_range, +jitter_range]
+    let delta = rng.gen_range(-jitter_range..=jitter_range);
+    let jittered = (pps as i32 + delta).max(1) as u32; // At least 1 pps
+    
+    jittered
 }

@@ -1,0 +1,2032 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>veth-lab Metrics Dashboard</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Consolas', monospace;
+            background: #0a0a0f;
+            color: #e0e0e0;
+            overflow: hidden;
+        }
+
+        #container {
+            display: grid;
+            grid-template-rows: 50px 1fr 400px;
+            grid-template-columns: 1fr 1fr;
+            width: 100vw;
+            height: 100vh;
+            gap: 4px;
+            padding: 4px;
+        }
+
+        #header {
+            grid-column: 1 / -1;
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 4px;
+            padding: 10px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        #header-left {
+            display: flex;
+            gap: 30px;
+            align-items: center;
+        }
+
+        #header-title {
+            font-size: 18px;
+            font-weight: bold;
+            color: #8af;
+        }
+
+        #status {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            font-size: 13px;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #555;
+        }
+
+        .status-dot.connected {
+            background: #4f4;
+            box-shadow: 0 0 8px #4f4;
+        }
+
+        #stats-summary {
+            display: flex;
+            gap: 20px;
+            font-size: 13px;
+        }
+
+        .stat-item {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .stat-label {
+            font-size: 10px;
+            color: #888;
+            text-transform: uppercase;
+        }
+
+        .stat-value {
+            font-size: 16px;
+            font-weight: bold;
+        }
+
+        #timeline {
+            grid-column: 1 / -1;
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 4px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        #timeline-chart {
+            width: 100%;
+            height: 100%;
+        }
+
+        #rule-log, #dag-viewer {
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 4px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .panel-header {
+            background: #181818;
+            padding: 10px 15px;
+            border-bottom: 1px solid #333;
+            font-size: 12px;
+            font-weight: bold;
+            color: #aaa;
+            text-transform: uppercase;
+        }
+
+        .panel-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px;
+        }
+
+        #rule-log .panel-body {
+            display: flex;
+            flex-direction: column-reverse;
+        }
+
+        .rule-event {
+            padding: 8px 12px;
+            margin-bottom: 6px;
+            background: #1a1a1a;
+            border-left: 3px solid;
+            border-radius: 3px;
+            font-size: 12px;
+        }
+
+        .rule-event.added {
+            border-left-color: #f84;
+            background: #1a1a1a;
+        }
+
+        .rule-event.expired {
+            border-left-color: #888;
+            background: #151515;
+            opacity: 0.7;
+        }
+
+        .rule-event.refreshed {
+            border-left-color: #4af;
+            background: #1a1f24;
+        }
+
+        .rule-event-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 4px;
+        }
+
+        .rule-event-action {
+            font-weight: bold;
+            text-transform: uppercase;
+            font-size: 11px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .rule-event-badge {
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+        }
+
+        .rule-event.added .rule-event-badge {
+            background: #f84;
+            box-shadow: 0 0 4px #f84;
+        }
+
+        .rule-event.expired .rule-event-badge {
+            background: #888;
+        }
+
+        .rule-event.refreshed .rule-event-badge {
+            background: #4af;
+            box-shadow: 0 0 4px #4af;
+        }
+
+        .rule-event-time {
+            color: #666;
+            font-size: 10px;
+        }
+
+        .rule-event-spec {
+            color: #aaa;
+            font-family: 'Consolas', monospace;
+            font-size: 11px;
+            word-break: break-all;
+        }
+
+        #dag-viewer canvas {
+            width: 100%;
+            height: 100%;
+            cursor: pointer;
+        }
+
+    #dag-viewer .panel-body {
+        position: relative;
+    }
+
+    #dag-tooltip {
+        position: absolute;
+        top: 16px;
+        left: 10px;
+        display: none;
+        background: rgba(10, 10, 20, 0.98);
+        border: 1px solid #4af;
+        border-radius: 6px;
+        padding: 12px 14px;
+        font-size: 11px;
+        color: #ddd;
+        pointer-events: none;
+        z-index: 1000;
+        max-width: calc(100% - 20px);
+        min-width: 200px;
+        font-family: 'Consolas', monospace;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+        backdrop-filter: blur(8px);
+    }
+
+        #dag-tooltip .tooltip-title {
+            font-weight: bold;
+            color: #4af;
+            margin-bottom: 6px;
+            font-size: 12px;
+        }
+
+        #dag-tooltip .tooltip-item {
+            margin: 3px 0;
+            color: #aaa;
+        }
+
+        #dag-tooltip .tooltip-label {
+            color: #8af;
+            font-weight: bold;
+            margin-right: 4px;
+        }
+
+        .legend {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.85);
+            padding: 10px 12px;
+            border-radius: 4px;
+            font-size: 11px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 50%;
+            overflow-y: auto;
+            border: 1px solid #333;
+        }
+
+        .legend-section {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .legend-title {
+            font-size: 10px;
+            color: #666;
+            text-transform: uppercase;
+            font-weight: bold;
+            margin-bottom: 2px;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-height: 18px;
+        }
+
+        .legend-item-small {
+            font-size: 10px;
+        }
+
+        .legend-color {
+            width: 20px;
+            height: 3px;
+            flex-shrink: 0;
+        }
+
+        .legend-name {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .legend-action {
+            color: #888;
+            font-size: 9px;
+            margin-left: auto;
+        }
+
+        .legend-value {
+            font-weight: bold;
+            color: #4af;
+            margin-left: auto;
+            white-space: nowrap;
+        }
+
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #0a0a0f;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #333;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #555;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="header">
+            <div id="header-left">
+                <div id="header-title">veth-lab Metrics</div>
+                <div id="status">
+                    <div class="status-dot" id="status-dot"></div>
+                    <span id="status-text">Connecting...</span>
+                </div>
+            </div>
+            <div id="stats-summary">
+                <div class="stat-item">
+                    <div class="stat-label">Total</div>
+                    <div class="stat-value" id="stat-total">0</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Passed</div>
+                    <div class="stat-value" id="stat-passed" style="color: #4af;">0</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Dropped</div>
+                    <div class="stat-value" id="stat-dropped" style="color: #f44;">0</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Rate Limited</div>
+                    <div class="stat-value" id="stat-rate-limited" style="color: #fa4;">0</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Packets/s</div>
+                    <div class="stat-value" id="stat-rate">0</div>
+                </div>
+            </div>
+        </div>
+
+        <div id="timeline">
+            <div id="timeline-chart"></div>
+            <div class="legend" id="legend">
+                <!-- Legend will be populated dynamically -->
+            </div>
+        </div>
+
+        <div id="rule-log">
+            <div class="panel-header">Rule Activity Log</div>
+            <div class="panel-body" id="rule-log-body"></div>
+        </div>
+
+        <div id="dag-viewer">
+            <div class="panel-header">DAG Structure</div>
+            <div class="panel-body">
+                <canvas id="dag-canvas"></canvas>
+                <div id="dag-tooltip"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // =============================================================================
+        // State Management
+        // =============================================================================
+
+        const MAX_TIMELINE_POINTS = 600;  // 600 points at 500ms = 5 minutes
+        const MAX_RULE_SERIES = 5;  // Show top 5 rules as series
+        const state = {
+            connected: false,
+            timeline: {
+                timestamps: [],
+                passed: [],
+                dropped: [],
+                rateLimited: [],
+                perRule: new Map(),  // ruleKey -> array of rates over time
+            },
+            lastStats: null,
+            ruleEvents: [],
+            dagNodes: [],
+            ruleCounters: new Map(),  // ruleKey -> {count, prevCount, rate, ts, label, action, ids: Set()}
+            lastCountersTs: null,
+            topRuleKeys: [],  // Ordered list of top N rule keys for series rendering
+        };
+        
+        // Helper: Generate a deduplication key for a rule based on constraints + action type
+        // This ignores rate-limit values so rules with identical constraints get merged
+        function getRuleKey(label, action) {
+            // Extract constraints from label (everything before " → ")
+            const parts = label.split(' → ');
+            const constraints = parts[0] || label;
+            
+            // Parse action to get type only (strip config like rate-limit value)
+            // e.g., "rate-limit(50000)" -> "rate-limit"
+            const actionType = action.replace(/\(.*\)/, '').trim();
+            
+            return `${constraints}__${actionType}`;
+        }
+
+        // =============================================================================
+        // SSE Connection
+        // =============================================================================
+
+        let eventSource = null;
+
+        function connectSSE() {
+            if (eventSource) {
+                eventSource.close();
+            }
+
+            eventSource = new EventSource('/api/metrics/events');
+
+            eventSource.onopen = () => {
+                state.connected = true;
+                updateStatus();
+            };
+
+            eventSource.onerror = () => {
+                state.connected = false;
+                updateStatus();
+                setTimeout(connectSSE, 5000);
+            };
+
+            eventSource.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    handleEvent(data);
+                } catch (e) {
+                    console.error('Failed to parse event:', e);
+                }
+            };
+        }
+
+        function handleEvent(data) {
+            switch (data.type) {
+                case 'metrics':
+                    handleMetrics(data);
+                    break;
+                case 'rule_event':
+                    handleRuleEvent(data);
+                    break;
+                case 'dag_snapshot':
+                    handleDagSnapshot(data);
+                    break;
+                case 'heartbeat':
+                    // Keep-alive, do nothing
+                    break;
+                default:
+                    console.log('Unknown event type:', data.type);
+            }
+        }
+
+        // =============================================================================
+        // Event Handlers
+        // =============================================================================
+
+        function handleMetrics(data) {
+            const now = Date.now() / 1000;
+            const ts = data.ts;
+
+            // ── Global stats rates (authoritative) ──────────────────────
+            let passedRate = 0;
+            let droppedRate = 0;
+            let rateLimitedRate = 0;
+            let totalRate = 0;
+
+            if (state.lastStats) {
+                const dt = ts - state.lastStats.ts;
+                if (dt > 0) {
+                    passedRate = Math.max(0, (data.passed - state.lastStats.passed) / dt);
+                    droppedRate = Math.max(0, (data.dropped - state.lastStats.dropped) / dt);
+                    rateLimitedRate = Math.max(0, (data.rate_limited - state.lastStats.rate_limited) / dt);
+                    totalRate = Math.max(0, (data.total - state.lastStats.total) / dt);
+                }
+            }
+
+            // ── Per-rule counter rates ─────────────────────────────────
+            // Aggregate rules by constraint+action (deduplicate across rate-limit config changes)
+            const aggregated = new Map();
+            for (const rule of (data.rules || [])) {
+                const ruleKey = getRuleKey(rule.label, rule.action);
+                if (!aggregated.has(ruleKey)) {
+                    aggregated.set(ruleKey, { count: 0, label: rule.label, action: rule.action, ids: new Set() });
+                }
+                const agg = aggregated.get(ruleKey);
+                agg.count += rule.count;
+                agg.ids.add(rule.id);
+            }
+
+            const counterDt = state.lastCountersTs ? (ts - state.lastCountersTs) : 0;
+
+            for (const [ruleKey, agg] of aggregated.entries()) {
+                const prev = state.ruleCounters.get(ruleKey);
+                const count = agg.count;
+
+                // Counts are now monotonically increasing (Rust side accumulates offsets
+                // for retired eBPF buckets), so simple delta/dt always works
+                let rate = 0;
+                if (prev && counterDt > 0) {
+                    const delta = count - prev.count;
+                    rate = Math.max(0, delta / counterDt);
+                }
+
+                state.ruleCounters.set(ruleKey, {
+                    count,
+                    rate,
+                    ts,
+                    label: agg.label,
+                    action: agg.action,
+                    ids: agg.ids,
+                });
+
+                // Ensure per-rule timeline exists
+                if (!state.timeline.perRule.has(ruleKey)) {
+                    state.timeline.perRule.set(ruleKey, new Array(state.timeline.timestamps.length).fill(0));
+                }
+            }
+
+            // ── Update timelines (all in sync) ─────────────────────────
+            state.lastStats = data;
+            state.lastCountersTs = ts;
+
+            state.timeline.timestamps.push(now);
+            state.timeline.passed.push(passedRate);
+            state.timeline.dropped.push(droppedRate);
+            state.timeline.rateLimited.push(rateLimitedRate);
+
+            // Push per-rule rates (or carry forward if rule wasn't in this batch)
+            for (const [ruleKey, timeline] of state.timeline.perRule.entries()) {
+                const counter = state.ruleCounters.get(ruleKey);
+                timeline.push(counter ? counter.rate : (timeline.length > 0 ? timeline[timeline.length - 1] : 0));
+            }
+
+            // Trim to max points
+            if (state.timeline.timestamps.length > MAX_TIMELINE_POINTS) {
+                state.timeline.timestamps.shift();
+                state.timeline.passed.shift();
+                state.timeline.dropped.shift();
+                state.timeline.rateLimited.shift();
+                for (const timeline of state.timeline.perRule.values()) {
+                    if (timeline.length > 0) timeline.shift();
+                }
+            }
+
+            // ── Determine top N rules and rebuild chart if needed ───────
+            const sortedRules = Array.from(state.ruleCounters.entries())
+                .sort((a, b) => b[1].rate - a[1].rate)
+                .slice(0, MAX_RULE_SERIES)
+                .map(([key, _]) => key);
+
+            const topChanged = JSON.stringify(sortedRules) !== JSON.stringify(state.topRuleKeys);
+            if (topChanged) {
+                state.topRuleKeys = sortedRules;
+                if (uplotInstance) {
+                    rebuildUPlotWithRules();
+                    // rebuildUPlotWithRules calls updateUPlotData internally
+                } else {
+                    updateUPlotData();
+                }
+            } else {
+                updateUPlotData();
+            }
+
+            // ── Update UI ──────────────────────────────────────────────
+            document.getElementById('stat-total').textContent = formatNumber(data.total);
+            document.getElementById('stat-passed').textContent = formatNumber(data.passed);
+            document.getElementById('stat-dropped').textContent = formatNumber(data.dropped);
+            document.getElementById('stat-rate-limited').textContent = formatNumber(data.rate_limited);
+            document.getElementById('stat-rate').textContent = formatNumber(Math.round(totalRate));
+
+            updateLegend(passedRate, droppedRate, rateLimitedRate);
+        }
+
+        function rebuildUPlotWithRules() {
+            if (!uplotInstance) return;
+
+            const container = document.getElementById('timeline-chart');
+            
+            // Clean up old tooltip and event listeners
+            if (currentTooltip && currentTooltip.parentNode) {
+                currentTooltip.remove();
+            }
+            for (const cleanup of tooltipCleanupFns) {
+                cleanup();
+            }
+            tooltipCleanupFns = [];
+            
+            uplotInstance.destroy();
+
+            const rect = container.getBoundingClientRect();
+
+            // Create tooltip element
+            const tooltip = document.createElement('div');
+            tooltip.id = 'uplot-tooltip';
+            tooltip.style.cssText = `
+                position: absolute;
+                display: none;
+                background: rgba(0, 0, 0, 0.9);
+                border: 1px solid #4af;
+                border-radius: 4px;
+                padding: 8px 10px;
+                font-size: 11px;
+                color: #ddd;
+                pointer-events: none;
+                z-index: 1000;
+                font-family: 'Consolas', monospace;
+                white-space: nowrap;
+            `;
+            container.appendChild(tooltip);
+            currentTooltip = tooltip;
+
+            // Build series config including per-rule series
+            const seriesConfig = [
+                {},  // x-axis
+                {
+                    label: "Passed",
+                    stroke: "#4af",
+                    fill: "rgba(68, 170, 255, 0.1)",
+                    width: 2,
+                    show: true,
+                },
+                {
+                    label: "Dropped",
+                    stroke: "#f44",
+                    fill: "rgba(255, 68, 68, 0.1)",
+                    width: 2,
+                    show: true,
+                },
+                {
+                    label: "Rate Limited",
+                    stroke: "#fa4",
+                    fill: "rgba(255, 170, 68, 0.1)",
+                    width: 2,
+                    show: true,
+                },
+            ];
+
+            // Generate colors for per-rule series (muted, distinct)
+            const ruleColors = ['#8b8', '#b8b', '#88b', '#bb8', '#8bb'];
+            for (let i = 0; i < state.topRuleKeys.length; i++) {
+                const ruleKey = state.topRuleKeys[i];
+                const counter = state.ruleCounters.get(ruleKey);
+                const color = ruleColors[i % ruleColors.length];
+                seriesConfig.push({
+                    label: counter ? counter.label : `Rule ${ruleKey}`,
+                    stroke: color,
+                    width: 1,
+                    dash: [5, 5],  // Dashed line for rules
+                    show: true,
+                });
+            }
+
+            const opts = {
+                title: "",
+                width: rect.width,
+                height: rect.height,
+                pxAlign: false,
+                scales: {
+                    x: {
+                        time: true,
+                        range: (self, dataMin, dataMax) => {
+                            const now = Date.now() / 1000;
+                            return [now - 300, now];
+                        },
+                    },
+                    y: {
+                        range: (self, dataMin, dataMax) => [0, Math.max(dataMax * 1.1, 1)],
+                    },
+                },
+                axes: [
+                    {
+                        stroke: "#888",
+                        grid: { show: true, stroke: "#222", width: 1 },
+                        ticks: { show: true, stroke: "#444", width: 1 },
+                        font: "11px monospace",
+                        labelFont: "11px monospace",
+                        labelSize: 20,
+                    },
+                    {
+                        stroke: "#888",
+                        grid: { show: true, stroke: "#222", width: 1 },
+                        ticks: { show: true, stroke: "#444", width: 1 },
+                        font: "11px monospace",
+                        values: (self, ticks) => ticks.map(v => formatNumber(Math.round(v)) + '/s'),
+                        size: 70,
+                    },
+                ],
+                series: seriesConfig,
+                cursor: {
+                    drag: { x: false, y: false },
+                    focus: { prox: 30 },
+                    points: { size: 6, width: 2 },
+                },
+                hooks: {
+                    setCursor: [
+                        (u) => {
+                            const { left, top, idx } = u.cursor;
+                            
+                            if (idx === null || idx === undefined) {
+                                tooltip.style.display = 'none';
+                                return;
+                            }
+
+                            // Build tooltip content
+                            const ts = u.data[0][idx];
+                            const date = new Date(ts * 1000);
+                            let html = `<div style="color: #888; margin-bottom: 4px;">${date.toLocaleTimeString()}</div>`;
+                            
+                            for (let i = 1; i < u.series.length; i++) {
+                                const series = u.series[i];
+                                const value = u.data[i][idx];
+                                if (value !== null && value !== undefined && series.show) {
+                                    html += `<div style="display: flex; gap: 8px; align-items: center;">`;
+                                    html += `<span style="color: ${series.stroke};">■</span>`;
+                                    html += `<span style="flex: 1;">${series.label}:</span>`;
+                                    html += `<span style="font-weight: bold;">${formatNumber(Math.round(value))}/s</span>`;
+                                    html += `</div>`;
+                                }
+                            }
+                            
+                            tooltip.innerHTML = html;
+                            tooltip.style.display = 'block';
+                            
+                            // Position tooltip - always to the left of cursor to avoid blocking view
+                            const containerRect = container.getBoundingClientRect();
+                            const tooltipRect = tooltip.getBoundingClientRect();
+                            
+                            // Position to the left of cursor
+                            let tooltipLeft = left - tooltipRect.width - 10;
+                            let tooltipTop = top - tooltipRect.height / 2;  // Center vertically on cursor
+                            
+                            // If too far left, put it on the right instead
+                            if (tooltipLeft < 0) {
+                                tooltipLeft = left + 10;
+                            }
+                            
+                            // Keep tooltip within vertical bounds
+                            if (tooltipTop < 0) {
+                                tooltipTop = 0;
+                            }
+                            if (tooltipTop + tooltipRect.height > containerRect.height) {
+                                tooltipTop = containerRect.height - tooltipRect.height;
+                            }
+                            
+                            tooltip.style.left = tooltipLeft + 'px';
+                            tooltip.style.top = tooltipTop + 'px';
+                        }
+                    ],
+                },
+                legend: { show: false },
+            };
+
+            uplotInstance = new uPlot(opts, buildUPlotData(), container);
+            
+            // Add cleanup listeners to hide tooltip on focus loss or visibility change
+            const hideTooltip = () => {
+                if (tooltip) tooltip.style.display = 'none';
+            };
+            
+            const blurHandler = () => hideTooltip();
+            const visibilityHandler = () => hideTooltip();
+            const mouseleaveHandler = () => hideTooltip();
+            
+            window.addEventListener('blur', blurHandler);
+            document.addEventListener('visibilitychange', visibilityHandler);
+            container.addEventListener('mouseleave', mouseleaveHandler);
+            
+            // Store cleanup functions
+            tooltipCleanupFns.push(
+                () => window.removeEventListener('blur', blurHandler),
+                () => document.removeEventListener('visibilitychange', visibilityHandler),
+                () => container.removeEventListener('mouseleave', mouseleaveHandler)
+            );
+            
+            updateUPlotData();
+        }
+
+        function buildUPlotData() {
+            const data = [
+                state.timeline.timestamps,
+                state.timeline.passed,
+                state.timeline.dropped,
+                state.timeline.rateLimited,
+            ];
+
+            // Add per-rule series data
+            for (const ruleKey of state.topRuleKeys) {
+                const ruleData = state.timeline.perRule.get(ruleKey) || [];
+                data.push(ruleData);
+            }
+
+            return data;
+        }
+
+        function updateUPlotData() {
+            if (!uplotInstance || state.timeline.timestamps.length === 0) return;
+            uplotInstance.setData(buildUPlotData());
+        }
+
+        function updateLegend(passedRate, droppedRate, rateLimitedRate) {
+            const legend = document.getElementById('legend');
+            if (!legend) return;
+
+            let html = '<div class="legend-section">';
+            html += '<div class="legend-title">Traffic</div>';
+            
+            html += '<div class="legend-item">';
+            html += '<div class="legend-color" style="background: #4af;"></div>';
+            html += `<span class="legend-name">Passed</span>`;
+            html += `<span class="legend-value">${formatNumber(Math.round(passedRate))}/s</span>`;
+            html += '</div>';
+            
+            html += '<div class="legend-item">';
+            html += '<div class="legend-color" style="background: #f44;"></div>';
+            html += `<span class="legend-name">Dropped</span>`;
+            html += `<span class="legend-value">${formatNumber(Math.round(droppedRate))}/s</span>`;
+            html += '</div>';
+            
+            html += '<div class="legend-item">';
+            html += '<div class="legend-color" style="background: #fa4;"></div>';
+            html += `<span class="legend-name">Rate Limited</span>`;
+            html += `<span class="legend-value">${formatNumber(Math.round(rateLimitedRate))}/s</span>`;
+            html += '</div>';
+            
+            html += '</div>';
+
+            // Add top rule series (shown on chart)
+            if (state.topRuleKeys.length > 0) {
+                const ruleColors = ['#8b8', '#b8b', '#88b', '#bb8', '#8bb'];
+                html += '<div class="legend-section">';
+                html += '<div class="legend-title">Top Rules (on chart)</div>';
+                
+                for (let i = 0; i < state.topRuleKeys.length; i++) {
+                    const ruleKey = state.topRuleKeys[i];
+                    const counter = state.ruleCounters.get(ruleKey);
+                    if (!counter) continue;
+                    
+                    const color = ruleColors[i % ruleColors.length];
+                    html += '<div class="legend-item legend-item-small">';
+                    html += `<div class="legend-color" style="background: ${color};"></div>`;
+                    html += `<span class="legend-name">${counter.label}</span>`;
+                    html += `<span class="legend-action">${counter.action}</span>`;
+                    html += `<span class="legend-value">${formatNumber(Math.round(counter.rate))}/s</span>`;
+                    html += '</div>';
+                }
+                
+                html += '</div>';
+            }
+
+            // Add other rule counters (not on chart)
+            const otherRules = Array.from(state.ruleCounters.entries())
+                .filter(([key, _]) => !state.topRuleKeys.includes(key))
+                .sort((a, b) => b[1].rate - a[1].rate)
+                .slice(0, 10);
+            
+            if (otherRules.length > 0) {
+                html += '<div class="legend-section">';
+                html += '<div class="legend-title">Other Rules</div>';
+                
+                for (const [ruleKey, counter] of otherRules) {
+                    html += '<div class="legend-item legend-item-small">';
+                    html += '<div class="legend-color" style="background: #555;"></div>';
+                    html += `<span class="legend-name">${counter.label}</span>`;
+                    html += `<span class="legend-action">${counter.action}</span>`;
+                    html += `<span class="legend-value">${formatNumber(Math.round(counter.rate))}/s</span>`;
+                    html += '</div>';
+                }
+                
+                html += '</div>';
+            }
+
+            legend.innerHTML = html;
+        }
+
+        function handleRuleEvent(data) {
+            state.ruleEvents.unshift(data);
+            if (state.ruleEvents.length > 100) {
+                state.ruleEvents.pop();
+            }
+            renderRuleLog();
+        }
+
+        function handleDagSnapshot(data) {
+            state.dagNodes = data.nodes;
+            // Clear any existing hover/selection state when DAG changes
+            dagHoveredNode = null;
+            dagSelectedNode = null;
+            hideDagTooltip();
+            renderDAG();
+        }
+
+        // =============================================================================
+        // Timeline Rendering
+        // =============================================================================
+
+        // =============================================================================
+        // uPlot Timeline Setup
+        // =============================================================================
+
+        let uplotInstance = null;
+        let currentTooltip = null;  // Track current tooltip for cleanup
+        let tooltipCleanupFns = [];  // Track event listener cleanup functions
+        
+        const dagCanvas = document.getElementById('dag-canvas');
+        const dagCtx = dagCanvas.getContext('2d');
+
+        function initUPlot() {
+            const container = document.getElementById('timeline-chart');
+            const rect = container.getBoundingClientRect();
+
+            // Create tooltip element
+            const tooltip = document.createElement('div');
+            tooltip.id = 'uplot-tooltip';
+            tooltip.style.cssText = `
+                position: absolute;
+                display: none;
+                background: rgba(0, 0, 0, 0.9);
+                border: 1px solid #4af;
+                border-radius: 4px;
+                padding: 8px 10px;
+                font-size: 11px;
+                color: #ddd;
+                pointer-events: none;
+                z-index: 1000;
+                font-family: 'Consolas', monospace;
+                white-space: nowrap;
+            `;
+            container.appendChild(tooltip);
+            currentTooltip = tooltip;
+
+            const opts = {
+                title: "",
+                width: rect.width,
+                height: rect.height,
+                pxAlign: false,
+                scales: {
+                    x: {
+                        time: true,
+                        // Fixed time window (5 minutes at 500ms intervals = 600 points)
+                        range: (self, dataMin, dataMax) => {
+                            const now = Date.now() / 1000;
+                            return [now - 300, now];  // Always show last 5 minutes
+                        },
+                    },
+                    y: {
+                        range: (self, dataMin, dataMax) => [0, Math.max(dataMax * 1.1, 1)],
+                    },
+                },
+                axes: [
+                    {
+                        stroke: "#888",
+                        grid: { show: true, stroke: "#222", width: 1 },
+                        ticks: { show: true, stroke: "#444", width: 1 },
+                        font: "11px monospace",
+                        labelFont: "11px monospace",
+                        labelSize: 20,
+                    },
+                    {
+                        stroke: "#888",
+                        grid: { show: true, stroke: "#222", width: 1 },
+                        ticks: { show: true, stroke: "#444", width: 1 },
+                        font: "11px monospace",
+                        values: (self, ticks) => ticks.map(v => formatNumber(Math.round(v)) + '/s'),
+                        size: 70,  // Increased from labelSize to give more room for labels
+                    },
+                ],
+                series: [
+                    {},  // x-axis (time)
+                    {
+                        label: "Passed",
+                        stroke: "#4af",
+                        fill: "rgba(68, 170, 255, 0.1)",
+                        width: 2,
+                        show: true,
+                    },
+                    {
+                        label: "Dropped",
+                        stroke: "#f44",
+                        fill: "rgba(255, 68, 68, 0.1)",
+                        width: 2,
+                        show: true,
+                    },
+                    {
+                        label: "Rate Limited",
+                        stroke: "#fa4",
+                        fill: "rgba(255, 170, 68, 0.1)",
+                        width: 2,
+                        show: true,
+                    },
+                ],
+                cursor: {
+                    drag: { x: false, y: false },
+                    focus: { prox: 30 },
+                    points: { size: 6, width: 2 },
+                },
+                hooks: {
+                    setCursor: [
+                        (u) => {
+                            const { left, top, idx } = u.cursor;
+                            
+                            if (idx === null || idx === undefined) {
+                                tooltip.style.display = 'none';
+                                return;
+                            }
+
+                            // Build tooltip content
+                            const ts = u.data[0][idx];
+                            const date = new Date(ts * 1000);
+                            let html = `<div style="color: #888; margin-bottom: 4px;">${date.toLocaleTimeString()}</div>`;
+                            
+                            for (let i = 1; i < u.series.length; i++) {
+                                const series = u.series[i];
+                                const value = u.data[i][idx];
+                                if (value !== null && value !== undefined && series.show) {
+                                    html += `<div style="display: flex; gap: 8px; align-items: center;">`;
+                                    html += `<span style="color: ${series.stroke};">■</span>`;
+                                    html += `<span style="flex: 1;">${series.label}:</span>`;
+                                    html += `<span style="font-weight: bold;">${formatNumber(Math.round(value))}/s</span>`;
+                                    html += `</div>`;
+                                }
+                            }
+                            
+                            tooltip.innerHTML = html;
+                            tooltip.style.display = 'block';
+                            
+                            // Position tooltip - always to the left of cursor to avoid blocking view
+                            const containerRect = container.getBoundingClientRect();
+                            const tooltipRect = tooltip.getBoundingClientRect();
+                            
+                            // Position to the left of cursor
+                            let tooltipLeft = left - tooltipRect.width - 10;
+                            let tooltipTop = top - tooltipRect.height / 2;  // Center vertically on cursor
+                            
+                            // If too far left, put it on the right instead
+                            if (tooltipLeft < 0) {
+                                tooltipLeft = left + 10;
+                            }
+                            
+                            // Keep tooltip within vertical bounds
+                            if (tooltipTop < 0) {
+                                tooltipTop = 0;
+                            }
+                            if (tooltipTop + tooltipRect.height > containerRect.height) {
+                                tooltipTop = containerRect.height - tooltipRect.height;
+                            }
+                            
+                            tooltip.style.left = tooltipLeft + 'px';
+                            tooltip.style.top = tooltipTop + 'px';
+                        }
+                    ],
+                },
+                legend: { show: false },  // We have our own custom legend
+            };
+
+            const data = [
+                [],  // timestamps
+                [],  // passed
+                [],  // dropped
+                [],  // rate limited
+                // Per-rule series will be added dynamically
+            ];
+
+            uplotInstance = new uPlot(opts, data, container);
+            
+            // Add cleanup listeners to hide tooltip on focus loss or visibility change
+            const hideTooltip = () => {
+                if (tooltip) tooltip.style.display = 'none';
+            };
+            
+            const blurHandler = () => hideTooltip();
+            const visibilityHandler = () => hideTooltip();
+            const mouseleaveHandler = () => hideTooltip();
+            
+            window.addEventListener('blur', blurHandler);
+            document.addEventListener('visibilitychange', visibilityHandler);
+            container.addEventListener('mouseleave', mouseleaveHandler);
+            
+            // Store cleanup functions
+            tooltipCleanupFns.push(
+                () => window.removeEventListener('blur', blurHandler),
+                () => document.removeEventListener('visibilitychange', visibilityHandler),
+                () => container.removeEventListener('mouseleave', mouseleaveHandler)
+            );
+            
+            return uplotInstance;
+        }
+
+        function resizeCanvas() {
+            // Resize DAG canvas
+            const dagRect = dagCanvas.getBoundingClientRect();
+            dagCanvas.width = Math.round(dagRect.width);
+            dagCanvas.height = Math.round(dagRect.height);
+            renderDAG();
+
+            // Resize uPlot
+            if (uplotInstance) {
+                const container = document.getElementById('timeline-chart');
+                const rect = container.getBoundingClientRect();
+                uplotInstance.setSize({ width: rect.width, height: rect.height });
+            }
+        }
+
+        window.addEventListener('resize', function() {
+            resizeCanvas();
+            // Hide tooltip on resize as positions change
+            hideDagTooltip();
+        });
+
+        // =============================================================================
+        // Rule Log Rendering
+        // =============================================================================
+
+        function renderRuleLog() {
+            const body = document.getElementById('rule-log-body');
+            body.innerHTML = '';
+
+            for (const event of state.ruleEvents) {
+                const div = document.createElement('div');
+                div.className = `rule-event ${event.action}`;
+
+                const header = document.createElement('div');
+                header.className = 'rule-event-header';
+
+                const action = document.createElement('span');
+                action.className = 'rule-event-action';
+                
+                // Add visual badge
+                const badge = document.createElement('span');
+                badge.className = 'rule-event-badge';
+                action.appendChild(badge);
+                
+                // Add text with icon
+                const actionText = document.createElement('span');
+                if (event.action === 'added') {
+                    actionText.textContent = '+ ADDED';
+                } else if (event.action === 'refreshed') {
+                    actionText.textContent = '↻ REFRESHED';
+                } else if (event.action === 'expired') {
+                    actionText.textContent = '✕ EXPIRED';
+                } else {
+                    actionText.textContent = event.action;
+                }
+                action.appendChild(actionText);
+
+                const time = document.createElement('span');
+                time.className = 'rule-event-time';
+                time.textContent = formatTime(event.ts);
+
+                header.appendChild(action);
+                header.appendChild(time);
+
+                const spec = document.createElement('div');
+                spec.className = 'rule-event-spec';
+                spec.textContent = event.spec_summary;
+
+                div.appendChild(header);
+                div.appendChild(spec);
+                body.appendChild(div);
+            }
+        }
+
+        // =============================================================================
+        // DAG Rendering
+        // =============================================================================
+
+        // DAG state
+        let dagLayout = new Map();
+        let dagHoveredNode = null;
+        let dagSelectedNode = null;
+
+        // Canvas events
+        dagCanvas.addEventListener('mousemove', function(e) {
+            const rect = dagCanvas.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+            updateDagHover(mouseX, mouseY);
+        });
+
+        dagCanvas.addEventListener('mouseleave', function() {
+            dagHoveredNode = null;
+            if (!dagSelectedNode) {
+                hideDagTooltip();
+            }
+            renderDAG();
+        });
+
+        dagCanvas.addEventListener('click', function(e) {
+            const rect = dagCanvas.getBoundingClientRect();
+            const clickX = e.clientX - rect.left;
+            const clickY = e.clientY - rect.top;
+            handleDagClick(clickX, clickY);
+        });
+
+        function getDagDisplayNodes() {
+            const source = state.dagNodes || [];
+            if (source.length === 0) return [];
+
+            const byId = new Map(source.map((n) => [n.id, { ...n }]));
+            const hidden = new Set();
+            const parents = new Map(source.map((n) => [n.id, []]));
+            const outgoing = new Map();
+
+            for (const n of source) {
+                const outs = [...(n.children || [])];
+                if (n.wildcard !== null && n.wildcard !== undefined) outs.push(n.wildcard);
+                outgoing.set(n.id, outs);
+                for (const c of outs) {
+                    if (parents.has(c)) parents.get(c).push(n.id);
+                }
+            }
+
+            // ── Deduplicate compiler-propagated actions ──
+            //
+            // The compiler copies a rule's action to every reachable termination
+            // point via wildcard chains.  The SHALLOWEST copy is the "real" one
+            // (the first node where all user constraints have been evaluated).
+            // Deeper copies are wildcard-propagated duplicates — clear them.
+            //
+            // This approach is topology-based: no constraint parsing needed,
+            // works regardless of how many proto-level (or other) rules exist.
+
+            // Compute BFS depth from root(s) once.
+            const nodeDepth = new Map();
+            const depthQueue = [];
+            for (const n of source) {
+                if ((parents.get(n.id) || []).length === 0) {
+                    nodeDepth.set(n.id, 0);
+                    depthQueue.push(n.id);
+                }
+            }
+            while (depthQueue.length > 0) {
+                const cur = depthQueue.shift();
+                const d = nodeDepth.get(cur);
+                for (const nxt of (outgoing.get(cur) || [])) {
+                    if (!nodeDepth.has(nxt)) {
+                        nodeDepth.set(nxt, d + 1);
+                        depthQueue.push(nxt);
+                    }
+                }
+            }
+
+            // Group action nodes by rule_id.
+            const actionsByRule = new Map();
+            for (const n of source) {
+                if (n.action && n.action_rule_id !== null && n.action_rule_id !== undefined) {
+                    const rid = n.action_rule_id;
+                    if (!actionsByRule.has(rid)) actionsByRule.set(rid, []);
+                    actionsByRule.get(rid).push(n);
+                }
+            }
+
+            for (const [ruleId, actionNodes] of actionsByRule.entries()) {
+                // Single-terminal rules have no propagation to undo.
+                if (actionNodes.length <= 1) continue;
+
+                // The compiler propagates a rule's action down every wildcard
+                // chain.  Intermediate (non-Leaf) nodes carry the action but
+                // always have a wildcard, so the traversal continues deeper —
+                // the action truly fires only at Leaf nodes.
+                //
+                // Keep Leaf-dim action nodes (the real terminals), clear the
+                // intermediate copies.  This ensures every rule visually
+                // terminates at a Leaf, matching user expectations.
+                const hasLeaf = actionNodes.some((n) => n.dim === 'Leaf');
+                for (const n of actionNodes) {
+                    // If the rule has Leaf terminals, clear non-Leaf copies.
+                    // Otherwise fall back to keeping shallowest (unlikely edge case).
+                    const shouldClear = hasLeaf ? n.dim !== 'Leaf' : false;
+                    if (shouldClear) {
+                        const dn = byId.get(n.id);
+                        if (dn) {
+                            dn.action = null;
+                            dn.action_rule_id = null;
+                            dn.action_priority = null;
+                            dn.label = null;
+                            dn.rule_constraints = null;
+                            dn.rule_expression = null;
+                        }
+                    }
+                }
+            }
+
+            // Iteratively prune dead-end nodes: nodes with no action, no children,
+            // no wildcard, and no range/specific edges serve no display purpose.
+            // Also prune wildcard-only leaves that duplicate their parent's action.
+            let changed = true;
+            while (changed) {
+                changed = false;
+                for (const node of byId.values()) {
+                    if (hidden.has(node.id)) continue;
+
+                    // Count live children (excluding already-hidden)
+                    const liveChildren = (node.children || []).filter((id) => !hidden.has(id));
+                    const liveWildcard = (node.wildcard !== null && node.wildcard !== undefined && !hidden.has(node.wildcard))
+                        ? node.wildcard : null;
+                    const isLeaf = liveChildren.length === 0 && liveWildcard === null;
+
+                    if (!isLeaf) continue;
+
+                    // Case 1: actionless dead-end leaf — always prune
+                    if (!node.action) {
+                        hidden.add(node.id);
+                        changed = true;
+                        continue;
+                    }
+
+                    // Case 2: wildcard leaf that duplicates parent action — prune
+                    // (parent already carries the same terminal, leaf is redundant)
+                    const nodeParents = parents.get(node.id) || [];
+                    for (const pid of nodeParents) {
+                        const parent = byId.get(pid);
+                        if (!parent || hidden.has(pid)) continue;
+                        if (parent.wildcard === node.id &&
+                            parent.action &&
+                            parent.action_rule_id === node.action_rule_id) {
+                            hidden.add(node.id);
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            return Array.from(byId.values())
+                .filter((n) => !hidden.has(n.id))
+                .map((n) => {
+                    const wildcard = (n.wildcard !== null && n.wildcard !== undefined && !hidden.has(n.wildcard))
+                        ? n.wildcard : null;
+                    const children = (n.children || []).filter((id) => !hidden.has(id));
+                    return {
+                        ...n,
+                        wildcard,
+                        children,
+                    };
+                });
+        }
+
+        function findNodeAtPoint(x, y) {
+            const displayNodes = getDagDisplayNodes();
+            if (displayNodes.length === 0) return null;
+            for (const node of displayNodes) {
+                const pos = dagLayout.get(node.id);
+                if (!pos) continue;
+                const dx = x - pos.x;
+                const dy = y - pos.y;
+                const distance = Math.sqrt(dx * dx + dy * dy);
+                if (distance <= 6) {
+                    return node;
+                }
+            }
+            return null;
+        }
+
+        function buildDagMeta(targetNodeId) {
+            const nodes = getDagDisplayNodes();
+            const nodeById = new Map(nodes.map((n) => [n.id, n]));
+            const parents = new Map(nodes.map((n) => [n.id, []]));
+            const outgoing = new Map();
+
+            for (const n of nodes) {
+                const outs = [...n.children];
+                if (n.wildcard !== null && n.wildcard !== undefined) {
+                    outs.push(n.wildcard);
+                }
+                outgoing.set(n.id, outs);
+                for (const c of outs) {
+                    if (parents.has(c)) parents.get(c).push(n.id);
+                }
+            }
+
+            const roots = nodes.filter((n) => (parents.get(n.id) || []).length === 0).map((n) => n.id);
+            const depth = new Map(nodes.map((n) => [n.id, Number.POSITIVE_INFINITY]));
+            const q = [];
+            for (const r of roots) {
+                depth.set(r, 0);
+                q.push(r);
+            }
+            while (q.length > 0) {
+                const cur = q.shift();
+                const d = depth.get(cur);
+                for (const nxt of outgoing.get(cur) || []) {
+                    if (d + 1 < (depth.get(nxt) ?? Number.POSITIVE_INFINITY)) {
+                        depth.set(nxt, d + 1);
+                        q.push(nxt);
+                    }
+                }
+            }
+
+            function subtreeSize(startId) {
+                const seen = new Set();
+                const stack = [startId];
+                while (stack.length > 0) {
+                    const id = stack.pop();
+                    if (seen.has(id)) continue;
+                    seen.add(id);
+                    for (const nxt of outgoing.get(id) || []) stack.push(nxt);
+                }
+                return seen.size;
+            }
+
+            function ancestryPath(startId, maxLen = 8) {
+                // Use first-parent chain for a compact readable path.
+                const dims = [];
+                let cur = startId;
+                let safety = 0;
+                while (cur != null && safety < maxLen) {
+                    const n = nodeById.get(cur);
+                    if (!n) break;
+                    dims.push(n.dim);
+                    const ps = parents.get(cur) || [];
+                    cur = ps.length > 0 ? ps[0] : null;
+                    safety += 1;
+                }
+                return dims.reverse();
+            }
+
+            const node = nodeById.get(targetNodeId);
+            if (!node) return null;
+            const inDeg = (parents.get(targetNodeId) || []).length;
+            const outDeg = (outgoing.get(targetNodeId) || []).length;
+            const d = depth.get(targetNodeId);
+            const isLeaf = outDeg === 0;
+            const hasAction = !!node.action;
+            let role = "Decision";
+            if (hasAction && isLeaf) role = "Terminal leaf";
+            else if (hasAction && !isLeaf) role = "Terminal + decision";
+            else if (!hasAction && isLeaf) role = "Dead-end leaf";
+
+            return {
+                node,
+                role,
+                inDeg,
+                outDeg,
+                depth: Number.isFinite(d) ? d : null,
+                subtree: subtreeSize(targetNodeId),
+                ancestry: ancestryPath(targetNodeId),
+                parents: parents.get(targetNodeId) || [],
+            };
+        }
+
+        function updateDagHover(mouseX, mouseY) {
+            const node = findNodeAtPoint(mouseX, mouseY);
+            if ((node?.id ?? null) !== (dagHoveredNode?.id ?? null)) {
+                dagHoveredNode = node;
+                if (dagHoveredNode) {
+                    showDagTooltip(dagHoveredNode);
+                } else if (!dagSelectedNode) {
+                    hideDagTooltip();
+                }
+                renderDAG();
+            }
+        }
+
+        function dagFieldName(dim) {
+            const names = {
+                'Proto': 'proto',
+                'SrcIp': 'src-addr',
+                'DstIp': 'dst-addr',
+                'L4Word0': 'src-port',
+                'L4Word1': 'dst-port',
+                'TcpFlags': 'tcp-flags',
+                'Ttl': 'ttl',
+                'DfBit': 'df',
+                'TcpWindow': 'tcp-window',
+            };
+            return names[dim] || dim.toLowerCase();
+        }
+
+        function isInternalCompiledField(field) {
+            return /^custom\d+$/.test(field);
+        }
+
+        function ipFromU32(v) {
+            // Field values in this pipeline are host-endian u32s.
+            // Use native byte order for dotted-quad display.
+            const bytes = new Uint8Array(new Uint32Array([v >>> 0]).buffer);
+            const a = bytes[0];
+            const b = bytes[1];
+            const c = bytes[2];
+            const d = bytes[3];
+            return `${a}.${b}.${c}.${d}`;
+        }
+
+        function formatValueForDim(dim, value) {
+            if (dim === 'SrcIp' || dim === 'DstIp') {
+                return ipFromU32(value);
+            }
+            return String(value);
+        }
+
+        function rangeOpToSymbol(op) {
+            const map = {
+                1: '>',
+                2: '<',
+                3: '>=',
+                4: '<=',
+                5: 'mask-eq',
+                6: 'byte-pattern-guard',
+            };
+            return map[op] || `op${op}`;
+        }
+
+        function formatRangeConstraint(edge, field) {
+            if (edge.op === 5) {
+                // Packed as (mask << 16) | expected in backend.
+                const mask = (edge.value >>> 16) & 0xffff;
+                const expected = edge.value & 0xffff;
+                return `(mask-eq ${field} mask=0x${mask.toString(16).padStart(4, '0')} expected=0x${expected.toString(16).padStart(4, '0')})`;
+            }
+            if (edge.op === 6) {
+                // RANGE_OP_PATTERN is a pattern table index, not a direct packet value.
+                return `(byte-pattern-guard pattern-idx=${edge.value})`;
+            }
+            return `(${rangeOpToSymbol(edge.op)} ${field} ${formatValueForDim(edge.fromDim, edge.value)})`;
+        }
+
+        function buildIncomingEdgeIndex() {
+            const incoming = new Map();
+            for (const n of getDagDisplayNodes()) {
+                for (const e of (n.specific_edges || [])) {
+                    if (!incoming.has(e.child_id)) incoming.set(e.child_id, []);
+                    incoming.get(e.child_id).push({
+                        fromId: n.id,
+                        fromDim: n.dim,
+                        type: 'specific',
+                        value: e.value,
+                    });
+                }
+                for (const e of (n.range_edges || [])) {
+                    if (!incoming.has(e.child_id)) incoming.set(e.child_id, []);
+                    incoming.get(e.child_id).push({
+                        fromId: n.id,
+                        fromDim: n.dim,
+                        type: 'range',
+                        op: e.op,
+                        value: e.value,
+                    });
+                }
+                if (n.wildcard !== null && n.wildcard !== undefined) {
+                    if (!incoming.has(n.wildcard)) incoming.set(n.wildcard, []);
+                    incoming.get(n.wildcard).push({
+                        fromId: n.id,
+                        fromDim: n.dim,
+                        type: 'wildcard',
+                    });
+                }
+            }
+            return incoming;
+        }
+
+        function buildRepresentativeConstraints(nodeId, maxDepth = 16) {
+            const incoming = buildIncomingEdgeIndex();
+            const constraints = [];
+            let cur = nodeId;
+            let steps = 0;
+            const seen = new Set();
+
+            while (steps < maxDepth && !seen.has(cur)) {
+                seen.add(cur);
+                const edges = incoming.get(cur) || [];
+                if (edges.length === 0) break;
+
+                const edge =
+                    edges.find((e) => e.type === 'specific') ||
+                    edges.find((e) => e.type === 'range') ||
+                    edges[0];
+                if (!edge) break;
+
+                const field = dagFieldName(edge.fromDim);
+                if (isInternalCompiledField(field)) {
+                    cur = edge.fromId;
+                    steps += 1;
+                    continue;
+                }
+                if (edge.type === 'specific') {
+                    constraints.push(`(= ${field} ${formatValueForDim(edge.fromDim, edge.value)})`);
+                } else if (edge.type === 'range') {
+                    constraints.push(formatRangeConstraint(edge, field));
+                }
+                cur = edge.fromId;
+                steps += 1;
+            }
+
+            constraints.reverse();
+            return constraints;
+        }
+
+        function extractUserExpressionFromLabel(label) {
+            if (!label) return null;
+            const trimmed = String(label).trim();
+            // Current system labels are shaped like: [system [...constraints...]]
+            if (trimmed.startsWith('[system ') && trimmed.endsWith(']')) {
+                return trimmed.slice(8, -1).trim();
+            }
+            return trimmed;
+        }
+
+        function isSystemGeneratedLabel(label) {
+            if (!label) return false;
+            const trimmed = String(label).trim();
+            return trimmed.startsWith('[system ') && trimmed.endsWith(']');
+        }
+
+        function normalizeExpression(expr) {
+            if (!expr) return '';
+            return String(expr).replace(/\s+/g, ' ').trim();
+        }
+
+        function parseActionTypeAndConfig(action) {
+            if (!action) return { type: 'none', config: '{}' };
+            if (action.startsWith('RATE_LIMIT')) {
+                const pps = action.split('(')[1]?.split(')')[0] || '';
+                return { type: 'rate-limit', config: `{pps ${pps}}` };
+            }
+            if (action === 'DROP') return { type: 'drop', config: '{}' };
+            if (action === 'PASS') return { type: 'pass', config: '{}' };
+            if (action === 'COUNT') return { type: 'count', config: '{}' };
+            return { type: String(action).toLowerCase(), config: '{}' };
+        }
+
+        function dimensionDescription(dim) {
+            const dimDescriptions = {
+                'Proto': 'IP Protocol',
+                'SrcIp': 'Source IP Address',
+                'DstIp': 'Destination IP Address',
+                'L4Word0': 'Source Port (TCP/UDP)',
+                'L4Word1': 'Destination Port (TCP/UDP)',
+                'TcpFlags': 'TCP Flags',
+                'Ttl': 'Time To Live',
+                'DfBit': "Don't Fragment Flag",
+                'TcpWindow': 'TCP Window Size',
+                'Custom0': 'Compiled l4-match fanout slot',
+                'Custom1': 'Compiled l4-match fanout slot',
+                'Custom2': 'Compiled l4-match fanout slot',
+                'Custom3': 'Compiled l4-match fanout slot',
+                'Custom4': 'Compiled l4-match fanout slot',
+                'Custom5': 'Compiled l4-match fanout slot',
+                'Custom6': 'Compiled l4-match fanout slot',
+                'Leaf': 'Terminal action node',
+            };
+            if (dimDescriptions[dim]) return dimDescriptions[dim];
+            if (/^Custom\d+$/.test(dim)) return 'Compiled l4-match fanout slot';
+            return dim;
+        }
+
+        function showDagTooltip(node) {
+            const tooltip = document.getElementById('dag-tooltip');
+            const meta = buildDagMeta(node.id);
+            if (!meta) {
+                tooltip.style.display = 'none';
+                return;
+            }
+
+            let tooltipContent = `<div class="tooltip-title">${node.dim} · ${meta.role}</div>`;
+
+            // ── Node identity ──
+            const dimDesc = dimensionDescription(node.dim);
+            tooltipContent += `<div class="tooltip-item"><span class="tooltip-label">Dimension:</span> ${dimDesc}</div>`;
+
+            // ── Structure ──
+            tooltipContent += `<div class="tooltip-item"><span class="tooltip-label">Depth:</span> ${meta.depth ?? "?"} · <span class="tooltip-label">Subtree:</span> ${meta.subtree} nodes</div>`;
+            tooltipContent += `<div class="tooltip-item"><span class="tooltip-label">Edges:</span> in=${meta.inDeg}, out=${meta.outDeg}</div>`;
+
+            if ((node.specific_edges || []).length > 0) {
+                tooltipContent += `<div class="tooltip-item"><span class="tooltip-label">Specific branches:</span> ${(node.specific_edges || []).length}</div>`;
+            }
+            if ((node.range_edges || []).length > 0) {
+                tooltipContent += `<div class="tooltip-item"><span class="tooltip-label">Range branches:</span> ${(node.range_edges || []).length}</div>`;
+            }
+            if (node.wildcard !== null && node.wildcard !== undefined) {
+                tooltipContent += `<div class="tooltip-item"><span class="tooltip-label">Wildcard:</span> yes (fallback branch)</div>`;
+            }
+
+            // ── Path ──
+            if (meta.ancestry && meta.ancestry.length > 0) {
+                tooltipContent += `<div class="tooltip-item"><span class="tooltip-label">Path:</span> ${meta.ancestry.join(" → ")}</div>`;
+            }
+
+            // ── Action details (terminal nodes only) ──
+            if (node.action) {
+                const actionMeta = parseActionTypeAndConfig(node.action);
+                tooltipContent += `<div class="tooltip-item"><span class="tooltip-label">Action:</span> ${actionMeta.type}</div>`;
+                if (actionMeta.config !== '{}') {
+                    tooltipContent += `<div class="tooltip-item"><span class="tooltip-label">Action config:</span> ${actionMeta.config}</div>`;
+                }
+                if (node.action_rule_id !== null && node.action_rule_id !== undefined) {
+                    tooltipContent += `<div class="tooltip-item"><span class="tooltip-label">Rule ID:</span> 0x${Number(node.action_rule_id >>> 0).toString(16)}</div>`;
+                }
+                if (node.action_priority !== null && node.action_priority !== undefined) {
+                    tooltipContent += `<div class="tooltip-item"><span class="tooltip-label">Priority:</span> ${node.action_priority}</div>`;
+                }
+
+                // Label (only if user-provided, not auto [system ...])
+                if (node.label && !isSystemGeneratedLabel(node.label)) {
+                    tooltipContent += `<div class="tooltip-item"><span class="tooltip-label">Label:</span> ${normalizeExpression(node.label)}</div>`;
+                }
+
+                // Rule expression — prefer the manifest's canonical constraints
+                let canonicalExpr = null;
+                if (node.rule_constraints) {
+                    canonicalExpr = normalizeExpression(node.rule_constraints);
+                } else {
+                    const concrete = buildRepresentativeConstraints(node.id);
+                    if (concrete.length > 0) {
+                        canonicalExpr = normalizeExpression(concrete.join(' '));
+                    }
+                }
+                tooltipContent += `<div class="tooltip-item"><span class="tooltip-label">Rule expression:</span> ${canonicalExpr || 'unavailable'}</div>`;
+            }
+
+            tooltip.innerHTML = tooltipContent;
+            tooltip.style.display = 'block';
+        }
+
+        function hideDagTooltip() {
+            const tooltip = document.getElementById('dag-tooltip');
+            tooltip.style.display = 'none';
+        }
+
+        function handleDagClick(clickX, clickY) {
+            const clickedNode = findNodeAtPoint(clickX, clickY);
+            dagSelectedNode = clickedNode
+                ? ((dagSelectedNode?.id ?? null) === clickedNode.id ? null : clickedNode)
+                : null;
+
+            if (dagSelectedNode) {
+                showDagTooltip(dagSelectedNode);
+            } else if (dagHoveredNode) {
+                showDagTooltip(dagHoveredNode);
+            } else {
+                hideDagTooltip();
+            }
+            renderDAG();
+        }
+
+        function renderDAG() {
+            const width = dagCanvas.width;
+            const height = dagCanvas.height;
+            const displayNodes = getDagDisplayNodes();
+
+            dagCtx.fillStyle = '#0a0a0f';
+            dagCtx.fillRect(0, 0, width, height);
+
+            if (displayNodes.length === 0) {
+                dagCtx.fillStyle = '#555';
+                dagCtx.font = '13px monospace';
+                dagCtx.textAlign = 'center';
+                dagCtx.textBaseline = 'middle';
+                dagCtx.fillText('No DAG data yet', width / 2, height / 2);
+                return;
+            }
+
+            // Update layout for rendering and interaction
+            if (displayNodes.length > 0) {
+                dagLayout = computeTreeLayout(displayNodes);
+            } else {
+                dagLayout.clear();
+            }
+            const layout = dagLayout;
+
+            // Draw edges
+            dagCtx.strokeStyle = '#444';
+            dagCtx.lineWidth = 1;
+            dagCtx.font = '9px monospace';
+            dagCtx.textAlign = 'center';
+            dagCtx.textBaseline = 'middle';
+
+            for (const node of displayNodes) {
+                const pos = layout.get(node.id);
+                if (!pos) continue;
+
+                // Draw edges to children
+                for (let i = 0; i < node.children.length; i++) {
+                    const childId = node.children[i];
+                    const childPos = layout.get(childId);
+                    if (childPos) {
+                        // Draw line
+                        dagCtx.beginPath();
+                        dagCtx.moveTo(pos.x, pos.y);
+                        dagCtx.lineTo(childPos.x, childPos.y);
+                        dagCtx.stroke();
+
+                        // Edge labels intentionally omitted for visual clarity
+                    }
+                }
+
+                // Draw edge to wildcard
+                if (node.wildcard !== null && node.wildcard !== undefined) {
+                    const wcPos = layout.get(node.wildcard);
+                    if (wcPos) {
+                        dagCtx.strokeStyle = '#666';
+                        dagCtx.setLineDash([3, 3]);
+                        dagCtx.beginPath();
+                        dagCtx.moveTo(pos.x, pos.y);
+                        dagCtx.lineTo(wcPos.x, wcPos.y);
+                        dagCtx.stroke();
+                        dagCtx.setLineDash([]);
+
+                        dagCtx.strokeStyle = '#444';
+                    }
+                }
+            }
+
+            // Draw nodes
+            for (const node of displayNodes) {
+                const pos = layout.get(node.id);
+                if (!pos) continue;
+
+                const isHovered = (dagHoveredNode?.id ?? null) === node.id;
+                const isSelected = (dagSelectedNode?.id ?? null) === node.id;
+
+                // Node circle
+                let fillColor = node.action ? '#f84' : '#1a1a2e';
+                if (isSelected) {
+                    fillColor = '#4af';
+                } else if (isHovered) {
+                    fillColor = node.action ? '#fa6' : '#2a2a4e';
+                }
+
+                dagCtx.fillStyle = fillColor;
+                dagCtx.beginPath();
+                dagCtx.arc(pos.x, pos.y, 6, 0, 2 * Math.PI);
+                dagCtx.fill();
+
+                // Node outline
+                let strokeColor = '#666';
+                let strokeWidth = 1;
+                if (isSelected) {
+                    strokeColor = '#4af';
+                    strokeWidth = 2;
+                } else if (isHovered) {
+                    strokeColor = '#888';
+                    strokeWidth = 2;
+                }
+
+                dagCtx.strokeStyle = strokeColor;
+                dagCtx.lineWidth = strokeWidth;
+                dagCtx.stroke();
+
+                // Label
+                dagCtx.fillStyle = '#aaa';
+                dagCtx.font = '9px monospace';
+                dagCtx.textAlign = 'center';
+                dagCtx.textBaseline = 'top';
+                dagCtx.fillText(node.dim, pos.x, pos.y + 10);
+
+                // Action indicator (short label only — details in tooltip)
+                if (node.action) {
+                    dagCtx.fillStyle = '#f84';
+                    const shortAction = parseActionTypeAndConfig(node.action).type;
+                    dagCtx.fillText(shortAction, pos.x, pos.y + 20);
+                }
+            }
+        }
+
+        function computeTreeLayout(nodes) {
+            const layout = new Map();
+            const width = dagCanvas.width;
+            const height = dagCanvas.height;
+
+            if (nodes.length === 0) return layout;
+
+            // Build parent map
+            const parentMap = new Map();
+            for (const node of nodes) {
+                for (const childId of node.children) {
+                    parentMap.set(childId, node.id);
+                }
+                if (node.wildcard !== null && node.wildcard !== undefined) {
+                    parentMap.set(node.wildcard, node.id);
+                }
+            }
+
+            // Find root (node with no parent)
+            let rootId = nodes[0].id;
+            for (const node of nodes) {
+                if (!parentMap.has(node.id)) {
+                    rootId = node.id;
+                    break;
+                }
+            }
+
+            // BFS to assign depths
+            const depths = new Map();
+            const queue = [[rootId, 0]];
+            depths.set(rootId, 0);
+            let maxDepth = 0;
+
+            while (queue.length > 0) {
+                const [nodeId, depth] = queue.shift();
+                maxDepth = Math.max(maxDepth, depth);
+
+                const node = nodes.find(n => n.id === nodeId);
+                if (!node) continue;
+
+                for (const childId of node.children) {
+                    if (!depths.has(childId)) {
+                        depths.set(childId, depth + 1);
+                        queue.push([childId, depth + 1]);
+                    }
+                }
+
+                if (node.wildcard !== null && node.wildcard !== undefined) {
+                    if (!depths.has(node.wildcard)) {
+                        depths.set(node.wildcard, depth + 1);
+                        queue.push([node.wildcard, depth + 1]);
+                    }
+                }
+            }
+
+            // Group nodes by depth
+            const depthGroups = new Map();
+            for (const node of nodes) {
+                const depth = depths.get(node.id) || 0;
+                if (!depthGroups.has(depth)) {
+                    depthGroups.set(depth, []);
+                }
+                depthGroups.get(depth).push(node.id);
+            }
+
+            // Assign positions
+            const padding = 40;
+            const availableHeight = height - 2 * padding;
+            const yStep = maxDepth > 0 ? availableHeight / maxDepth : 0;
+
+            for (const [depth, nodeIds] of depthGroups.entries()) {
+                const y = padding + depth * yStep;
+                const availableWidth = width - 2 * padding;
+                const xStep = nodeIds.length > 1 ? availableWidth / (nodeIds.length - 1) : 0;
+
+                for (let i = 0; i < nodeIds.length; i++) {
+                    const x = nodeIds.length === 1 ? width / 2 : padding + i * xStep;
+                    layout.set(nodeIds[i], { x, y });
+                }
+            }
+
+            return layout;
+        }
+
+        // =============================================================================
+        // Utility Functions
+        // =============================================================================
+
+        function formatNumber(n) {
+            if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+            if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+            return n.toString();
+        }
+
+        function formatTime(ts) {
+            const date = new Date(ts * 1000);
+            return date.toLocaleTimeString();
+        }
+
+        function updateStatus() {
+            const dot = document.getElementById('status-dot');
+            const text = document.getElementById('status-text');
+
+            if (state.connected) {
+                dot.classList.add('connected');
+                text.textContent = 'Connected';
+            } else {
+                dot.classList.remove('connected');
+                text.textContent = 'Disconnected';
+            }
+        }
+
+        // =============================================================================
+        // Initialize
+        // =============================================================================
+
+        // Initialize uPlot and DAG canvas
+        initUPlot();
+        resizeCanvas();
+
+        connectSSE();
+
+        // Fetch initial DAG state
+        fetch('/api/dag')
+            .then(r => r.json())
+            .then(data => {
+                if (data.nodes) {
+                    state.dagNodes = data.nodes;
+                    renderDAG();
+                }
+            })
+            .catch(e => console.error('Failed to fetch DAG:', e));
+    </script>
+</body>
+</html>
