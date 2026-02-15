@@ -531,8 +531,10 @@ unsafe impl aya::Pod for CustomDimEntry {}
 /// Maximum length of a byte pattern for l4-match
 pub const MAX_PATTERN_LEN: usize = 64;
 
-/// Maximum number of byte pattern entries in the BYTE_PATTERNS map
-pub const MAX_BYTE_PATTERNS: u32 = 4096;
+/// Maximum number of byte pattern entries in the BYTE_PATTERNS map.
+/// 65536 entries at 132 bytes each = ~8.5 MB of BPF map memory.
+/// Supports massive multi-tenant deployments with many byte match rules.
+pub const MAX_BYTE_PATTERNS: u32 = 65536;
 
 /// A byte pattern for multi-byte matching at a transport-relative offset.
 /// Stored in the BYTE_PATTERNS BPF map.

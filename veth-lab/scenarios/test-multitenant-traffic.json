@@ -1,0 +1,132 @@
+{
+  "name": "Multi-Tenant Byte Match Test",
+  "description": "Proves multi-tenant byte matching with direct packet reads at various offsets. Each phase sends traffic to a different tenant's dst-addr with the correct byte pattern at the expected L4 offset. Offsets are relative to the transport header; UDP payload starts at L4 offset 8, so payload_hex byte 0 = L4 offset 8.",
+  "baseline_pps": 5000,
+  "attack_pps": 5000,
+  "phases": [
+    {
+      "name": "warmup",
+      "duration_secs": 20,
+      "type": "normal",
+      "pps": 5000,
+      "description": "Warmup: normal UDP traffic to default target"
+    },
+    {
+      "name": "tenant_a_magic",
+      "duration_secs": 10,
+      "type": "custom",
+      "dst_ip": "10.0.0.1",
+      "dst_port": 8888,
+      "payload_hex": "DEADBEEF00000000000000000000000000000000",
+      "description": "Tenant A: DEADBEEF at L4 offset 8 (payload byte 0). Expect tenant-a/magic-header count."
+    },
+    {
+      "name": "tenant_a_alt",
+      "duration_secs": 10,
+      "type": "custom",
+      "dst_ip": "10.0.0.1",
+      "dst_port": 8888,
+      "payload_hex": "CAFEBABE00000000000000000000000000000000",
+      "description": "Tenant A: CAFEBABE at L4 offset 8 (payload byte 0). Expect tenant-a/alt-header count."
+    },
+    {
+      "name": "tenant_b_tag",
+      "duration_secs": 10,
+      "type": "custom",
+      "dst_ip": "10.0.0.2",
+      "dst_port": 8888,
+      "payload_hex": "0000123400000000000000000000000000000000",
+      "description": "Tenant B: 1234 at L4 offset 10 (payload byte 2). Expect tenant-b/payload-tag count."
+    },
+    {
+      "name": "tenant_b_alt",
+      "duration_secs": 10,
+      "type": "custom",
+      "dst_ip": "10.0.0.2",
+      "dst_port": 8888,
+      "payload_hex": "0000567800000000000000000000000000000000",
+      "description": "Tenant B: 5678 at L4 offset 10 (payload byte 2). Expect tenant-b/alt-tag count."
+    },
+    {
+      "name": "tenant_c_marker",
+      "duration_secs": 10,
+      "type": "custom",
+      "dst_ip": "10.0.0.3",
+      "dst_port": 8888,
+      "payload_hex": "0000000000000000AA00000000000000000000000000000000000000",
+      "description": "Tenant C: AA at L4 offset 16 (payload byte 8). Expect tenant-c/byte-marker count."
+    },
+    {
+      "name": "tenant_d_deep",
+      "duration_secs": 10,
+      "type": "custom",
+      "dst_ip": "10.0.0.4",
+      "dst_port": 8888,
+      "payload_hex": "000000000000000000000000DEADC0DE00000000000000000000000000000000",
+      "description": "Tenant D: DEADC0DE at L4 offset 20 (payload byte 12). Expect tenant-d/deep-match count."
+    },
+    {
+      "name": "tenant_e_game",
+      "duration_secs": 10,
+      "type": "custom",
+      "dst_ip": "10.0.0.5",
+      "dst_port": 8888,
+      "payload_hex": "0000000000000000000000000000000000000000FEEDFACE00000000000000000000000000000000",
+      "description": "Tenant E: FEEDFACE at L4 offset 28 (payload byte 20). Expect tenant-e/game-proto count."
+    },
+    {
+      "name": "tenant_f_session",
+      "duration_secs": 10,
+      "type": "custom",
+      "dst_ip": "10.0.0.6",
+      "dst_port": 8888,
+      "payload_hex": "000000000000000000000000000000000000000000000000000000000000000001020304000000000000000000000000",
+      "description": "Tenant F: 01020304 at L4 offset 40 (payload byte 32). Expect tenant-f/session-id count."
+    },
+    {
+      "name": "tenant_g_deep_payload",
+      "duration_secs": 10,
+      "type": "custom",
+      "dst_ip": "10.0.0.7",
+      "dst_port": 8888,
+      "payload_hex": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000F0F0F0F0",
+      "description": "Tenant G: F0F0F0F0 at L4 offset 56 (payload byte 48). Expect tenant-g/deep-payload count."
+    },
+    {
+      "name": "tenant_h_offset100",
+      "duration_secs": 10,
+      "type": "custom",
+      "dst_ip": "10.0.0.8",
+      "dst_port": 8888,
+      "payload_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ABCD1234",
+      "description": "Tenant H: ABCD1234 at L4 offset 108 (payload byte 100). DEEP — beyond 64-byte pattern_data. Expect tenant-h/deep-offset-100 count."
+    },
+    {
+      "name": "tenant_i_offset200",
+      "duration_secs": 10,
+      "type": "custom",
+      "dst_ip": "10.0.0.9",
+      "dst_port": 8888,
+      "payload_hex": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000099887766",
+      "description": "Tenant I: 99887766 at L4 offset 208 (payload byte 200). VERY DEEP. Expect tenant-i/deep-offset-200 count."
+    },
+    {
+      "name": "tenant_j_long_pattern",
+      "duration_secs": 10,
+      "type": "custom",
+      "dst_ip": "10.0.0.10",
+      "dst_port": 8888,
+      "payload_hex": "0000000000000000564554482D4C41422D54455354000000000000000000000000",
+      "description": "Tenant J: VETH-LAB-TEST (13 bytes) at L4 offset 16 (payload byte 8). Long pattern -> PatternGuard. Expect tenant-j/long-pattern count."
+    },
+    {
+      "name": "negative_test",
+      "duration_secs": 10,
+      "type": "custom",
+      "dst_ip": "10.0.0.1",
+      "dst_port": 8888,
+      "payload_hex": "1111111100000000000000000000000000000000",
+      "description": "Negative: send to tenant A's dst but with WRONG payload (11111111 instead of DEADBEEF/CAFEBABE). Expect NO tenant-a count increment."
+    }
+  ]
+}

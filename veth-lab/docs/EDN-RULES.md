@@ -64,6 +64,10 @@ Each line is a complete EDN map:
 Match and mask values are **hexadecimal strings**. The offset is relative to the
 start of the transport (L4) header (byte 0 = first byte after IP header).
 
+**Tenant scoping requirement:** Every rule containing an `l4-match` predicate
+**must** also include a `(= dst-addr ...)` constraint. This enforces tenant
+isolation — byte match rules without a destination scope are rejected at load time.
+
 Multiple constraints use implicit AND:
 
 ```edn

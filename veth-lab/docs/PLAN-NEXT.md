@@ -144,10 +144,26 @@ three-tiered matching system.
    - `(l4-match <offset> "<hex-match>" "<hex-mask>")` where len 5-64
 
 **Key eBPF innovations:**
-- `DfsState.pattern_data: [u8; 64]` — pre-copies transport payload
-- Custom dimensions extracted via `extract_custom_dim_from_data`
+- `DfsState.pattern_data: [u8; 64]` — pre-copies transport payload for PatternGuard
+- Custom dimensions extracted directly from packet in `veth_filter` (arbitrary offset)
 - Pre-shifted `BytePattern` eliminates runtime offset arithmetic
-- `BTreeSet` for deterministic custom dimension assignment (stable `rule_id`s)
+- Frequency-based custom dim allocation (most-used combos get O(1) fan-out slots)
+- `BYTE_PATTERNS` map scaled to 65K entries (~8.5 MB) for massive multi-tenancy
+
+**Multi-tenant byte matching:**
+- **Arbitrary offset custom dims:** 1-4 byte matches at ANY packet offset (not
+  limited to pattern_data's 64-byte window). `extract_custom_dim_from_packet`
+  reads directly from the XDP packet context where pointers are verified.
+- **Frequency-based slot allocation:** The 7 custom dim slots are assigned to
+  the `(offset, length)` combos used by the most rules, maximizing O(1) fan-out
+  benefit. Overflow combos fall back to PatternGuard (correct, just linear scan).
+- **Tenant isolation:** Each tenant's rules occupy their own subtree in the DAG.
+  Packets destined for tenant X only traverse X's subtree — other tenants' byte
+  match guards are never evaluated.
+- **Tenant limits:** `--max-byte-matches-per-scope N` enforces per-destination
+  byte match density limits, preventing resource exhaustion.
+- **Scale target:** 65K byte pattern entries, hundreds of concurrent tenants
+  with different offsets and patterns.
 
 ### ✅ Per-Rule Metrics Manifest
 
@@ -175,6 +191,7 @@ See `veth-lab/scenarios/comprehensive-predicate-test.edn`.
 | Count action | Medium | New map + action type | ✅ Done |
 | Range predicates | Medium | Node annotation | ✅ Done |
 | Bitmask & byte matching | High | Custom dims + pattern map | ✅ Done |
+| Multi-tenant byte matching | Medium | Direct packet read + 65K patterns | ✅ Done |
 | Per-rule metrics manifest | Medium | TREE_COUNTERS for all actions | ✅ Done |
 | LPM trie prefix sets | High | New map type + predicate | Planned |
 | Bloom filters | Medium | New map type | Planned |

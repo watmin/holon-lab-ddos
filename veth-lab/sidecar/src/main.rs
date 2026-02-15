@@ -98,6 +98,12 @@ struct Args {
     /// Format: JSON array of {constraints, action, rate_pps?, priority?}
     #[arg(long)]
     rules_file: Option<PathBuf>,
+
+    /// Maximum number of l4-match (byte match) rules per destination scope.
+    /// Limits per-tenant byte match complexity to prevent resource exhaustion.
+    /// Set to 0 to disable the limit.
+    #[arg(long, default_value = "32")]
+    max_byte_matches_per_scope: usize,
 }
 
 // =============================================================================
@@ -791,6 +797,90 @@ impl Detection {
 /// Format: EDN maps, one per line
 /// ```edn
 /// {:constraints [(= proto 17) (= src-port 53)] :actions [(rate-limit 500)] :priority 190}
+/// Validate byte match policy: every l4-match rule MUST have a destination address
+/// constraint (tenant scoping), and no scope may exceed the configured density limit.
+/// This enforces tenant isolation and resource boundaries in multi-tenant deployments.
+fn validate_byte_match_density(rules: &[RuleSpec], max_per_scope: usize) -> Result<()> {
+    use std::collections::HashMap;
+    use veth_filter::{FieldRef, Predicate};
+
+    // Group rules by dst-addr (scope discriminator).
+    // Rules without dst-addr are rejected — byte matches require tenant scoping.
+    let mut scope_counts: HashMap<String, usize> = HashMap::new();
+    let mut total_byte_matches = 0usize;
+    let mut unscoped_rules: Vec<String> = Vec::new();
+
+    for rule in rules {
+        // Count l4-match constraints in this rule
+        let byte_match_count = rule.constraints.iter().filter(|p| {
+            matches!(p.field_ref(), FieldRef::L4Byte { .. })
+        }).count();
+
+        if byte_match_count == 0 {
+            continue;
+        }
+
+        total_byte_matches += byte_match_count;
+
+        // Find the dst-addr for scoping (if any)
+        let scope = rule.constraints.iter().find_map(|p| {
+            match p {
+                Predicate::Eq(FieldRef::Dim(veth_filter::FieldDim::DstIp), val) => {
+                    Some(format!("{}.{}.{}.{}",
+                        (val >> 24) & 0xFF, (val >> 16) & 0xFF,
+                        (val >> 8) & 0xFF, val & 0xFF))
+                }
+                _ => None,
+            }
+        });
+
+        match scope {
+            Some(addr) => {
+                *scope_counts.entry(addr).or_insert(0) += byte_match_count;
+            }
+            None => {
+                // Byte match without dst-addr — policy violation
+                unscoped_rules.push(rule.display_label());
+            }
+        }
+    }
+
+    // Reject unscoped byte match rules
+    if !unscoped_rules.is_empty() {
+        let examples: Vec<&str> = unscoped_rules.iter().take(3).map(|s| s.as_str()).collect();
+        anyhow::bail!(
+            "{} byte match rule(s) missing required (= dst-addr ...) constraint. \
+             Every l4-match rule must be scoped to a destination address for tenant isolation.\n  \
+             Examples: {}",
+            unscoped_rules.len(),
+            examples.join("\n  ")
+        );
+    }
+
+    if total_byte_matches > 0 {
+        let num_scopes = scope_counts.len();
+        let max_scope = scope_counts.iter().max_by_key(|(_, v)| *v);
+        info!("Byte match density: {} total across {} scopes (limit: {}/scope)",
+              total_byte_matches, num_scopes, max_per_scope);
+
+        for (scope, count) in &scope_counts {
+            if *count > max_per_scope {
+                anyhow::bail!(
+                    "Scope '{}' has {} byte match rules, exceeding limit of {}. \
+                     Split into separate scopes or increase --max-byte-matches-per-scope.",
+                    scope, count, max_per_scope
+                );
+            }
+        }
+
+        if let Some((scope, count)) = max_scope {
+            info!("  Densest scope: {} ({} byte matches)", scope, count);
+        }
+    }
+
+    Ok(())
+}
+
 /// {:constraints [(= proto 6) (= tcp-flags 2)] :actions [(drop)] :priority 200}
 /// {:constraints [(= src-addr "10.0.0.200")] :actions [(drop)] :comment "Known attacker"}
 /// ```
@@ -1469,6 +1559,11 @@ async fn main() -> Result<()> {
         let preloaded = parse_rules_file(rules_path)?;
         let parse_time = start.elapsed();
         info!("Parsed {} rules from {:?} in {:?}", preloaded.len(), rules_path, parse_time);
+
+        // Validate byte match density per scope (tenant limit enforcement)
+        if args.max_byte_matches_per_scope > 0 {
+            validate_byte_match_density(&preloaded, args.max_byte_matches_per_scope)?;
+        }
 
         if !preloaded.is_empty() {
             let mut rules = active_rules.write().await;

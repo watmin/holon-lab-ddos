@@ -1,0 +1,81 @@
+;; Multi-tenant byte matching stress test
+;;
+;; Demonstrates:
+;;   - Multiple tenants with different L4 byte match offsets
+;;   - Frequency-based custom dim allocation (most popular offsets get O(1) slots)
+;;   - Overflow from custom dims to PatternGuard for less popular offsets
+;;   - Tenant isolation via dst-addr scoping
+;;   - Deep offsets (108, 208) BEYOND the 64-byte pattern_data window
+;;
+;; All offsets are >= 8 (inside UDP payload area, after the 8-byte UDP header).
+;; This means payload_hex in the traffic JSON maps directly to these offsets:
+;;   l4-match offset N  ↔  payload byte at position (N - 8)
+;;
+;; 10 tenants, each with different byte match requirements at various offsets.
+;; Only 7 custom dim slots available — top 7 by frequency get O(1) fan-out,
+;; remaining fall back to PatternGuard (still correct, just linear scan).
+
+;; ──────────────────────────────────────────────────────────────
+;; Tenant A (dst 10.0.0.1): Match 4 bytes at L4 offset 8 (payload byte 0)
+;; Most popular offset (2 rules) — should get a custom dim slot.
+;; ──────────────────────────────────────────────────────────────
+{:constraints [(= dst-addr "10.0.0.1") (= proto 17) (l4-match 8 "DEADBEEF" "FFFFFFFF")] :actions [(count :name ["tenant-a" "magic-header"])] :priority 100}
+
+{:constraints [(= dst-addr "10.0.0.1") (= proto 17) (l4-match 8 "CAFEBABE" "FFFFFFFF")] :actions [(count :name ["tenant-a" "alt-header"])] :priority 100}
+
+;; ──────────────────────────────────────────────────────────────
+;; Tenant B (dst 10.0.0.2): Match 2 bytes at L4 offset 10 (payload byte 2)
+;; ──────────────────────────────────────────────────────────────
+{:constraints [(= dst-addr "10.0.0.2") (= proto 17) (l4-match 10 "1234" "FFFF")] :actions [(count :name ["tenant-b" "payload-tag"])] :priority 100}
+
+{:constraints [(= dst-addr "10.0.0.2") (= proto 17) (l4-match 10 "5678" "FFFF")] :actions [(count :name ["tenant-b" "alt-tag"])] :priority 100}
+
+;; ──────────────────────────────────────────────────────────────
+;; Tenant C (dst 10.0.0.3): Match 1 byte at L4 offset 16 (payload byte 8)
+;; ──────────────────────────────────────────────────────────────
+{:constraints [(= dst-addr "10.0.0.3") (= proto 17) (l4-match 16 "AA" "FF")] :actions [(count :name ["tenant-c" "byte-marker"])] :priority 100}
+
+;; ──────────────────────────────────────────────────────────────
+;; Tenant D (dst 10.0.0.4): Match 4 bytes at L4 offset 20 (payload byte 12)
+;; ──────────────────────────────────────────────────────────────
+{:constraints [(= dst-addr "10.0.0.4") (= proto 17) (l4-match 20 "DEADC0DE" "FFFFFFFF")] :actions [(count :name ["tenant-d" "deep-match"])] :priority 100}
+
+;; ──────────────────────────────────────────────────────────────
+;; Tenant E (dst 10.0.0.5): Match 4 bytes at L4 offset 28 (payload byte 20)
+;; ──────────────────────────────────────────────────────────────
+{:constraints [(= dst-addr "10.0.0.5") (= proto 17) (l4-match 28 "FEEDFACE" "FFFFFFFF")] :actions [(count :name ["tenant-e" "game-proto"])] :priority 100}
+
+;; ──────────────────────────────────────────────────────────────
+;; Tenant F (dst 10.0.0.6): Match 4 bytes at L4 offset 40 (payload byte 32)
+;; ──────────────────────────────────────────────────────────────
+{:constraints [(= dst-addr "10.0.0.6") (= proto 17) (l4-match 40 "01020304" "FFFFFFFF")] :actions [(count :name ["tenant-f" "session-id"])] :priority 100}
+
+;; ──────────────────────────────────────────────────────────────
+;; Tenant G (dst 10.0.0.7): Match 4 bytes at L4 offset 56 (payload byte 48)
+;; ──────────────────────────────────────────────────────────────
+{:constraints [(= dst-addr "10.0.0.7") (= proto 17) (l4-match 56 "F0F0F0F0" "FFFFFFFF")] :actions [(count :name ["tenant-g" "deep-payload"])] :priority 100}
+
+;; ──────────────────────────────────────────────────────────────
+;; Tenant H (dst 10.0.0.8): Match 4 bytes at L4 offset 108 (payload byte 100)
+;; BEYOND the 64-byte pattern_data window.
+;; Only possible with direct packet reads (the new enhancement).
+;; ──────────────────────────────────────────────────────────────
+{:constraints [(= dst-addr "10.0.0.8") (= proto 17) (l4-match 108 "ABCD1234" "FFFFFFFF")] :actions [(count :name ["tenant-h" "deep-offset-100"])] :priority 100}
+
+;; ──────────────────────────────────────────────────────────────
+;; Tenant I (dst 10.0.0.9): Match 4 bytes at L4 offset 208 (payload byte 200)
+;; Even deeper — well beyond the 64-byte pattern_data.
+;; ──────────────────────────────────────────────────────────────
+{:constraints [(= dst-addr "10.0.0.9") (= proto 17) (l4-match 208 "99887766" "FFFFFFFF")] :actions [(count :name ["tenant-i" "deep-offset-200"])] :priority 100}
+
+;; ──────────────────────────────────────────────────────────────
+;; Tenant J (dst 10.0.0.10): Long pattern match (13 bytes at L4 offset 16)
+;; "VETH-LAB-TEST" = 56455448 2D4C4142 2D544553 54
+;; Exceeds 4 bytes → ALWAYS goes to PatternGuard regardless of custom dim slots.
+;; ──────────────────────────────────────────────────────────────
+{:constraints [(= dst-addr "10.0.0.10") (= proto 17) (l4-match 16 "564554482D4C41422D54455354" "FFFFFFFFFFFFFFFFFFFFFFFFFF")] :actions [(count :name ["tenant-j" "long-pattern"])] :priority 100}
+
+;; ──────────────────────────────────────────────────────────────
+;; Shared rule: Rate-limit all UDP as a baseline safety net
+;; ──────────────────────────────────────────────────────────────
+{:constraints [(= proto 17)] :actions [(rate-limit 50000 :name ["global" "udp-baseline"])] :priority 10}

@@ -195,9 +195,10 @@ pub struct BytePattern {
     pub mask_bytes: [u8; MAX_PATTERN_LEN],
 }
 
-/// Byte patterns for multi-byte matching (l4-match 5-64 byte patterns)
+/// Byte patterns for multi-byte matching (l4-match 5-64 byte patterns).
+/// 65536 entries for massive multi-tenant deployments (~8.5 MB BPF map).
 #[map]
-static BYTE_PATTERNS: Array<BytePattern> = Array::with_max_entries(4096, 0);
+static BYTE_PATTERNS: Array<BytePattern> = Array::with_max_entries(65536, 0);
 
 /// Custom dimension config: 7 slots for l4-match byte extraction.
 /// Each entry is a CustomDimEntry { offset: u16, length: u8, _pad: u8 }.
@@ -407,7 +408,7 @@ fn try_veth_filter(ctx: XdpContext) -> Result<u32, ()> {
             state.fields[6] = fields[6];
             state.fields[7] = fields[7];
             state.fields[8] = fields[8];
-            // Custom dims (9-15) extracted from pattern_data below
+            // Custom dims (9-15) extracted from packet below
             // Match state
             state.matched = 0;
             state.best_action = ACT_PASS;
@@ -449,15 +450,19 @@ fn try_veth_filter(ctx: XdpContext) -> Result<u32, ()> {
                 }
             }
 
-            // Extract custom dimension values from pattern_data (not from
-            // packet pointers — variable-offset packet access fails verifier).
-            extract_custom_dim_from_data(state, 0);
-            extract_custom_dim_from_data(state, 1);
-            extract_custom_dim_from_data(state, 2);
-            extract_custom_dim_from_data(state, 3);
-            extract_custom_dim_from_data(state, 4);
-            extract_custom_dim_from_data(state, 5);
-            extract_custom_dim_from_data(state, 6);
+            // Extract custom dimension values by reading directly from the
+            // packet. We're in veth_filter where packet pointers are verified,
+            // so we can access arbitrary offsets (not limited to pattern_data's
+            // 64-byte window). This enables l4-match at deep offsets (e.g.
+            // offset 1000) for multi-tenant byte matching.
+            let tp_start = data + ETH_HDR_LEN + ihl;
+            extract_custom_dim_from_packet(state, 0, data, data_end, tp_start);
+            extract_custom_dim_from_packet(state, 1, data, data_end, tp_start);
+            extract_custom_dim_from_packet(state, 2, data, data_end, tp_start);
+            extract_custom_dim_from_packet(state, 3, data, data_end, tp_start);
+            extract_custom_dim_from_packet(state, 4, data, data_end, tp_start);
+            extract_custom_dim_from_packet(state, 5, data, data_end, tp_start);
+            extract_custom_dim_from_packet(state, 6, data, data_end, tp_start);
 
             // DIAG: about to attempt tail call
             if let Some(cnt) = STATS.get_ptr_mut(11) { unsafe { *cnt += 1; } }
@@ -558,9 +563,9 @@ fn extract_phase2(data_end: usize, ip_hdr: usize, ihl: usize, proto: u8) -> PktF
 // =============================================================================
 
 /// Extract static packet field values into a flat array indexed by dimension.
-/// Custom dimensions (9-15) are extracted separately from pattern_data after
-/// the transport payload has been pre-copied, avoiding variable-offset packet
-/// pointer arithmetic that the verifier rejects.
+/// Custom dimensions (9-15) are extracted separately by reading directly from
+/// the packet in veth_filter (where packet pointers are verified), supporting
+/// arbitrary offsets into the transport payload.
 #[inline(always)]
 fn extract_all_fields(
     data_end: usize, ip_hdr: usize, ihl: usize, facts: &PktFacts,
@@ -576,39 +581,57 @@ fn extract_all_fields(
     f[6] = facts2.ttl as u32;
     f[7] = facts2.df_bit as u32;
     f[8] = facts2.tcp_window as u32;
-    // f[9..15] = custom dims, populated later from pattern_data
+    // f[9..15] = custom dims, populated later from packet in veth_filter
     f
 }
 
-/// Extract a single custom dimension value from pre-copied pattern_data.
-/// Reads from the map-value byte buffer instead of the packet, so the
-/// verifier can prove all accesses are in-bounds.
+/// Extract a single custom dimension value by reading directly from the packet.
+///
+/// MUST be called from veth_filter (the main XDP entry), where the verifier
+/// has proven packet pointer ranges. This allows arbitrary offsets into the
+/// transport payload (up to packet length), not limited to the 64-byte
+/// pattern_data buffer.
+///
+/// `data` and `data_end` are the XDP packet boundaries.
+/// `tp_start` is the absolute offset of the transport header (data + ETH + IHL).
 #[inline(always)]
-fn extract_custom_dim_from_data(state: &mut DfsState, index: u32) {
+fn extract_custom_dim_from_packet(
+    state: &mut DfsState,
+    index: u32,
+    data: usize,
+    data_end: usize,
+    tp_start: usize,
+) {
     if let Some(&cfg) = CUSTOM_DIM_CONFIG.get(index) {
         let offset = (cfg & 0xFFFF) as usize;
         let length = ((cfg >> 16) & 0xFF) as usize;
         if offset > 0 && length > 0 {
-            // Mask offset to pattern_data bounds (0..63)
-            let off = offset & 0x3F;
+            // Mask offset to 15 bits (max 32767) to help verifier bound tracking
+            let off = offset & 0x7FFF;
+            let pkt_off = tp_start + off;
             let val = match length {
                 1 => {
-                    if off < MAX_PATTERN_LEN {
-                        state.pattern_data[off] as u32
+                    if pkt_off + 1 <= data_end && pkt_off >= data {
+                        unsafe { *((pkt_off) as *const u8) as u32 }
                     } else { 0 }
                 }
                 2 => {
-                    if off + 1 < MAX_PATTERN_LEN {
-                        ((state.pattern_data[off] as u32) << 8)
-                            | (state.pattern_data[off + 1] as u32)
+                    if pkt_off + 2 <= data_end && pkt_off >= data {
+                        unsafe {
+                            let p = pkt_off as *const u8;
+                            ((*p as u32) << 8) | (*p.add(1) as u32)
+                        }
                     } else { 0 }
                 }
                 4 => {
-                    if off + 3 < MAX_PATTERN_LEN {
-                        ((state.pattern_data[off] as u32) << 24)
-                            | ((state.pattern_data[off + 1] as u32) << 16)
-                            | ((state.pattern_data[off + 2] as u32) << 8)
-                            | (state.pattern_data[off + 3] as u32)
+                    if pkt_off + 4 <= data_end && pkt_off >= data {
+                        unsafe {
+                            let p = pkt_off as *const u8;
+                            ((*p as u32) << 24)
+                                | ((*p.add(1) as u32) << 16)
+                                | ((*p.add(2) as u32) << 8)
+                                | (*p.add(3) as u32)
+                        }
                     } else { 0 }
                 }
                 _ => 0,

@@ -178,6 +178,12 @@ pub(crate) fn compile_tree_full(rules: &[RuleSpec]) -> (Rc<ShadowNode>, CustomDi
     }
 
     let tree = compile_recursive_dynamic(&expanded, 0, &dim_order);
+
+    // Compilation summary
+    let pattern_count = PATTERN_ALLOC.with(|pa| pa.borrow().len());
+    info!("Compilation summary: {} rules, {} custom dims, {} pattern guards, {} manifest entries",
+          expanded.len(), mapping.entries.len(), pattern_count, manifest.len());
+
     (tree, mapping, dim_order, manifest)
 }
 
@@ -304,57 +310,77 @@ fn allocate_patterns(rules: &mut Vec<RuleSpec>) -> Vec<crate::BytePattern> {
 /// For 1-4 byte exact matches (mask = all-FF), auto-promotes MaskEq to Eq
 /// for specific-edge fan-out.
 fn resolve_l4byte_refs(rules: &mut Vec<RuleSpec>) -> CustomDimMapping {
-    use std::collections::BTreeSet;
     use std::collections::BTreeMap;
     
-    // Pass 1: Collect unique (offset, length) combinations (order-independent)
-    let mut seen: BTreeSet<(u16, u8)> = BTreeSet::new();
+    // Pass 1: Collect unique (offset, length) combos AND count rules per combo.
+    // Frequency-based allocation: assign custom dim slots to the combos used by
+    // the most rules, maximizing O(1) fan-out benefit. Overflow combos fall back
+    // to PatternGuard (still correct, just without HashMap fan-out).
+    let mut combo_counts: BTreeMap<(u16, u8), usize> = BTreeMap::new();
     for rule in rules.iter() {
         for pred in &rule.constraints {
             match pred.field_ref() {
                 FieldRef::L4Byte { offset, length } if *length <= 4 => {
-                    seen.insert((*offset, *length));
+                    *combo_counts.entry((*offset, *length)).or_insert(0) += 1;
                 }
                 FieldRef::L4Byte { offset, length } if *length > 4 => {
-                    info!("L4Byte offset={} length={} -> pattern guard (too long for custom dim)", offset, length);
+                    info!("L4Byte offset={} length={} -> pattern guard (>4 bytes)", offset, length);
                 }
                 _ => {}
             }
         }
     }
     
-    // Pass 2: Assign custom dims in deterministic sorted order (by offset, then length)
+    // Pass 2: Sort by frequency (descending), then by offset for deterministic
+    // tie-breaking. Assign the top NUM_CUSTOM_DIMS combos to custom dim slots.
+    let mut sorted_combos: Vec<((u16, u8), usize)> = combo_counts.iter()
+        .map(|(k, v)| (*k, *v))
+        .collect();
+    sorted_combos.sort_by(|a, b| {
+        b.1.cmp(&a.1)                        // highest rule count first
+            .then(a.0.0.cmp(&b.0.0))         // then lowest offset
+            .then(a.0.1.cmp(&b.0.1))         // then lowest length
+    });
+    
     let mut unique_combos: BTreeMap<(u16, u8), FieldDim> = BTreeMap::new();
     let mut next_custom = 0usize;
-    for key in &seen {
+    let total_combos = sorted_combos.len();
+    
+    for ((offset, length), count) in &sorted_combos {
         if next_custom >= crate::NUM_CUSTOM_DIMS {
-            tracing::warn!(
-                "Too many unique L4Byte combos (>{}), ignoring offset={} length={}",
-                crate::NUM_CUSTOM_DIMS, key.0, key.1
-            );
-            continue;
+            break;
         }
         let dim = FieldDim::from_custom_index(next_custom).unwrap();
-        unique_combos.insert(*key, dim);
+        unique_combos.insert((*offset, *length), dim);
+        info!("  {:?} = (offset {}, len {}) — {} rules (fan-out)",
+              dim, offset, length, count);
         next_custom += 1;
     }
     
-    // Build the mapping
+    // Log overflow combos that fall to PatternGuard
+    if total_combos > crate::NUM_CUSTOM_DIMS {
+        let overflow_count = total_combos - crate::NUM_CUSTOM_DIMS;
+        let overflow_rules: usize = sorted_combos[crate::NUM_CUSTOM_DIMS..]
+            .iter().map(|(_, c)| c).sum();
+        info!("Custom dim allocation: {} slots used, {} overflow -> PatternGuard ({} rules)",
+              next_custom, overflow_count, overflow_rules);
+        for ((offset, length), count) in &sorted_combos[crate::NUM_CUSTOM_DIMS..] {
+            info!("  PatternGuard fallback: (offset {}, len {}) — {} rules", offset, length, count);
+        }
+    } else if total_combos > 0 {
+        info!("Custom dim allocation: {} slots used, all combos assigned", next_custom);
+    }
+    
+    // Build the mapping (sorted by custom dim index for config map population)
     let mapping = CustomDimMapping {
         entries: unique_combos.iter()
             .map(|((offset, length), dim)| (*offset, *length, *dim))
             .collect(),
     };
     
-    if !mapping.entries.is_empty() {
-        info!("Custom dim mapping: {} entries", mapping.entries.len());
-        for (offset, length, dim) in &mapping.entries {
-            info!("  offset={}, length={} -> {:?}", offset, length, dim);
-        }
-    }
-    
     // Resolve 1-4 byte L4Byte refs in rules to their assigned custom dims.
-    // Leave 5+ byte L4Byte refs unresolved for pattern guard handling.
+    // Unassigned combos (overflow) remain as L4Byte refs and will be caught by
+    // allocate_patterns(), which converts them to PatternGuard edges.
     for rule in rules.iter_mut() {
         let mut new_constraints = Vec::with_capacity(rule.constraints.len());
         for pred in &rule.constraints {
@@ -383,7 +409,7 @@ fn resolve_l4byte_refs(rules: &mut Vec<RuleSpec>) -> CustomDimMapping {
                         pred.clone()
                     }
                 }
-                // 5-64 byte patterns: leave as L4Byte for pattern guard allocation
+                // 5-64 byte patterns and overflow short patterns: leave for allocate_patterns()
                 other => other.clone(),
             };
             new_constraints.push(resolved);

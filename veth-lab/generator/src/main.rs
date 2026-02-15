@@ -122,6 +122,26 @@ struct Phase {
     /// Optional per-phase PPS override (if not set, uses baseline_pps or attack_pps)
     #[serde(default)]
     pps: Option<u32>,
+    /// Custom destination IP (overrides --target for this phase)
+    #[serde(default)]
+    dst_ip: Option<String>,
+    /// Custom destination port (overrides normal/attack port for this phase)
+    #[serde(default)]
+    dst_port: Option<u16>,
+    /// Custom payload as hex string (e.g. "DEADBEEF01020304...")
+    /// The decoded bytes become the L4 payload. For deep-offset testing,
+    /// zero-pad the hex string up to the desired offset then append match bytes.
+    #[serde(default)]
+    payload_hex: Option<String>,
+    /// TTL override (default: 64 for custom/normal, 255 for attack, 128 for syn_flood)
+    #[serde(default)]
+    ttl: Option<u8>,
+    /// DF flag override (default: true for custom/normal, false for attack)
+    #[serde(default)]
+    df: Option<bool>,
+    /// Protocol: "udp" (default) or "tcp_syn"
+    #[serde(default)]
+    proto: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
@@ -131,6 +151,8 @@ enum PhaseType {
     Attack,
     /// TCP SYN flood: TCP SYN packets with distinctive p0f fingerprint
     SynFlood,
+    /// Fully configurable: dst_ip, payload_hex, dst_port, ttl, df, proto
+    Custom,
 }
 
 #[tokio::main]
@@ -283,7 +305,7 @@ fn run_scenario_file(
     for (i, phase) in config.phases.iter().enumerate() {
         // Use per-phase PPS if specified, otherwise use global baseline/attack
         let pps = phase.pps.unwrap_or(match phase.phase_type {
-            PhaseType::Normal => config.baseline_pps,
+            PhaseType::Normal | PhaseType::Custom => config.baseline_pps,
             PhaseType::Attack | PhaseType::SynFlood => config.attack_pps,
         });
         let end_time = total_secs + phase.duration_secs;
@@ -317,10 +339,9 @@ fn run_scenario_file(
         
         // Use per-phase PPS if specified, otherwise use global baseline/attack
         let pps = phase.pps.unwrap_or(match phase.phase_type {
-            PhaseType::Normal => config.baseline_pps,
+            PhaseType::Normal | PhaseType::Custom => config.baseline_pps,
             PhaseType::Attack | PhaseType::SynFlood => config.attack_pps,
         });
-        let is_attack = phase.phase_type != PhaseType::Normal;
         
         info!(
             ">>> [{:>3}s] PHASE {}: {} ({:?}, {} pps, {}s)",
@@ -332,36 +353,78 @@ fn run_scenario_file(
             phase.duration_secs
         );
         
+        // Pre-parse custom phase payload (once per phase, not per packet)
+        let custom_payload: Option<Vec<u8>> = if let Some(ref hex) = phase.payload_hex {
+            Some(hex_decode(hex).with_context(|| format!(
+                "Phase '{}': invalid payload_hex", phase.name
+            ))?)
+        } else {
+            None
+        };
+        
+        // Pre-parse custom destination IP
+        let custom_dst_ip: Option<Ipv4Addr> = if let Some(ref ip_str) = phase.dst_ip {
+            Some(ip_str.parse().with_context(|| format!(
+                "Phase '{}': invalid dst_ip '{}'", phase.name, ip_str
+            ))?)
+        } else {
+            None
+        };
+        
         let phase_start = Instant::now();
         let phase_duration = Duration::from_secs(phase.duration_secs);
         let phase_start_packets = packets_sent.load(Ordering::Relaxed);
         
         while running.load(Ordering::Relaxed) && phase_start.elapsed() < phase_duration {
-            // Generate packet based on phase type
-            let (src_ip, dst_port) = if is_attack {
-                (attack_src, args.attack_port)
-            } else {
-                let src = Ipv4Addr::new(192, 168, rng.gen_range(1..255), rng.gen_range(1..255));
-                (src, args.normal_port)
-            };
-
             let src_port: u16 = rng.gen_range(10000..60000);
 
             let packet = match phase.phase_type {
-                PhaseType::Normal => craft_udp_packet(
-                    src_mac, dst_mac, src_ip, target_ip,
-                    src_port, dst_port, b"VETH-LAB-TEST", 64, true,
-                ),
-                PhaseType::Attack => craft_udp_packet(
-                    // UDP attack: TTL=255, DF=clear (simulates amplification reflector)
-                    src_mac, dst_mac, src_ip, target_ip,
-                    src_port, dst_port, b"VETH-LAB-TEST", 255, false,
-                ),
-                PhaseType::SynFlood => craft_tcp_syn_packet(
-                    // TCP SYN flood: flags=0x02, window=65535, TTL=128 (Windows botnet)
-                    src_mac, dst_mac, src_ip, target_ip,
-                    src_port, dst_port, 128, 65535,
-                ),
+                PhaseType::Normal => {
+                    let src_ip = Ipv4Addr::new(192, 168, rng.gen_range(1..255), rng.gen_range(1..255));
+                    let dst_port = phase.dst_port.unwrap_or(args.normal_port);
+                    let dst = custom_dst_ip.unwrap_or(target_ip);
+                    craft_udp_packet(
+                        src_mac, dst_mac, src_ip, dst,
+                        src_port, dst_port, b"VETH-LAB-TEST", 64, true,
+                    )
+                }
+                PhaseType::Attack => {
+                    let dst_port = phase.dst_port.unwrap_or(args.attack_port);
+                    let dst = custom_dst_ip.unwrap_or(target_ip);
+                    craft_udp_packet(
+                        src_mac, dst_mac, attack_src, dst,
+                        src_port, dst_port, b"VETH-LAB-TEST", 255, false,
+                    )
+                }
+                PhaseType::SynFlood => {
+                    let dst_port = phase.dst_port.unwrap_or(args.attack_port);
+                    let dst = custom_dst_ip.unwrap_or(target_ip);
+                    craft_tcp_syn_packet(
+                        src_mac, dst_mac, attack_src, dst,
+                        src_port, dst_port, 128, 65535,
+                    )
+                }
+                PhaseType::Custom => {
+                    let dst = custom_dst_ip.unwrap_or(target_ip);
+                    let dst_port = phase.dst_port.unwrap_or(args.normal_port);
+                    let ttl = phase.ttl.unwrap_or(64);
+                    let df = phase.df.unwrap_or(true);
+                    let src_ip = Ipv4Addr::new(192, 168, rng.gen_range(1..255), rng.gen_range(1..255));
+                    let payload = custom_payload.as_deref().unwrap_or(b"VETH-LAB-TEST");
+                    
+                    let is_tcp = phase.proto.as_deref() == Some("tcp_syn");
+                    if is_tcp {
+                        craft_tcp_syn_packet(
+                            src_mac, dst_mac, src_ip, dst,
+                            src_port, dst_port, ttl, 65535,
+                        )
+                    } else {
+                        craft_udp_packet(
+                            src_mac, dst_mac, src_ip, dst,
+                            src_port, dst_port, payload, ttl, df,
+                        )
+                    }
+                }
             };
 
             match send_packet(socket, &packet) {
@@ -733,6 +796,21 @@ fn get_interface_mac(name: &str) -> Result<[u8; 6]> {
     }
     
     Ok([parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]])
+}
+
+/// Decode a hex string into bytes. Accepts upper/lowercase, must be even length.
+fn hex_decode(s: &str) -> Result<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        anyhow::bail!("hex string must have even length, got {}", s.len());
+    }
+    let mut bytes = Vec::with_capacity(s.len() / 2);
+    for i in (0..s.len()).step_by(2) {
+        let byte = u8::from_str_radix(&s[i..i + 2], 16)
+            .with_context(|| format!("invalid hex at position {}: {:?}", i, &s[i..i + 2]))?;
+        bytes.push(byte);
+    }
+    Ok(bytes)
 }
 
 fn craft_udp_packet(
