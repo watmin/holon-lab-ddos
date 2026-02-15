@@ -19,7 +19,7 @@ use holon::{Holon, Primitives, SegmentMethod, Vector};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -792,11 +792,17 @@ impl Detection {
 // Rules File Loader (EDN Format)
 // =============================================================================
 
-/// Parse an EDN rules file (one rule per line, streaming-friendly).
+/// Parse an EDN rules file (one rule per EDN map, can span multiple lines).
 /// 
-/// Format: EDN maps, one per line
+/// Format: EDN maps, possibly spanning multiple lines for readability
 /// ```edn
-/// {:constraints [(= proto 17) (= src-port 53)] :actions [(rate-limit 500)] :priority 190}
+/// {:constraints [(= proto 17) (= src-port 53)] 
+///  :actions [(rate-limit 500)] 
+///  :priority 190}
+/// ```
+/// Comments (lines starting with `;`) and blank lines are ignored.
+/// The parser accumulates lines until a complete EDN map is found (balanced braces).
+/// 
 /// Validate byte match policy: every l4-match rule MUST have a destination address
 /// constraint (tenant scoping), and no scope may exceed the configured density limit.
 /// This enforces tenant isolation and resource boundaries in multi-tenant deployments.
@@ -886,33 +892,59 @@ fn validate_byte_match_density(rules: &[RuleSpec], max_per_scope: usize) -> Resu
 /// ```
 /// 
 /// Comments (lines starting with `;`) and blank lines are ignored.
+/// Rules can span multiple lines - we accumulate lines until edn-rs can parse it.
 fn parse_rules_file(path: &std::path::Path) -> Result<Vec<RuleSpec>> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("Failed to open rules file: {:?}", path))?;
     
-    let reader = BufReader::new(file);
     let mut rules = Vec::new();
     let mut skipped = 0;
-    let mut line_num = 0;
+    let mut accumulator = String::new();
+    let mut line_count = 0;
     
-    for line in reader.lines() {
-        line_num += 1;
+    for line in std::io::BufReader::new(file).lines() {
         let line = line?;
-        let line = line.trim();
+        line_count += 1;
         
-        // Skip empty lines and comments
-        if line.is_empty() || line.starts_with(';') {
+        // Skip pure comment lines when accumulator is empty
+        let trimmed = line.trim();
+        if accumulator.is_empty() && (trimmed.is_empty() || trimmed.starts_with(';')) {
             continue;
         }
         
-        // Each line should be a complete EDN map
-        match parse_edn_rule_line(line, line_num) {
-            Ok(rule) => rules.push(rule),
-            Err(e) => {
-                warn!("Line {}: Failed to parse rule: {} - Line: {}", line_num, e, line);
-                skipped += 1;
+        // Add line to accumulator
+        accumulator.push_str(&line);
+        accumulator.push('\n');
+        
+        // Try to parse - if it works, we have a complete expression
+        match accumulator.trim().parse::<Edn>() {
+            Ok(edn) => {
+                // Got a complete EDN expression!
+                match parse_edn_rule(&edn) {
+                    Ok(rule) => rules.push(rule),
+                    Err(e) => {
+                        warn!("Line {}: Failed to parse rule: {}", line_count, e);
+                        skipped += 1;
+                    }
+                }
+                accumulator.clear();
+            }
+            Err(_) => {
+                // Not complete yet, keep accumulating
+                // Safety check: don't let accumulator grow unbounded
+                if accumulator.len() > 100_000 {
+                    warn!("Line {}: Rule exceeded 100KB, skipping", line_count);
+                    accumulator.clear();
+                    skipped += 1;
+                }
             }
         }
+    }
+    
+    // Check for incomplete expression at EOF
+    if !accumulator.trim().is_empty() {
+        warn!("EOF: Incomplete expression: {}", accumulator.trim());
+        skipped += 1;
     }
     
     if skipped > 0 {
@@ -922,10 +954,8 @@ fn parse_rules_file(path: &std::path::Path) -> Result<Vec<RuleSpec>> {
     Ok(rules)
 }
 
-/// Parse a single EDN rule line
-fn parse_edn_rule_line(line: &str, line_num: usize) -> Result<RuleSpec> {
-    let edn: Edn = line.parse()
-        .map_err(|e| anyhow::anyhow!("Failed to parse EDN on line {}: {:?}", line_num, e))?;
+/// Parse a single EDN rule
+fn parse_edn_rule(edn: &Edn) -> Result<RuleSpec> {
     
     // Extract map fields
     let constraints_edn = edn.get(":constraints")

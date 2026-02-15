@@ -115,16 +115,23 @@ Rules use EDN (Extensible Data Notation) format with s-expression predicates:
  :priority    200}
 ```
 
-**File Format:** One rule per line (streaming-friendly, handles 1M+ rules):
+**File Format:** Rules can span multiple lines for readability:
 ```edn
+;; Single-line (compact)
 {:constraints [(= proto 17) (= src-port 53)] :actions [(rate-limit 500)] :priority 200}
+
+;; Multi-line (readable)
+{:constraints [(= proto 17)
+               (= src-port 53)]
+ :actions [(rate-limit 500)]
+ :priority 200}
 ```
 
 **Fields:** `proto`, `src-addr`, `dst-addr`, `src-port`, `dst-port`, `tcp-flags`, `ttl`, `df`, `tcp-window`
 
 **Actions:** `(drop)`, `(pass)`, `(rate-limit <pps>)`, `(rate-limit <pps> :name "label")`, `(count :name "label")`
 
-See [docs/EDN-RULES.md](docs/EDN-RULES.md) for the complete EDN format reference.  
+See [docs/EDN-RULES.md](docs/EDN-RULES.md) for the complete EDN format reference.
 See [docs/RULES.md](docs/RULES.md) for the legacy s-expression format and language theory.
 
 ## Documentation
