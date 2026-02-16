@@ -747,8 +747,8 @@ impl FieldTracker {
 // =============================================================================
 
 const PAYLOAD_WINDOW_SIZE: usize = 64;
-const MAX_PAYLOAD_BYTES: usize = 512;
-const NUM_PAYLOAD_WINDOWS: usize = MAX_PAYLOAD_BYTES / PAYLOAD_WINDOW_SIZE; // 8
+const MAX_PAYLOAD_BYTES: usize = veth_filter::SAMPLE_DATA_SIZE; // 2048 — full XDP capture
+const NUM_PAYLOAD_WINDOWS: usize = MAX_PAYLOAD_BYTES / PAYLOAD_WINDOW_SIZE; // 32
 
 /// Per-destination payload anomaly tracking state.
 struct DstPayloadState {

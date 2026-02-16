@@ -15,7 +15,7 @@ https://github.com/user-attachments/assets/aad82715-3460-4036-8b48-de0e8e79c6c8
 
 During warmup (configurable, typically 15 seconds), the `PayloadTracker` observes legitimate traffic and builds a VSA baseline:
 
-1. Each packet's L4 payload is truncated to 512 bytes and sliced into **8 windows of 64 bytes** each
+1. Each packet's L4 payload (up to 2048 bytes captured by XDP) is sliced into **32 windows of 64 bytes** each
 2. Each window is encoded as a VSA vector using walkable encoding: byte positions (`p0`..`p63`) bound with hex values (`0xde`, `0x41`, etc.)
 3. Vectors are accumulated across all warmup packets into per-window accumulators
 4. On freeze: accumulators are normalized into **bipolar baseline vectors** (one per window)
@@ -108,8 +108,8 @@ Generated rules use the `l4-match` predicate with sparse byte masks:
 | Constant | Value | Purpose |
 |----------|-------|---------|
 | `PAYLOAD_WINDOW_SIZE` | 64 bytes | VSA encoding window granularity |
-| `MAX_PAYLOAD_BYTES` | 512 bytes | Maximum L4 payload analyzed per packet |
-| `NUM_PAYLOAD_WINDOWS` | 8 | Windows per payload (512 / 64) |
+| `MAX_PAYLOAD_BYTES` | 2048 bytes | Full XDP capture size (`SAMPLE_DATA_SIZE`) |
+| `NUM_PAYLOAD_WINDOWS` | 32 | Windows per payload (2048 / 64) |
 | `MAX_PAYLOAD_RULES_TOTAL` | 64 | Global budget across all destinations |
 
 ## Test Scenario
