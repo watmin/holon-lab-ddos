@@ -130,47 +130,52 @@ async fn run_stats_loop(filter: &VethFilter, interval: u64) -> Result<()> {
 }
 
 async fn run_watch_loop(filter: &VethFilter, max: usize) -> Result<()> {
-    use aya::util::online_cpus;
-    use bytes::BytesMut;
+    use tokio::io::unix::AsyncFd;
     use tokio::sync::mpsc;
 
     println!("Watching packet samples (Ctrl+C to stop)...");
     println!();
     
-    let mut perf_array = filter.take_perf_array().await?;
+    let ring_buf = filter.take_ring_buf().await?;
     
-    // Channel to receive samples from all CPUs
+    // Channel to receive samples
     let (tx, mut rx) = mpsc::channel::<PacketSample>(1000);
 
-    // Spawn a task for each CPU
-    let cpus = online_cpus().map_err(|(msg, e)| anyhow::anyhow!("{}: {}", msg, e))?;
-    
-    for cpu_id in cpus {
-        let mut buf = perf_array.open(cpu_id, None)?;
+    // Single task to drain the ring buffer using AsyncFd polling
+    {
         let tx = tx.clone();
-
         tokio::spawn(async move {
-            let mut buffers = (0..16)
-                .map(|_| BytesMut::with_capacity(4096))
-                .collect::<Vec<_>>();
+            // AsyncFd owns the RingBuf; we access it via the guard
+            let mut async_fd = match AsyncFd::new(ring_buf) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    eprintln!("Failed to create AsyncFd for ring buffer: {}", e);
+                    return;
+                }
+            };
 
             loop {
-                let events = match buf.read_events(&mut buffers).await {
-                    Ok(events) => events,
-                    Err(_) => continue,
+                let mut guard = match async_fd.readable_mut().await {
+                    Ok(g) => g,
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        continue;
+                    }
                 };
 
-                for i in 0..events.read {
-                    let event_buf = &buffers[i];
-                    if event_buf.len() >= std::mem::size_of::<PacketSample>() {
+                let ring_buf = guard.get_inner_mut();
+                while let Some(item) = ring_buf.next() {
+                    if item.len() >= std::mem::size_of::<PacketSample>() {
                         let sample = unsafe {
-                            std::ptr::read_unaligned(event_buf.as_ptr() as *const PacketSample)
+                            std::ptr::read_unaligned(item.as_ptr() as *const PacketSample)
                         };
                         if tx.send(sample).await.is_err() {
                             return;
                         }
                     }
                 }
+
+                guard.clear_ready();
             }
         });
     }

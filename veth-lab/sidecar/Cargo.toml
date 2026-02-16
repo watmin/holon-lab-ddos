@@ -13,7 +13,6 @@ holon = { path = "../../../holon-rs" }
 # Async runtime
 tokio = { workspace = true }
 anyhow = { workspace = true }
-bytes = "1"
 aya = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

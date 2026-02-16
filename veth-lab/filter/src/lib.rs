@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use aya::{
     include_bytes_aligned,
-    maps::{MapData, PerCpuArray, PerCpuValues, AsyncPerfEventArray, ProgramArray},
+    maps::{MapData, PerCpuArray, PerCpuValues, ProgramArray, RingBuf},
     programs::{Xdp, XdpFlags},
     Ebpf,
 };
@@ -1153,7 +1153,7 @@ impl RuleSpec {
 // Packet Sample + Walkable (unchanged)
 // =============================================================================
 
-pub const SAMPLE_DATA_SIZE: usize = 128;
+pub const SAMPLE_DATA_SIZE: usize = 2048;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -1490,10 +1490,10 @@ impl VethFilter {
         Ok(())
     }
 
-    pub async fn take_perf_array(&self) -> Result<AsyncPerfEventArray<MapData>> {
+    pub async fn take_ring_buf(&self) -> Result<RingBuf<MapData>> {
         let mut bpf = self.bpf.write().await;
-        let samples = bpf.take_map("SAMPLES").context("SAMPLES not found")?;
-        AsyncPerfEventArray::try_from(samples).context("Failed to create perf array")
+        let samples = bpf.take_map("SAMPLE_RING").context("SAMPLE_RING not found")?;
+        RingBuf::try_from(samples).context("Failed to create ring buffer")
     }
 
     pub fn bpf(&self) -> Arc<RwLock<Ebpf>> { self.bpf.clone() }

@@ -85,11 +85,6 @@ struct Args {
     #[arg(long, default_value = "100")]
     sample_rate: u32,
 
-    /// Perf buffer pages per CPU (smaller = less buffering, samples dropped when full)
-    /// Default 4 pages = 16KB per CPU, fills/drops fast under load
-    #[arg(long, default_value = "4")]
-    perf_pages: usize,
-
     /// Enable rate limiting instead of binary DROP (experimental)
     #[arg(long)]
     rate_limit: bool,
@@ -1573,7 +1568,7 @@ async fn main() -> Result<()> {
     info!("  Dimensions: {}", args.dimensions);
     info!("  Warmup: {} windows / {} packets", args.warmup_windows, args.warmup_packets);
     info!("  Sample rate: 1 in {} packets", args.sample_rate);
-    info!("  Perf buffer: {} pages/CPU ({}KB)", args.perf_pages, args.perf_pages * 4);
+    info!("  Sample transport: BPF RingBuf (4MB shared, overflow-drop)");
     info!("  Log file: {:?}", log_path);
     info!("");
     info!("Enhanced features enabled:");
@@ -1600,49 +1595,59 @@ async fn main() -> Result<()> {
     // Create enhanced field tracker
     let tracker = Arc::new(RwLock::new(FieldTracker::new(holon.clone())));
 
-    // Take perf array for sample reading
-    let mut perf_array = filter.take_perf_array().await?;
+    // Take ring buffer for sample reading (single shared buffer across all CPUs)
+    let ring_buf = filter.take_ring_buf().await?;
+    info!("Ring buffer opened (single shared buffer, overflow-drop)");
 
-    // Channel for samples from all CPUs
+    // Channel for samples
     let (sample_tx, mut sample_rx) = tokio::sync::mpsc::channel::<PacketSample>(1000);
 
-    // Spawn a task for each CPU to read from perf buffer
-    let cpus = aya::util::online_cpus().map_err(|(msg, e)| anyhow::anyhow!("{}: {}", msg, e))?;
-    info!("Starting perf readers on {} CPUs ({} pages/CPU)", cpus.len(), args.perf_pages);
+    // Spawn a single task to drain the ring buffer using AsyncFd polling
+    {
+        use tokio::io::unix::AsyncFd;
 
-    for cpu_id in cpus {
-        let mut buf = perf_array
-            .open(cpu_id, Some(args.perf_pages))
-            .context(format!("Failed to open perf buffer for CPU {}", cpu_id))?;
         let tx = sample_tx.clone();
 
         tokio::spawn(async move {
-            use bytes::BytesMut;
-            let mut buffers = (0..16)
-                .map(|_| BytesMut::with_capacity(4096))
-                .collect::<Vec<_>>();
+            // AsyncFd owns the RingBuf; we access it via the guard
+            let mut async_fd = match AsyncFd::new(ring_buf) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    error!("Failed to create AsyncFd for ring buffer: {}", e);
+                    return;
+                }
+            };
 
             loop {
-                let events = match buf.read_events(&mut buffers).await {
-                    Ok(events) => events,
-                    Err(_) => continue,
+                // Wait for data availability (epoll on the ring buffer fd)
+                let mut guard = match async_fd.readable_mut().await {
+                    Ok(g) => g,
+                    Err(e) => {
+                        error!("AsyncFd readable error: {}", e);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
                 };
 
-                for i in 0..events.read {
-                    let event_buf = &buffers[i];
-                    if event_buf.len() >= std::mem::size_of::<PacketSample>() {
+                // Drain all available items from the shared ring buffer
+                let ring_buf = guard.get_inner_mut();
+                while let Some(item) = ring_buf.next() {
+                    if item.len() >= std::mem::size_of::<PacketSample>() {
                         let sample = unsafe {
-                            std::ptr::read_unaligned(event_buf.as_ptr() as *const PacketSample)
+                            std::ptr::read_unaligned(item.as_ptr() as *const PacketSample)
                         };
                         match tx.try_send(sample) {
                             Ok(_) => {},
                             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                // Channel full - drop sample
+                                // Channel full - drop sample (back-pressure)
                             }
                         }
                     }
                 }
+
+                // Clear readiness so epoll re-arms for next notification
+                guard.clear_ready();
             }
         });
     }

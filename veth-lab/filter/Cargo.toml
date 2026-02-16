@@ -14,9 +14,6 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# For ring buffer polling
-bytes = "1"
-
 # Holon for Walkable trait implementation
 holon = { path = "../../../holon-rs" }
 

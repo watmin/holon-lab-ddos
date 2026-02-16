@@ -22,7 +22,7 @@ use aya_ebpf::{
     bindings::xdp_action,
     helpers::bpf_ktime_get_ns,
     macros::{map, xdp},
-    maps::{Array, HashMap, PerCpuArray, PerfEventArray, ProgramArray},
+    maps::{Array, HashMap, PerCpuArray, ProgramArray, RingBuf},
     programs::XdpContext,
 };
 
@@ -148,9 +148,17 @@ static STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
 #[map]
 static CONFIG: PerCpuArray<u32> = PerCpuArray::with_max_entries(4, 0);
 
-/// Perf event array for packet samples
+/// Ring buffer for full-packet samples (4 MB, shared across all CPUs).
+/// Overflow: output() returns Err and the sample is silently dropped.
 #[map]
-static SAMPLES: PerfEventArray<PacketSample> = PerfEventArray::new(0);
+static SAMPLE_RING: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+
+/// Per-CPU scratch space for building PacketSample before submitting to ring buffer.
+/// PacketSample is ~1556 bytes — too large for BPF's 512-byte stack.
+/// We write header fields + use bpf_xdp_load_bytes to copy packet data here,
+/// then output() the whole thing to SAMPLE_RING in one call.
+#[map]
+static SAMPLE_SCRATCH: PerCpuArray<PacketSample> = PerCpuArray::with_max_entries(1, 0);
 
 // =============================================================================
 // Tree Rete Engine Maps (blue/green double-buffered)
@@ -272,7 +280,11 @@ static TREE_WALK_PROG: ProgramArray = ProgramArray::with_max_entries(1, 0);
 // Packet Sample Structure
 // =============================================================================
 
-const SAMPLE_DATA_SIZE: usize = 128;
+/// 2048 bytes: rounded up from 1514 (max ethernet frame) to the next power-of-2.
+/// This allows using `& 0x7FF` (max 2047) as a verifier-friendly bound check
+/// for bpf_xdp_load_bytes — the verifier requires the copy length to be provably
+/// within the destination buffer via mask or explicit comparison.
+const SAMPLE_DATA_SIZE: usize = 2048;
 
 #[repr(C)]
 pub struct PacketSample {
@@ -543,23 +555,70 @@ fn pass_packet() -> Result<u32, ()> {
 fn sample_packet(
     ctx: &XdpContext, pkt_len: u32, src_ip: u32, dst_ip: u32,
     src_port: u16, dst_port: u16, protocol: u8,
-    matched: bool, action: u8, data: usize, data_end: usize,
+    matched: bool, action: u8, _data: usize, _data_end: usize,
     tcp_flags: u8, ttl: u8, df_bit: u8, tcp_window: u16,
     ip_id: u16, ip_len: u16, dscp: u8, ecn: u8, mf_bit: u8, frag_offset: u16,
 ) {
+    // Use per-CPU scratch space (PacketSample is ~1556 bytes, too large for
+    // BPF's 512-byte stack). We write into the scratch array, then output()
+    // the whole thing to the ring buffer in one BPF helper call.
+    let Some(scratch) = SAMPLE_SCRATCH.get_ptr_mut(0) else { return; };
+    let s = unsafe { &mut *scratch };
+
     let cap_len = if pkt_len as usize > SAMPLE_DATA_SIZE { SAMPLE_DATA_SIZE } else { pkt_len as usize };
-    let mut sample = PacketSample {
-        pkt_len, cap_len: cap_len as u32, src_ip, dst_ip, src_port, dst_port,
-        protocol, matched_rule: if matched { 1 } else { 0 }, action_taken: action,
-        tcp_flags, ttl, df_bit, tcp_window,
-        ip_id, ip_len, dscp, ecn, mf_bit, _pad_fp: 0, frag_offset, _pad_fp2: 0,
-        data: [0u8; SAMPLE_DATA_SIZE],
-    };
-    let src = data as *const u8;
-    for i in 0..SAMPLE_DATA_SIZE {
-        if data + i < data_end { sample.data[i] = unsafe { *src.add(i) }; } else { break; }
+
+    // Write metadata header fields into scratch space
+    s.pkt_len = pkt_len;
+    s.cap_len = cap_len as u32;
+    s.src_ip = src_ip;
+    s.dst_ip = dst_ip;
+    s.src_port = src_port;
+    s.dst_port = dst_port;
+    s.protocol = protocol;
+    s.matched_rule = if matched { 1 } else { 0 };
+    s.action_taken = action;
+    s.tcp_flags = tcp_flags;
+    s.ttl = ttl;
+    s.df_bit = df_bit;
+    s.tcp_window = tcp_window;
+    s.ip_id = ip_id;
+    s.ip_len = ip_len;
+    s.dscp = dscp;
+    s.ecn = ecn;
+    s.mf_bit = mf_bit;
+    s._pad_fp = 0;
+    s.frag_offset = frag_offset;
+    s._pad_fp2 = 0;
+
+    // Copy packet data using bpf_xdp_load_bytes — single BPF helper call.
+    // This avoids the per-byte verifier state explosion that caused the
+    // "BPF program is too large" error with a 1514-iteration copy loop.
+    //
+    // BPF verifier dance:
+    //   1. volatile read — prevents LLVM from proving the range at compile time
+    //      (it inlines sample_packet and would otherwise remove all checks)
+    //   2. & 0x7FF mask — the verifier accepts this idiom to bound a scalar;
+    //      max value is 2047, which fits in s.data[2048]
+    //   3. > 0 check — bpf_xdp_load_bytes rejects zero-sized reads
+    let copy_len = unsafe { core::ptr::read_volatile(&s.cap_len) } & 0x7FF;
+    if copy_len > 0 {
+        let ret = unsafe {
+            aya_ebpf_bindings::helpers::bpf_xdp_load_bytes(
+                ctx.ctx as *mut _,
+                0, // offset from start of packet (Ethernet header)
+                s.data.as_mut_ptr() as *mut _,
+                copy_len,
+            )
+        };
+        if ret < 0 {
+            // Copy failed — submit sample with cap_len=0 (header only)
+            s.cap_len = 0;
+        }
     }
-    let _ = SAMPLES.output(ctx, &sample, 0);
+
+    // Submit to ring buffer. output() allocates + copies in one helper call.
+    // Returns Err when ring buffer is full (overflow drop — silent).
+    let _ = SAMPLE_RING.output(s, 0);
     if let Some(sampled) = STATS.get_ptr_mut(4) { unsafe { *sampled += 1; } }
 }
 
