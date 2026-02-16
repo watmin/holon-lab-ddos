@@ -475,6 +475,10 @@ pub struct TokenBucket {
     pub rate_pps: u32,
     pub tokens: u32,
     pub last_update_ns: u64,
+    /// Fractional token accumulator in "nano-token" units (rate_pps * ns).
+    /// Rolls over at NS_PER_SEC, producing one whole token per rollover.
+    /// This preserves sub-token remainders without runtime division.
+    pub credit: u64,
     pub allowed_count: u64,
     pub dropped_count: u64,
 }

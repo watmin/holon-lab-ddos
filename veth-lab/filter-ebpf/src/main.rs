@@ -51,6 +51,10 @@ pub struct TokenBucket {
     pub rate_pps: u32,
     pub tokens: u32,
     pub last_update_ns: u64,
+    /// Fractional token accumulator in "nano-token" units (rate_pps * ns).
+    /// Rolls over at NS_PER_SEC, producing one whole token per rollover.
+    /// This preserves sub-token remainders without runtime division.
+    pub credit: u64,
     pub allowed_count: u64,
     pub dropped_count: u64,
 }
@@ -320,8 +324,7 @@ pub struct PacketSample {
 const ETH_HDR_LEN: usize = 14;
 const IP_HDR_MIN_LEN: usize = 20;
 const ETH_P_IP: u16 = 0x0800;
-const MS_PER_SEC: u64 = 1000;
-const NS_PER_MS: u64 = 1_000_000;
+const NS_PER_SEC: u64 = 1_000_000_000;
 
 // =============================================================================
 // XDP Program
@@ -767,6 +770,18 @@ fn extract_custom_dim_from_packet(
 }
 
 /// Token bucket rate limiting for tree rules (keyed by stable rule_id).
+///
+/// Uses a credit accumulator for exact nanosecond-precision refill with
+/// zero remainder loss and no runtime division (BPF codegen safe).
+///
+/// Each nanosecond of elapsed time adds `rate_pps` to the credit counter
+/// (units: "nano-tokens"). When credit reaches NS_PER_SEC (1 billion),
+/// one whole token is produced. The remainder stays in credit for the
+/// next packet, preserving sub-token fractions exactly.
+///
+/// All arithmetic uses only multiplication and constant division
+/// (/ NS_PER_SEC), which the LLVM BPF backend compiles to
+/// multiply-by-reciprocal — no runtime div instructions.
 #[inline(always)]
 fn apply_tree_token_bucket(rule_id: u32) -> bool {
     match TREE_RATE_STATE.get_ptr_mut(&rule_id) {
@@ -777,17 +792,28 @@ fn apply_tree_token_bucket(rule_id: u32) -> bool {
                 bucket.last_update_ns = now;
                 bucket.tokens = bucket.rate_pps;
             }
+
             let elapsed_ns = now.saturating_sub(bucket.last_update_ns);
-            let elapsed_ms = elapsed_ns / NS_PER_MS;
-            if elapsed_ms > 0 && bucket.rate_pps > 0 {
-                let tokens_to_add = ((elapsed_ms * bucket.rate_pps as u64) / MS_PER_SEC) as u32;
+            bucket.last_update_ns = now;
+
+            if bucket.rate_pps > 0 && elapsed_ns > 0 {
+                // Cap elapsed to 2s to prevent u64 overflow on the multiply.
+                // (2e9 * u32::MAX = 8.6e18 < u64::MAX = 1.8e19)
+                let capped = if elapsed_ns > 2 * NS_PER_SEC { 2 * NS_PER_SEC } else { elapsed_ns };
+
+                // Accumulate "nano-tokens": each ns earns rate_pps credit.
+                bucket.credit += capped * bucket.rate_pps as u64;
+
+                // Convert whole tokens: divide by constant NS_PER_SEC.
+                let tokens_to_add = (bucket.credit / NS_PER_SEC) as u32;
                 if tokens_to_add > 0 {
+                    // Subtract consumed credit, preserving the fractional remainder.
+                    bucket.credit -= tokens_to_add as u64 * NS_PER_SEC;
                     let new_tokens = bucket.tokens.saturating_add(tokens_to_add);
                     bucket.tokens = if new_tokens > bucket.rate_pps { bucket.rate_pps } else { new_tokens };
-                    bucket.last_update_ns = now;
                 }
             }
-            
+
             // Token check and enforcement stats
             if bucket.tokens > 0 {
                 bucket.tokens -= 1;

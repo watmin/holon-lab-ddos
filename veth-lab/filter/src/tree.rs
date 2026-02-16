@@ -537,8 +537,24 @@ fn compile_recursive_dynamic(rules: &[RuleSpec], dim_idx: usize, dim_order: &[Fi
         range_groups.entry(edge.clone()).or_default().push(rule);
     }
     for (edge, range_rules) in &range_groups {
-        let owned: Vec<RuleSpec> = range_rules.iter().map(|r| (*r).clone()).collect();
-        let child = compile_recursive_dynamic(&owned, dim_idx + 1, dim_order);
+        // Remove the matched range predicate from each rule so it isn't
+        // re-evaluated, then recurse at the SAME dim_idx.  If the rule has
+        // a second range predicate on this dimension (e.g. >= AND <=), the
+        // next iteration will find it and create a chained guard — giving
+        // correct AND semantics.  When no more constraints remain on this
+        // dimension the rule falls to the wildcard bucket which advances
+        // to dim_idx + 1.
+        let owned: Vec<RuleSpec> = range_rules.iter().map(|r| {
+            let mut r = (*r).clone();
+            // Remove the specific predicate that produced this edge
+            if let Some(pos) = r.constraints.iter().position(|p| {
+                p.as_guard_on_dim(dim) == Some((edge.op, edge.value))
+            }) {
+                r.constraints.remove(pos);
+            }
+            r
+        }).collect();
+        let child = compile_recursive_dynamic(&owned, dim_idx, dim_order);
         node.range_children.push((edge.clone(), child));
     }
 
@@ -774,6 +790,7 @@ fn flatten_recursive(
                     rate_pps: a.rate_pps,
                     tokens: a.rate_pps,
                     last_update_ns: 0,
+                    credit: 0,
                     allowed_count: 0,
                     dropped_count: 0,
                 }));
@@ -955,6 +972,7 @@ impl TreeManager {
                             rate_pps: bucket.rate_pps,
                             tokens: existing.tokens,
                             last_update_ns: existing.last_update_ns,
+                            credit: existing.credit,
                             allowed_count: existing.allowed_count,
                             dropped_count: existing.dropped_count,
                         };
@@ -3873,6 +3891,110 @@ mod tests {
         assert!(matched);
         assert_eq!(action, crate::ACT_DROP, "MF=1 drop should win over ECN rate-limit");
         assert_eq!(prio, 200);
+    }
+
+    #[test]
+    fn test_compound_range_and_semantics() {
+        // Regression: compound range predicates on the same dimension must
+        // chain as AND, not OR.
+        //
+        // Rule A: (= proto 17) (= ttl 64) (>= ip-id 1000) (<= ip-id 2000)
+        //         → rate-limit, priority 180
+        // Rule B: (= proto 17) → pass, priority 10 (wildcard baseline)
+        //
+        // Packet with ip-id=1500: matches A (in range) → rate-limit
+        // Packet with ip-id=500:  OUTSIDE range → only B matches → pass
+        // Packet with ip-id=3000: OUTSIDE range → only B matches → pass
+        let rules = vec![
+            RuleSpec::compound(
+                vec![
+                    Predicate::eq(FieldDim::Proto, 17),
+                    Predicate::eq(FieldDim::Ttl, 64),
+                    Predicate::Gte(crate::FieldRef::Dim(FieldDim::IpId), 1000),
+                    Predicate::Lte(crate::FieldRef::Dim(FieldDim::IpId), 2000),
+                ],
+                RuleAction::RateLimit { pps: 1000, name: None },
+            ).with_priority(180),
+            RuleSpec::compound(
+                vec![Predicate::eq(FieldDim::Proto, 17)],
+                RuleAction::pass(),
+            ).with_priority(10),
+        ];
+
+        let tree = compile_tree(&rules);
+        let flat = flatten_tree(&tree, 1);
+
+        // ip-id=1500: inside [1000, 2000] → rate-limit (A wins, prio 180)
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 64), (FieldDim::IpId, 1500)],
+        );
+        assert!(matched, "ip-id 1500 should match");
+        assert_eq!(action, ACT_RATE_LIMIT, "ip-id 1500 in [1000,2000] → rate-limit");
+        assert_eq!(prio, 180);
+
+        // ip-id=1000: boundary (inclusive) → rate-limit
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 64), (FieldDim::IpId, 1000)],
+        );
+        assert!(matched, "ip-id 1000 should match (>= boundary)");
+        assert_eq!(action, ACT_RATE_LIMIT);
+        assert_eq!(prio, 180);
+
+        // ip-id=2000: boundary (inclusive) → rate-limit
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 64), (FieldDim::IpId, 2000)],
+        );
+        assert!(matched, "ip-id 2000 should match (<= boundary)");
+        assert_eq!(action, ACT_RATE_LIMIT);
+        assert_eq!(prio, 180);
+
+        // ip-id=500: BELOW range → should NOT match A, only B (pass)
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 64), (FieldDim::IpId, 500)],
+        );
+        assert!(matched, "ip-id 500 should match baseline");
+        assert_eq!(action, crate::ACT_PASS, "ip-id 500 below range → pass (baseline)");
+        assert_eq!(prio, 10);
+
+        // ip-id=3000: ABOVE range → should NOT match A, only B (pass)
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 64), (FieldDim::IpId, 3000)],
+        );
+        assert!(matched, "ip-id 3000 should match baseline");
+        assert_eq!(action, crate::ACT_PASS, "ip-id 3000 above range → pass (baseline)");
+        assert_eq!(prio, 10);
+
+        // ip-id=999: just below range → pass
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 64), (FieldDim::IpId, 999)],
+        );
+        assert!(matched, "ip-id 999 should match baseline");
+        assert_eq!(action, crate::ACT_PASS, "ip-id 999 just below → pass");
+        assert_eq!(prio, 10);
+
+        // ip-id=2001: just above range → pass
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 64), (FieldDim::IpId, 2001)],
+        );
+        assert!(matched, "ip-id 2001 should match baseline");
+        assert_eq!(action, crate::ACT_PASS, "ip-id 2001 just above → pass");
+        assert_eq!(prio, 10);
+
+        // Different TTL (128, Windows): should NOT match A regardless of ip-id
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 128), (FieldDim::IpId, 1500)],
+        );
+        assert!(matched, "TTL=128 should match baseline");
+        assert_eq!(action, crate::ACT_PASS, "TTL=128 → baseline pass");
+        assert_eq!(prio, 10);
     }
 
     #[test]
