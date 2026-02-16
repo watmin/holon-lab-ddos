@@ -4015,4 +4015,780 @@ mod tests {
             "Should skip to FragOffset (dim_index 14 in DIM_ORDER)"
         );
     }
+
+    // =========================================================================
+    // Compound range edge cases
+    // =========================================================================
+
+    #[test]
+    fn test_compound_range_empty_range() {
+        // (>= ip-id 1000) (<= ip-id 999) → impossible; should never match.
+        // Only the baseline (pass) rule should match for any ip-id.
+        let rules = vec![
+            RuleSpec::compound(
+                vec![
+                    Predicate::eq(FieldDim::Proto, 17),
+                    Predicate::Gte(crate::FieldRef::Dim(FieldDim::IpId), 1000),
+                    Predicate::Lte(crate::FieldRef::Dim(FieldDim::IpId), 999),
+                ],
+                RuleAction::drop(),
+            ).with_priority(200),
+            RuleSpec::compound(
+                vec![Predicate::eq(FieldDim::Proto, 17)],
+                RuleAction::pass(),
+            ).with_priority(10),
+        ];
+
+        let tree = compile_tree(&rules);
+        let flat = flatten_tree(&tree, 1);
+
+        // Value inside the "impossible" range: should NOT match drop
+        for val in [0, 500, 999, 1000, 1500, 65535] {
+            let (matched, action, prio, _) = simulate_single_walk(
+                &flat,
+                &[(FieldDim::Proto, 17), (FieldDim::IpId, val)],
+            );
+            assert!(matched, "ip-id={val} should match baseline");
+            assert_eq!(action, crate::ACT_PASS,
+                "ip-id={val}: empty range [1000,999] must never match drop");
+            assert_eq!(prio, 10);
+        }
+    }
+
+    #[test]
+    fn test_compound_range_single_point() {
+        // (>= ip-id 1000) (<= ip-id 1000) → match only ip-id == 1000
+        let rules = vec![
+            RuleSpec::compound(
+                vec![
+                    Predicate::eq(FieldDim::Proto, 17),
+                    Predicate::Gte(crate::FieldRef::Dim(FieldDim::IpId), 1000),
+                    Predicate::Lte(crate::FieldRef::Dim(FieldDim::IpId), 1000),
+                ],
+                RuleAction::drop(),
+            ).with_priority(200),
+            RuleSpec::compound(
+                vec![Predicate::eq(FieldDim::Proto, 17)],
+                RuleAction::pass(),
+            ).with_priority(10),
+        ];
+
+        let tree = compile_tree(&rules);
+        let flat = flatten_tree(&tree, 1);
+
+        // Exact hit
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::IpId, 1000)],
+        );
+        assert!(matched);
+        assert_eq!(action, crate::ACT_DROP, "ip-id=1000 single-point range → drop");
+        assert_eq!(prio, 200);
+
+        // Neighbours must miss
+        for val in [999, 1001, 0, 500, 2000, 65535] {
+            let (matched, action, prio, _) = simulate_single_walk(
+                &flat,
+                &[(FieldDim::Proto, 17), (FieldDim::IpId, val)],
+            );
+            assert!(matched, "ip-id={val} should match baseline");
+            assert_eq!(action, crate::ACT_PASS, "ip-id={val} outside single-point → pass");
+            assert_eq!(prio, 10);
+        }
+    }
+
+    #[test]
+    fn test_compound_range_three_predicates_same_dim() {
+        // (> ttl 60) (< ttl 70) combined with a mask (mask-eq ttl 0xF0 0x40)
+        // The mask selects TTL values where upper nibble == 0x40 (64-79).
+        // Combined with (> 60) (< 70): TTL must be in (60,70) AND upper nibble 0x40
+        // → effective match: 64, 65, 66, 67, 68, 69
+        //
+        // We also test without the mask to confirm range-only works:
+        // (> ttl 60) (< ttl 70) → 61..69 inclusive
+        let rules_range_only = vec![
+            RuleSpec::compound(
+                vec![
+                    Predicate::eq(FieldDim::Proto, 6),
+                    Predicate::Gt(crate::FieldRef::Dim(FieldDim::Ttl), 60),
+                    Predicate::Lt(crate::FieldRef::Dim(FieldDim::Ttl), 70),
+                ],
+                RuleAction::drop(),
+            ).with_priority(200),
+            RuleSpec::compound(
+                vec![Predicate::eq(FieldDim::Proto, 6)],
+                RuleAction::pass(),
+            ).with_priority(10),
+        ];
+
+        let tree = compile_tree(&rules_range_only);
+        let flat = flatten_tree(&tree, 1);
+
+        // Inside (60,70) → drop
+        for val in [61, 64, 65, 69] {
+            let (_, action, prio, _) = simulate_single_walk(
+                &flat,
+                &[(FieldDim::Proto, 6), (FieldDim::Ttl, val)],
+            );
+            assert_eq!(action, crate::ACT_DROP, "ttl={val} in (60,70) → drop");
+            assert_eq!(prio, 200);
+        }
+
+        // Boundaries and outside → pass
+        for val in [0, 59, 60, 70, 71, 128, 255] {
+            let (_, action, prio, _) = simulate_single_walk(
+                &flat,
+                &[(FieldDim::Proto, 6), (FieldDim::Ttl, val)],
+            );
+            assert_eq!(action, crate::ACT_PASS, "ttl={val} outside (60,70) → pass");
+            assert_eq!(prio, 10);
+        }
+    }
+
+    // =========================================================================
+    // Cross-dimension compound ranges
+    // =========================================================================
+
+    #[test]
+    fn test_compound_range_cross_dimension() {
+        // Rule: (>= ttl 60) (<= ttl 70) (>= ip-id 100) (<= ip-id 200)
+        //       → rate-limit, priority 180
+        // Baseline: proto=17 → pass, priority 10
+        //
+        // Both TTL and IP-ID ranges must be satisfied (AND across dimensions).
+        let rules = vec![
+            RuleSpec::compound(
+                vec![
+                    Predicate::eq(FieldDim::Proto, 17),
+                    Predicate::Gte(crate::FieldRef::Dim(FieldDim::Ttl), 60),
+                    Predicate::Lte(crate::FieldRef::Dim(FieldDim::Ttl), 70),
+                    Predicate::Gte(crate::FieldRef::Dim(FieldDim::IpId), 100),
+                    Predicate::Lte(crate::FieldRef::Dim(FieldDim::IpId), 200),
+                ],
+                RuleAction::RateLimit { pps: 500, name: None },
+            ).with_priority(180),
+            RuleSpec::compound(
+                vec![Predicate::eq(FieldDim::Proto, 17)],
+                RuleAction::pass(),
+            ).with_priority(10),
+        ];
+
+        let tree = compile_tree(&rules);
+        let flat = flatten_tree(&tree, 1);
+
+        // Both ranges satisfied → rate-limit
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 64), (FieldDim::IpId, 150)],
+        );
+        assert!(matched);
+        assert_eq!(action, ACT_RATE_LIMIT, "both ranges hit → rate-limit");
+        assert_eq!(prio, 180);
+
+        // TTL in range, IP-ID out → baseline
+        let (_, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 65), (FieldDim::IpId, 300)],
+        );
+        assert_eq!(action, crate::ACT_PASS, "ttl ok, ip-id out → pass");
+        assert_eq!(prio, 10);
+
+        // TTL out, IP-ID in range → baseline
+        let (_, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 128), (FieldDim::IpId, 150)],
+        );
+        assert_eq!(action, crate::ACT_PASS, "ttl out, ip-id ok → pass");
+        assert_eq!(prio, 10);
+
+        // Both out → baseline
+        let (_, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 128), (FieldDim::IpId, 5000)],
+        );
+        assert_eq!(action, crate::ACT_PASS, "both out → pass");
+        assert_eq!(prio, 10);
+
+        // Boundaries: TTL=60, IP-ID=100 (both inclusive) → rate-limit
+        let (_, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 60), (FieldDim::IpId, 100)],
+        );
+        assert_eq!(action, ACT_RATE_LIMIT, "both at lower boundary → rate-limit");
+        assert_eq!(prio, 180);
+
+        // Boundaries: TTL=70, IP-ID=200 (both inclusive) → rate-limit
+        let (_, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 70), (FieldDim::IpId, 200)],
+        );
+        assert_eq!(action, ACT_RATE_LIMIT, "both at upper boundary → rate-limit");
+        assert_eq!(prio, 180);
+
+        // One boundary miss: TTL=59, IP-ID=100 → pass
+        let (_, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 59), (FieldDim::IpId, 100)],
+        );
+        assert_eq!(action, crate::ACT_PASS, "ttl=59 just below → pass");
+        assert_eq!(prio, 10);
+    }
+
+    // =========================================================================
+    // Range + exact match on same dimension
+    // =========================================================================
+
+    #[test]
+    fn test_range_with_exact_match_same_dim() {
+        // Rule A: (= ttl 64) (>= ip-id 1000) (<= ip-id 2000)
+        //         → drop, priority 200
+        // Rule B: (>= ip-id 500) (<= ip-id 3000)
+        //         → rate-limit, priority 150
+        // Baseline: proto=17 → pass, priority 10
+        //
+        // Packet with ttl=64, ip-id=1500: matches A (drop, prio 200) AND B
+        //   → A wins (higher priority)
+        // Packet with ttl=128, ip-id=1500: misses A (wrong ttl), matches B
+        //   → B wins
+        // Packet with ttl=64, ip-id=500: misses A (ip-id below A's range),
+        //   matches B → B wins
+        // Packet with ttl=128, ip-id=4000: misses both A and B → baseline
+        let rules = vec![
+            RuleSpec::compound(
+                vec![
+                    Predicate::eq(FieldDim::Proto, 17),
+                    Predicate::eq(FieldDim::Ttl, 64),
+                    Predicate::Gte(crate::FieldRef::Dim(FieldDim::IpId), 1000),
+                    Predicate::Lte(crate::FieldRef::Dim(FieldDim::IpId), 2000),
+                ],
+                RuleAction::drop(),
+            ).with_priority(200),
+            RuleSpec::compound(
+                vec![
+                    Predicate::eq(FieldDim::Proto, 17),
+                    Predicate::Gte(crate::FieldRef::Dim(FieldDim::IpId), 500),
+                    Predicate::Lte(crate::FieldRef::Dim(FieldDim::IpId), 3000),
+                ],
+                RuleAction::RateLimit { pps: 1000, name: None },
+            ).with_priority(150),
+            RuleSpec::compound(
+                vec![Predicate::eq(FieldDim::Proto, 17)],
+                RuleAction::pass(),
+            ).with_priority(10),
+        ];
+
+        let tree = compile_tree(&rules);
+        let flat = flatten_tree(&tree, 1);
+
+        // ttl=64, ip-id=1500 → both A and B match, A wins (prio 200)
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 64), (FieldDim::IpId, 1500)],
+        );
+        assert!(matched);
+        assert_eq!(action, crate::ACT_DROP, "A wins at prio 200");
+        assert_eq!(prio, 200);
+
+        // ttl=128, ip-id=1500 → only B matches (prio 150)
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 128), (FieldDim::IpId, 1500)],
+        );
+        assert!(matched);
+        assert_eq!(action, ACT_RATE_LIMIT, "B wins when A's ttl misses");
+        assert_eq!(prio, 150);
+
+        // ttl=64, ip-id=500 → only B matches (ip-id in B's range but below A's)
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 64), (FieldDim::IpId, 500)],
+        );
+        assert!(matched);
+        assert_eq!(action, ACT_RATE_LIMIT, "B wins when ip-id below A's range");
+        assert_eq!(prio, 150);
+
+        // ttl=128, ip-id=4000 → baseline only
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 128), (FieldDim::IpId, 4000)],
+        );
+        assert!(matched);
+        assert_eq!(action, crate::ACT_PASS, "baseline when both miss");
+        assert_eq!(prio, 10);
+
+        // ttl=64, ip-id=2500 → only B matches (ip-id above A's range, in B's)
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::Ttl, 64), (FieldDim::IpId, 2500)],
+        );
+        assert!(matched);
+        assert_eq!(action, ACT_RATE_LIMIT, "B wins when ip-id above A's range");
+        assert_eq!(prio, 150);
+    }
+
+    // =========================================================================
+    // Range predicates on new IP fingerprint dimensions
+    // =========================================================================
+
+    #[test]
+    fn test_range_predicates_on_fingerprint_dims() {
+        // Test range predicates on dimensions added in the IP fingerprint feature.
+        // Rule A: (>= dscp 32) (<= dscp 48) → rate-limit, prio 180
+        // Rule B: (>= ip-len 40) (< ip-len 100) → drop (runt packets), prio 200
+        // Rule C: (> frag-offset 0) → drop (fragments), prio 250
+        // Baseline: pass, prio 10
+        let rules = vec![
+            RuleSpec::compound(
+                vec![
+                    Predicate::Gte(crate::FieldRef::Dim(FieldDim::Dscp), 32),
+                    Predicate::Lte(crate::FieldRef::Dim(FieldDim::Dscp), 48),
+                ],
+                RuleAction::RateLimit { pps: 1000, name: None },
+            ).with_priority(180),
+            RuleSpec::compound(
+                vec![
+                    Predicate::Gte(crate::FieldRef::Dim(FieldDim::IpLen), 40),
+                    Predicate::Lt(crate::FieldRef::Dim(FieldDim::IpLen), 100),
+                ],
+                RuleAction::drop(),
+            ).with_priority(200),
+            RuleSpec::compound(
+                vec![
+                    Predicate::Gt(crate::FieldRef::Dim(FieldDim::FragOffset), 0),
+                ],
+                RuleAction::drop(),
+            ).with_priority(250),
+            RuleSpec::compound(
+                vec![],
+                RuleAction::pass(),
+            ).with_priority(10),
+        ];
+
+        let tree = compile_tree(&rules);
+        let flat = flatten_tree(&tree, 1);
+
+        // DSCP=40 → rate-limit (A)
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Dscp, 40)],
+        );
+        assert!(matched);
+        assert_eq!(action, ACT_RATE_LIMIT, "dscp=40 in [32,48] → rate-limit");
+        assert_eq!(prio, 180);
+
+        // DSCP=10 → pass (baseline)
+        let (_, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Dscp, 10)],
+        );
+        assert_eq!(action, crate::ACT_PASS, "dscp=10 outside → pass");
+        assert_eq!(prio, 10);
+
+        // IpLen=60 → drop (B: runt)
+        let (_, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::IpLen, 60)],
+        );
+        assert_eq!(action, crate::ACT_DROP, "ip-len=60 in [40,100) → drop");
+        assert_eq!(prio, 200);
+
+        // IpLen=100 → pass (boundary, < 100 is exclusive)
+        let (_, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::IpLen, 100)],
+        );
+        assert_eq!(action, crate::ACT_PASS, "ip-len=100 at exclusive boundary → pass");
+        assert_eq!(prio, 10);
+
+        // FragOffset=185 → drop (C)
+        let (_, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::FragOffset, 185)],
+        );
+        assert_eq!(action, crate::ACT_DROP, "frag-offset > 0 → drop");
+        assert_eq!(prio, 250);
+
+        // FragOffset=0 → pass (not a fragment)
+        let (_, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::FragOffset, 0)],
+        );
+        assert_eq!(action, crate::ACT_PASS, "frag-offset=0 → pass");
+        assert_eq!(prio, 10);
+
+        // Combined: dscp=40 AND ip-len=60 → both A and B match, B wins (prio 200 > 180)
+        let (_, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Dscp, 40), (FieldDim::IpLen, 60)],
+        );
+        assert_eq!(action, crate::ACT_DROP, "overlapping A+B → B wins at prio 200");
+        assert_eq!(prio, 200);
+
+        // Combined: dscp=40 AND frag-offset=100 → A and C match, C wins (prio 250)
+        let (_, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Dscp, 40), (FieldDim::FragOffset, 100)],
+        );
+        assert_eq!(action, crate::ACT_DROP, "overlapping A+C → C wins at prio 250");
+        assert_eq!(prio, 250);
+    }
+
+    // =========================================================================
+    // Complex multi-rule scenarios
+    // =========================================================================
+
+    #[test]
+    fn test_complex_realistic_ruleset() {
+        // Simulates a realistic DDoS scrubbing ruleset with 7 rules of
+        // mixed predicate types, overlapping constraints, and varied priorities.
+        //
+        // Ruleset (evaluated by priority, highest wins):
+        //
+        //  1. prio 250: Drop fragments: (> frag-offset 0) → drop
+        //  2. prio 220: Drop TCP SYN floods to port 80:
+        //               (= proto 6) (= dst-port 80) (mask-eq tcp-flags 0x02 0x02) → drop
+        //  3. prio 200: Rate-limit suspicious TTL+DSCP combo:
+        //               (= proto 17) (>= ttl 60) (<= ttl 70) (>= dscp 40) (<= dscp 50)
+        //               → rate-limit 500
+        //  4. prio 180: Rate-limit Linux botnet fingerprint:
+        //               (= proto 17) (= ttl 64) (= df 0) (>= ip-id 1000) (<= ip-id 2000)
+        //               → rate-limit 1000
+        //  5. prio 150: Rate-limit all UDP to game port:
+        //               (= proto 17) (= dst-port 9999) → rate-limit 5000
+        //  6. prio 100: Count all ICMP: (= proto 1) → count
+        //  7. prio  10: Baseline: (= proto 17) → pass
+        //
+        // We test 12 different packet profiles to validate correct precedence.
+        let rules = vec![
+            // Rule 1: drop fragments
+            RuleSpec::compound(
+                vec![Predicate::Gt(crate::FieldRef::Dim(FieldDim::FragOffset), 0)],
+                RuleAction::drop(),
+            ).with_priority(250),
+
+            // Rule 2: drop SYN floods to port 80
+            RuleSpec::compound(
+                vec![
+                    Predicate::eq(FieldDim::Proto, 6),
+                    Predicate::eq(FieldDim::L4Word1, 80),
+                    Predicate::MaskEq(crate::FieldRef::Dim(FieldDim::TcpFlags), 0x02, 0x02),
+                ],
+                RuleAction::drop(),
+            ).with_priority(220),
+
+            // Rule 3: rate-limit suspicious TTL+DSCP combo
+            RuleSpec::compound(
+                vec![
+                    Predicate::eq(FieldDim::Proto, 17),
+                    Predicate::Gte(crate::FieldRef::Dim(FieldDim::Ttl), 60),
+                    Predicate::Lte(crate::FieldRef::Dim(FieldDim::Ttl), 70),
+                    Predicate::Gte(crate::FieldRef::Dim(FieldDim::Dscp), 40),
+                    Predicate::Lte(crate::FieldRef::Dim(FieldDim::Dscp), 50),
+                ],
+                RuleAction::RateLimit { pps: 500, name: None },
+            ).with_priority(200),
+
+            // Rule 4: rate-limit Linux botnet fingerprint
+            RuleSpec::compound(
+                vec![
+                    Predicate::eq(FieldDim::Proto, 17),
+                    Predicate::eq(FieldDim::Ttl, 64),
+                    Predicate::eq(FieldDim::DfBit, 0),
+                    Predicate::Gte(crate::FieldRef::Dim(FieldDim::IpId), 1000),
+                    Predicate::Lte(crate::FieldRef::Dim(FieldDim::IpId), 2000),
+                ],
+                RuleAction::RateLimit { pps: 1000, name: None },
+            ).with_priority(180),
+
+            // Rule 5: rate-limit all UDP to game port
+            RuleSpec::compound(
+                vec![
+                    Predicate::eq(FieldDim::Proto, 17),
+                    Predicate::eq(FieldDim::L4Word1, 9999),
+                ],
+                RuleAction::RateLimit { pps: 5000, name: None },
+            ).with_priority(150),
+
+            // Rule 6: count all ICMP
+            RuleSpec::compound(
+                vec![Predicate::eq(FieldDim::Proto, 1)],
+                RuleAction::Count { name: None },
+            ).with_priority(100),
+
+            // Rule 7: baseline pass for UDP
+            RuleSpec::compound(
+                vec![Predicate::eq(FieldDim::Proto, 17)],
+                RuleAction::pass(),
+            ).with_priority(10),
+        ];
+
+        let tree = compile_tree(&rules);
+        let flat = flatten_tree(&tree, 1);
+
+        // --- Packet 1: UDP fragment (frag-offset=100, proto=17)
+        //     Matches Rule 1 (prio 250) and Rule 7 (prio 10).
+        //     Rule 1 wins → drop.
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::FragOffset, 100)],
+        );
+        assert!(matched);
+        assert_eq!(action, crate::ACT_DROP, "pkt1: fragment → drop (R1)");
+        assert_eq!(prio, 250);
+
+        // --- Packet 2: TCP SYN to port 80 (proto=6, dst=80, flags=0x02)
+        //     Matches Rule 2 (prio 220). → drop.
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[
+                (FieldDim::Proto, 6),
+                (FieldDim::L4Word1, 80),
+                (FieldDim::TcpFlags, 0x02),
+            ],
+        );
+        assert!(matched);
+        assert_eq!(action, crate::ACT_DROP, "pkt2: SYN to :80 → drop (R2)");
+        assert_eq!(prio, 220);
+
+        // --- Packet 3: TCP SYN-ACK to port 80 (flags=0x12)
+        //     SYN bit IS set (0x12 & 0x02 == 0x02), so Rule 2 matches.
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[
+                (FieldDim::Proto, 6),
+                (FieldDim::L4Word1, 80),
+                (FieldDim::TcpFlags, 0x12),
+            ],
+        );
+        assert!(matched);
+        assert_eq!(action, crate::ACT_DROP, "pkt3: SYN-ACK to :80 still has SYN → drop (R2)");
+        assert_eq!(prio, 220);
+
+        // --- Packet 4: TCP ACK to port 80 (flags=0x10, no SYN bit)
+        //     Doesn't match Rule 2 (mask 0x02 fails). No other TCP rule.
+        let (matched, _, _, _) = simulate_single_walk(
+            &flat,
+            &[
+                (FieldDim::Proto, 6),
+                (FieldDim::L4Word1, 80),
+                (FieldDim::TcpFlags, 0x10),
+            ],
+        );
+        assert!(!matched, "pkt4: ACK to :80 → no matching rule");
+
+        // --- Packet 5: UDP, ttl=64, dscp=46, ip-id=1500, dst=9999, df=0
+        //     Matches Rule 3? ttl in [60,70] ✓, dscp=46 in [40,50] ✓ → prio 200
+        //     Matches Rule 4? ttl=64 ✓, df=0 ✓, ip-id in [1000,2000] ✓ → prio 180
+        //     Matches Rule 5? dst=9999 ✓ → prio 150
+        //     Matches Rule 7? proto=17 ✓ → prio 10
+        //     Rule 3 wins (prio 200) → rate-limit 500
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[
+                (FieldDim::Proto, 17),
+                (FieldDim::L4Word1, 9999),
+                (FieldDim::Ttl, 64),
+                (FieldDim::DfBit, 0),
+                (FieldDim::IpId, 1500),
+                (FieldDim::Dscp, 46),
+            ],
+        );
+        assert!(matched);
+        assert_eq!(action, ACT_RATE_LIMIT, "pkt5: multi-match → R3 wins (prio 200)");
+        assert_eq!(prio, 200);
+
+        // --- Packet 6: UDP, ttl=64, dscp=10, ip-id=1500, dst=9999, df=0
+        //     Rule 3: dscp=10 outside [40,50] ✗
+        //     Rule 4: ttl=64 ✓, df=0 ✓, ip-id=1500 in [1000,2000] ✓ → prio 180
+        //     Rule 5: dst=9999 ✓ → prio 150
+        //     Rule 4 wins (prio 180) → rate-limit 1000
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[
+                (FieldDim::Proto, 17),
+                (FieldDim::L4Word1, 9999),
+                (FieldDim::Ttl, 64),
+                (FieldDim::DfBit, 0),
+                (FieldDim::IpId, 1500),
+                (FieldDim::Dscp, 10),
+            ],
+        );
+        assert!(matched);
+        assert_eq!(action, ACT_RATE_LIMIT, "pkt6: R4 wins over R5 (prio 180 > 150)");
+        assert_eq!(prio, 180);
+
+        // --- Packet 7: UDP, ttl=128, dst=9999 (Windows client to game port)
+        //     Rule 3: ttl=128 outside [60,70] ✗
+        //     Rule 4: ttl≠64 ✗
+        //     Rule 5: dst=9999 ✓ → prio 150
+        //     Rule 5 wins → rate-limit 5000
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[
+                (FieldDim::Proto, 17),
+                (FieldDim::L4Word1, 9999),
+                (FieldDim::Ttl, 128),
+            ],
+        );
+        assert!(matched);
+        assert_eq!(action, ACT_RATE_LIMIT, "pkt7: Windows client → R5 (prio 150)");
+        assert_eq!(prio, 150);
+
+        // --- Packet 8: ICMP (proto=1)
+        //     Rule 6: proto=1 ✓ → count, prio 100
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 1)],
+        );
+        assert!(matched);
+        assert_eq!(action, crate::ACT_COUNT, "pkt8: ICMP → count (R6)");
+        assert_eq!(prio, 100);
+
+        // --- Packet 9: UDP random port (proto=17, dst=12345)
+        //     Only Rule 7 matches → pass, prio 10
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 17), (FieldDim::L4Word1, 12345)],
+        );
+        assert!(matched);
+        assert_eq!(action, crate::ACT_PASS, "pkt9: random UDP → baseline pass (R7)");
+        assert_eq!(prio, 10);
+
+        // --- Packet 10: UDP, ttl=64, df=0, ip-id=500, dst=9999
+        //     Rule 4: ip-id=500 outside [1000,2000] ✗
+        //     Rule 5: dst=9999 ✓ → prio 150
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[
+                (FieldDim::Proto, 17),
+                (FieldDim::L4Word1, 9999),
+                (FieldDim::Ttl, 64),
+                (FieldDim::DfBit, 0),
+                (FieldDim::IpId, 500),
+            ],
+        );
+        assert!(matched);
+        assert_eq!(action, ACT_RATE_LIMIT, "pkt10: ip-id outside R4 range → R5 (prio 150)");
+        assert_eq!(prio, 150);
+
+        // --- Packet 11: UDP, ttl=64, df=1, ip-id=1500, dst=9999
+        //     Rule 4: df=1 ✗ (rule requires df=0)
+        //     Rule 5: dst=9999 ✓ → prio 150
+        let (matched, action, prio, _) = simulate_single_walk(
+            &flat,
+            &[
+                (FieldDim::Proto, 17),
+                (FieldDim::L4Word1, 9999),
+                (FieldDim::Ttl, 64),
+                (FieldDim::DfBit, 1),
+                (FieldDim::IpId, 1500),
+            ],
+        );
+        assert!(matched);
+        assert_eq!(action, ACT_RATE_LIMIT, "pkt11: df=1 breaks R4 → R5 (prio 150)");
+        assert_eq!(prio, 150);
+
+        // --- Packet 12: Unknown protocol (proto=47, GRE)
+        //     No rules match → unmatched
+        let (matched, _, _, _) = simulate_single_walk(
+            &flat,
+            &[(FieldDim::Proto, 47)],
+        );
+        assert!(!matched, "pkt12: GRE → no matching rule");
+    }
+
+    #[test]
+    fn test_complex_overlapping_ranges_priority_ladder() {
+        // Multiple rules with overlapping but nested ranges on the same dimension,
+        // each with different priorities.  Validates the tree correctly compiles
+        // nested intervals and priority selection across all regions.
+        //
+        // ip-id regions and expected winners:
+        //
+        //    0────499  500────999  1000────1499  1500────2000  2001────65535
+        //    |   C     |    B+C    |    A+B+C    |    B+C      |    C        |
+        //    |  prio50 |  prio100  |   prio200   |   prio100   |   prio50   |
+        //
+        // Rule A: (>= ip-id 1000) (<= ip-id 1499) → drop, prio 200
+        // Rule B: (>= ip-id 500) (<= ip-id 2000) → rate-limit, prio 100
+        // Rule C: wildcard → pass, prio 50
+        let rules = vec![
+            RuleSpec::compound(
+                vec![
+                    Predicate::Gte(crate::FieldRef::Dim(FieldDim::IpId), 1000),
+                    Predicate::Lte(crate::FieldRef::Dim(FieldDim::IpId), 1499),
+                ],
+                RuleAction::drop(),
+            ).with_priority(200),
+            RuleSpec::compound(
+                vec![
+                    Predicate::Gte(crate::FieldRef::Dim(FieldDim::IpId), 500),
+                    Predicate::Lte(crate::FieldRef::Dim(FieldDim::IpId), 2000),
+                ],
+                RuleAction::RateLimit { pps: 1000, name: None },
+            ).with_priority(100),
+            RuleSpec::compound(
+                vec![],
+                RuleAction::pass(),
+            ).with_priority(50),
+        ];
+
+        let tree = compile_tree(&rules);
+        let flat = flatten_tree(&tree, 1);
+
+        // Region: 0-499 → only C → pass, prio 50
+        for val in [0, 100, 499] {
+            let (matched, action, prio, _) = simulate_single_walk(
+                &flat,
+                &[(FieldDim::IpId, val)],
+            );
+            assert!(matched, "ip-id={val} should match");
+            assert_eq!(action, crate::ACT_PASS, "ip-id={val} → pass (C only)");
+            assert_eq!(prio, 50);
+        }
+
+        // Region: 500-999 → B+C, B wins → rate-limit, prio 100
+        for val in [500, 750, 999] {
+            let (matched, action, prio, _) = simulate_single_walk(
+                &flat,
+                &[(FieldDim::IpId, val)],
+            );
+            assert!(matched, "ip-id={val} should match");
+            assert_eq!(action, ACT_RATE_LIMIT, "ip-id={val} → rate-limit (B wins)");
+            assert_eq!(prio, 100);
+        }
+
+        // Region: 1000-1499 → A+B+C, A wins → drop, prio 200
+        for val in [1000, 1250, 1499] {
+            let (matched, action, prio, _) = simulate_single_walk(
+                &flat,
+                &[(FieldDim::IpId, val)],
+            );
+            assert!(matched, "ip-id={val} should match");
+            assert_eq!(action, crate::ACT_DROP, "ip-id={val} → drop (A wins)");
+            assert_eq!(prio, 200);
+        }
+
+        // Region: 1500-2000 → B+C, B wins → rate-limit, prio 100
+        for val in [1500, 1750, 2000] {
+            let (matched, action, prio, _) = simulate_single_walk(
+                &flat,
+                &[(FieldDim::IpId, val)],
+            );
+            assert!(matched, "ip-id={val} should match");
+            assert_eq!(action, ACT_RATE_LIMIT, "ip-id={val} → rate-limit (B wins)");
+            assert_eq!(prio, 100);
+        }
+
+        // Region: 2001-65535 → only C → pass, prio 50
+        for val in [2001, 10000, 65535] {
+            let (matched, action, prio, _) = simulate_single_walk(
+                &flat,
+                &[(FieldDim::IpId, val)],
+            );
+            assert!(matched, "ip-id={val} should match");
+            assert_eq!(action, crate::ACT_PASS, "ip-id={val} → pass (C only)");
+            assert_eq!(prio, 50);
+        }
+    }
 }

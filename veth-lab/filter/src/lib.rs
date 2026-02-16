@@ -1716,4 +1716,252 @@ mod tests {
         assert_eq!(all[9], FieldDim::IpId);
         assert_eq!(all[14], FieldDim::FragOffset);
     }
+
+    // =========================================================================
+    // TokenBucket credit accumulator math
+    // =========================================================================
+    //
+    // Pure-Rust mirror of the eBPF apply_tree_token_bucket logic.
+    // This lets us verify the nano-token credit math without needing
+    // eBPF infrastructure.
+
+    const NS_PER_SEC: u64 = 1_000_000_000;
+
+    /// Simulate a single packet arrival at `now_ns`.
+    /// Returns true if the packet is ALLOWED, false if DROPPED.
+    fn bucket_arrive(bucket: &mut TokenBucket, now_ns: u64) -> bool {
+        if bucket.last_update_ns == 0 {
+            bucket.last_update_ns = now_ns;
+            bucket.tokens = bucket.rate_pps;
+        }
+
+        let elapsed_ns = now_ns.saturating_sub(bucket.last_update_ns);
+        bucket.last_update_ns = now_ns;
+
+        if bucket.rate_pps > 0 && elapsed_ns > 0 {
+            let capped = if elapsed_ns > 2 * NS_PER_SEC {
+                2 * NS_PER_SEC
+            } else {
+                elapsed_ns
+            };
+            bucket.credit += capped * bucket.rate_pps as u64;
+            let tokens_to_add = (bucket.credit / NS_PER_SEC) as u32;
+            if tokens_to_add > 0 {
+                bucket.credit -= tokens_to_add as u64 * NS_PER_SEC;
+                let new_tokens = bucket.tokens.saturating_add(tokens_to_add);
+                bucket.tokens = if new_tokens > bucket.rate_pps {
+                    bucket.rate_pps
+                } else {
+                    new_tokens
+                };
+            }
+        }
+
+        if bucket.tokens > 0 {
+            bucket.tokens -= 1;
+            bucket.allowed_count += 1;
+            true
+        } else {
+            bucket.dropped_count += 1;
+            false
+        }
+    }
+
+    fn new_bucket(rate_pps: u32) -> TokenBucket {
+        TokenBucket {
+            rate_pps,
+            tokens: 0,
+            last_update_ns: 0,
+            credit: 0,
+            allowed_count: 0,
+            dropped_count: 0,
+        }
+    }
+
+    #[test]
+    fn test_token_bucket_initial_burst() {
+        // First packet initializes tokens to rate_pps.
+        let mut b = new_bucket(1000);
+        let allowed = bucket_arrive(&mut b, 1_000_000);
+        assert!(allowed, "first packet should be allowed (initial burst)");
+        assert_eq!(b.tokens, 999, "tokens should be rate_pps - 1 after first packet");
+        assert_eq!(b.allowed_count, 1);
+        assert_eq!(b.dropped_count, 0);
+    }
+
+    #[test]
+    fn test_token_bucket_drain_and_refill() {
+        // Drain all tokens, verify drops, then refill after 1 second.
+        let mut b = new_bucket(10);
+        let t0 = 1_000_000_000u64; // 1s
+
+        // First packet initializes
+        assert!(bucket_arrive(&mut b, t0));
+        // Drain remaining 9
+        for _ in 0..9 {
+            assert!(bucket_arrive(&mut b, t0));
+        }
+        assert_eq!(b.tokens, 0);
+        assert_eq!(b.allowed_count, 10);
+
+        // Next packet at same time → drop
+        assert!(!bucket_arrive(&mut b, t0));
+        assert_eq!(b.dropped_count, 1);
+
+        // 1 second later → refill to rate_pps (10)
+        let t1 = t0 + NS_PER_SEC;
+        assert!(bucket_arrive(&mut b, t1));
+        // Should have refilled 10 tokens, consumed 1
+        assert_eq!(b.tokens, 9);
+        assert_eq!(b.allowed_count, 11);
+    }
+
+    #[test]
+    fn test_token_bucket_fractional_preservation() {
+        // With rate_pps=3, each packet needs 333.33ms of credit.
+        // Send packets every 300ms — credit should accumulate across calls
+        // and not be lost.
+        let mut b = new_bucket(3);
+        let t0 = NS_PER_SEC;
+
+        // Initialize
+        assert!(bucket_arrive(&mut b, t0));
+        // Drain initial burst
+        assert!(bucket_arrive(&mut b, t0));
+        assert!(bucket_arrive(&mut b, t0));
+        assert_eq!(b.tokens, 0);
+
+        // 300ms later: 300ms * 3 = 900M credit. < 1B → no token yet.
+        let t1 = t0 + 300_000_000;
+        assert!(!bucket_arrive(&mut b, t1), "300ms: not enough for a token");
+        assert_eq!(b.credit, 900_000_000);
+
+        // Another 100ms later (400ms total from drain):
+        // credit += 100ms * 3 = 300M → total 1.2B → 1 token, remainder 200M
+        let t2 = t1 + 100_000_000;
+        assert!(bucket_arrive(&mut b, t2), "400ms: exactly 1 token available");
+        assert_eq!(b.credit, 200_000_000);
+        assert_eq!(b.tokens, 0); // consumed the token immediately
+
+        // Another 300ms: credit = 200M + 900M = 1.1B → 1 token, remainder 100M
+        let t3 = t2 + 300_000_000;
+        assert!(bucket_arrive(&mut b, t3), "700ms: another token from carryover");
+        assert_eq!(b.credit, 100_000_000);
+    }
+
+    #[test]
+    fn test_token_bucket_high_rate_precision() {
+        // With rate_pps=20000, send 20000 packets over exactly 1 second
+        // (50µs apart). All 20000 should be allowed if we include the
+        // initial burst. Actually: initial burst = 20000, so first 20000
+        // at t0 all pass. Then at t0+1s, another 20000 should pass.
+        let rate = 20_000u32;
+        let mut b = new_bucket(rate);
+        let t0 = NS_PER_SEC;
+        let interval_ns = NS_PER_SEC / rate as u64; // 50µs
+
+        // Initialize and drain initial burst
+        for i in 0..rate {
+            let allowed = bucket_arrive(&mut b, t0 + i as u64); // all at ~t0
+            assert!(allowed, "initial burst packet {i} should pass");
+        }
+        assert_eq!(b.allowed_count, rate as u64);
+        assert_eq!(b.tokens, 0);
+
+        // Now send 20000 packets evenly over the next second
+        let mut allowed_in_second = 0u64;
+        let mut dropped_in_second = 0u64;
+        for i in 0..rate {
+            let t = t0 + (i as u64 + 1) * interval_ns;
+            if bucket_arrive(&mut b, t) {
+                allowed_in_second += 1;
+            } else {
+                dropped_in_second += 1;
+            }
+        }
+
+        // At exactly rate_pps packets/s, we should allow very close to all
+        // (small rounding may cause 1-2 drops at boundaries).
+        let tolerance = 2u64;
+        assert!(
+            allowed_in_second >= rate as u64 - tolerance,
+            "expected ~{rate} allowed in 1s, got {allowed_in_second} (dropped {dropped_in_second})"
+        );
+    }
+
+    #[test]
+    fn test_token_bucket_overflow_cap() {
+        // Elapsed > 2s should be capped to prevent u64 overflow.
+        let mut b = new_bucket(1000);
+        let t0 = NS_PER_SEC;
+        bucket_arrive(&mut b, t0); // initialize
+        // Drain all
+        for _ in 0..999 {
+            bucket_arrive(&mut b, t0);
+        }
+
+        // Jump forward 100 seconds — should cap refill at rate_pps (1000)
+        let t1 = t0 + 100 * NS_PER_SEC;
+        assert!(bucket_arrive(&mut b, t1));
+        // Tokens should be capped at rate_pps, minus 1 for the packet we just sent
+        assert_eq!(b.tokens, 999, "tokens capped at rate_pps after long gap");
+    }
+
+    #[test]
+    fn test_token_bucket_zero_rate() {
+        // rate_pps=0 → no tokens ever refilled, initial burst = 0 → all drops
+        let mut b = new_bucket(0);
+        assert!(!bucket_arrive(&mut b, NS_PER_SEC));
+        assert!(!bucket_arrive(&mut b, 2 * NS_PER_SEC));
+        assert_eq!(b.dropped_count, 2);
+        assert_eq!(b.allowed_count, 0);
+    }
+
+    #[test]
+    fn test_token_bucket_one_pps_exact() {
+        // 1 pps: exactly 1 token per second.
+        let mut b = new_bucket(1);
+        let t0 = NS_PER_SEC;
+
+        // Initialize → 1 token
+        assert!(bucket_arrive(&mut b, t0));
+        assert_eq!(b.tokens, 0);
+
+        // 500ms later → no token (0.5 credit)
+        assert!(!bucket_arrive(&mut b, t0 + 500_000_000));
+
+        // Another 500ms (1s total) → 1 token
+        assert!(bucket_arrive(&mut b, t0 + NS_PER_SEC));
+        assert_eq!(b.tokens, 0);
+
+        // 999ms later → no token
+        assert!(!bucket_arrive(&mut b, t0 + NS_PER_SEC + 999_000_000));
+
+        // 1ms more (2s total) → 1 token
+        assert!(bucket_arrive(&mut b, t0 + 2 * NS_PER_SEC));
+    }
+
+    #[test]
+    fn test_token_bucket_credit_rollover_exact() {
+        // Verify that credit accumulates exactly and rolls over correctly.
+        // rate_pps=7, NS_PER_SEC/7 ≈ 142857142.857ns per token.
+        // After exactly 142857142ns, credit = 142857142 * 7 = 999999994 < 1B → no token.
+        // After 142857143ns from last_update, credit += 1*7 = 999999994+7 = 1000000001 → 1 token,
+        //   remainder = 1000000001 - 1000000000 = 1.
+        let mut b = new_bucket(7);
+        let t0 = NS_PER_SEC;
+
+        // Initialize and drain
+        for _ in 0..7 { bucket_arrive(&mut b, t0); }
+        assert_eq!(b.tokens, 0);
+
+        // Sub-token interval
+        let almost = NS_PER_SEC / 7; // 142857142ns
+        assert!(!bucket_arrive(&mut b, t0 + almost));
+        assert_eq!(b.credit, almost * 7); // 999999994
+
+        // One more nanosecond
+        assert!(bucket_arrive(&mut b, t0 + almost + 1));
+        assert_eq!(b.credit, 1, "remainder should be exactly 1 nano-token");
+    }
 }
