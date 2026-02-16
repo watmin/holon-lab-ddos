@@ -3,7 +3,7 @@
 **Planning document for implementation. Each section is a self-contained spec
 that can be handed to a capable model for implementation.**
 
-**Last updated:** 2026-02-14
+**Last updated:** 2026-02-15
 
 ---
 
@@ -180,6 +180,182 @@ See `veth-lab/scenarios/comprehensive-predicate-test.edn`.
 
 ---
 
+## ✅ 5. IPv4 Header Fingerprinting [COMPLETED 2026-02-15]
+
+**See:** `docs/IP-HEADER-FINGERPRINTING.md` for full details.
+
+### What Was Done
+
+Extended the packet extraction pipeline and rule language with 6 new IPv4
+header dimensions for OS fingerprinting, fragment detection, and QoS abuse
+identification. The Holon detection loop autonomously picks up these fields
+and generates targeted mitigation rules.
+
+- **6 new FieldDim variants:** `IpId`, `IpLen`, `Dscp`, `Ecn`, `MfBit`,
+  `FragOffset` — expanding static dimensions from 9 to 15
+- **DIM_ORDER redesign:** Dimensions ordered by discriminative power
+  (Proto → SrcIp → DstIp → ... → Ttl → DfBit → ... → FragOffset).
+  Justified by information-theoretic analysis, not byte order.
+- **Dimension skipping:** Tree compiler skips unconstrained dimensions at
+  zero runtime cost. A rule on only `FragOffset` (dim index 14) compiles
+  to a tree that jumps directly to that dimension.
+- **Expression language extensions:** `ip-id`, `ip-len`, `dscp`, `ecn`,
+  `mf`, `frag-offset` as first-class dimension names in EDN rules
+- **eBPF extraction:** All 6 fields extracted in the root XDP program
+  alongside existing fields, stored in `DfsState.fields[]`
+- **Autonomous detection validated:** Holon's `similarity_profile()` and
+  `invert()` automatically surface the new fields in concentration analysis,
+  generating rules like `(= ttl 64) (= df 0) (= dscp 46)` without any
+  detection code changes
+
+### Example Rules
+
+```edn
+;; OS fingerprinting: Linux botnet (sequential IP IDs in range)
+{:constraints [(= proto 17) (= ttl 64) (>= ip-id 1000) (<= ip-id 2000)]
+ :actions [(rate-limit 1000 :name ["fingerprint" "linux-botnet"])]
+ :priority 180}
+
+;; Fragment flood detection
+{:constraints [(= proto 17) (> frag-offset 0)]
+ :actions [(drop :name ["fingerprint" "fragmented"])]
+ :priority 200}
+```
+
+**Files changed:** `filter-ebpf/src/main.rs` (extraction), `filter/src/lib.rs`
+(FieldDim enum), `filter/src/tree.rs` (DIM_ORDER, compilation),
+`sidecar/src/main.rs` (EDN parser)
+
+---
+
+## ✅ 6. BPF RingBuf Full-Packet Sampling [COMPLETED 2026-02-15]
+
+### What Was Done
+
+Replaced the per-CPU `PerfEventArray` sampling transport with a single shared
+BPF `RingBuf`. Packets are now sampled in full (up to MTU) rather than just
+header fields, enabling future payload-based detection.
+
+- **BPF RingBuf (4MB shared):** Single ring buffer with overflow-drop
+  semantics — when the sidecar can't consume fast enough, new samples are
+  silently dropped rather than blocking the XDP fast path
+- **Full packet copy:** `bpf_xdp_load_bytes()` copies the entire packet
+  (up to 1500 bytes) into the ring buffer entry, not just extracted fields
+- **Async consumption:** Sidecar uses `tokio::io::unix::AsyncFd` to
+  poll the ring buffer FD without busy-waiting
+- **Backward compatible:** `PacketSample` struct extended with packet
+  payload bytes; existing Holon `Walkable` encoding continues to work
+  on the header fields, ignoring extra payload bytes for now
+- **XDP program untouched:** The XDP program still makes its own pass/drop
+  decision independently — the ring buffer copy is fire-and-forget
+
+### Architecture
+
+```
+XDP program (fast path)
+  ├── Extract fields → DFS walk → pass/drop/rate-limit
+  └── 1:N sample → bpf_ringbuf_reserve() → copy full packet → submit
+                          ↓
+Sidecar (async consumer)
+  └── AsyncFd poll → read PacketSample → Holon encode → accumulate
+```
+
+**Key property:** The ring buffer is a "copy stream" — like an in-memory
+pcap. The XDP program does its normal work and the sidecar gets a shadow
+copy for analysis. No packet is delayed or lost due to sampling.
+
+**Files changed:** `filter-ebpf/src/main.rs` (RingBuf map, sample logic),
+`filter/src/lib.rs` (PacketSample struct), `sidecar/src/main.rs` (AsyncFd
+consumer)
+
+---
+
+## ✅ 7. Real-Time Metrics Dashboard [COMPLETED 2026-02-15]
+
+**See:** `docs/METRICS-DASHBOARD.md` for full details.
+
+### What Was Done
+
+Built an embedded web dashboard served directly by the sidecar, providing
+real-time observability into XDP stats, rate limiter state, and rule DAG
+structure.
+
+- **SSE streaming:** Server-Sent Events at 500ms intervals push metrics
+  to the browser with no polling overhead
+- **Timeline visualization:** uPlot-based Grafana-like dark theme with
+  passed/dropped/rate-limited rates and per-rule trendlines
+- **DAG viewer:** Interactive tree visualization of the compiled Rete
+  decision tree with node types, edge labels, and depth coloring
+- **Monotonic counter tracking:** Correct delta computation across
+  blue/green tree flips by tracking cumulative offsets
+- **Zero dependencies:** Single `dashboard.html` file with inline CSS/JS,
+  served by the sidecar's built-in HTTP server on `--metrics-port`
+
+**Files changed:** `sidecar/src/main.rs` (SSE endpoint, metrics collector),
+`sidecar/static/dashboard.html`
+
+---
+
+## ✅ 8. Token Bucket Precision & Compound Range Fix [COMPLETED 2026-02-15]
+
+### What Was Done
+
+Fixed two bugs that caused a sawtooth pattern in rate-limit enforcement
+during live attack testing.
+
+### 8a. Nanosecond-Precision Token Bucket
+
+The millisecond-granularity refill logic discarded sub-millisecond remainders
+on every packet, causing cumulative drift that significantly under-counted
+tokens at high packet rates.
+
+- **Credit accumulator:** `credit += elapsed_ns * rate_pps`. When credit
+  reaches `NS_PER_SEC` (1 billion), one whole token is produced. The
+  fractional remainder is preserved across packets.
+- **No runtime division:** All arithmetic uses multiplication and constant
+  division (`/ NS_PER_SEC`), which the LLVM BPF backend compiles to
+  multiply-by-reciprocal. No runtime `div` instructions.
+- **Overflow protection:** Elapsed time capped at 2 seconds to prevent
+  `u64` overflow on the multiply (`2e9 * u32::MAX = 8.6e18 < u64::MAX`).
+
+### 8b. Compound Range AND Semantics
+
+The tree compiler's `compile_recursive_dynamic` extracted only the first
+range predicate per dimension (via `find_map`) and advanced `dim_idx + 1`,
+silently dropping subsequent predicates. A rule like
+`(>= ip-id 1000) (<= ip-id 2000)` was compiled as just `(>= ip-id 1000)`,
+matching ~98.5% of traffic instead of ~1.5%.
+
+- **Fix:** Remove the matched predicate from the rule and recurse at the
+  **same** `dim_idx`. Subsequent predicates on the same dimension are
+  picked up in further recursive steps, chaining as AND guards.
+- **Regression test:** `test_compound_range_and_semantics` covers
+  in-range, boundary, and out-of-range cases across 8 packet profiles.
+
+### 8c. Comprehensive Test Suite (15 new tests)
+
+Added targeted tests for all edge cases identified after the fixes:
+
+**Tree compiler (tree.rs):**
+- Empty range `(>= 1000) (<= 999)` — never matches
+- Single-point range `(>= 1000) (<= 1000)` — exact match
+- 3+ predicates on same dimension (strict `>` and `<`)
+- Cross-dimension compound ranges (TTL AND IpId)
+- Range + exact match interaction with priority ladder
+- Range predicates on new fingerprint dimensions (Dscp, IpLen, FragOffset)
+- 7-rule realistic DDoS ruleset with 12 packet profiles
+- Nested overlapping ranges across 5 value regions
+
+**Token bucket (lib.rs):**
+- Initial burst, drain/refill, fractional preservation
+- 20K pps precision, overflow cap, zero rate, 1 pps exact
+- Nano-token credit rollover verification
+
+**Files changed:** `filter-ebpf/src/main.rs` (token bucket), `filter/src/lib.rs`
+(TokenBucket struct + 8 tests), `filter/src/tree.rs` (compiler fix + 8 tests)
+
+---
+
 ## Implementation Progress Summary
 
 | Feature | Complexity | eBPF Changes | Status |
@@ -193,9 +369,16 @@ See `veth-lab/scenarios/comprehensive-predicate-test.edn`.
 | Bitmask & byte matching | High | Custom dims + pattern map | ✅ Done |
 | Multi-tenant byte matching | Medium | Direct packet read + 65K patterns | ✅ Done |
 | Per-rule metrics manifest | Medium | TREE_COUNTERS for all actions | ✅ Done |
+| IPv4 header fingerprinting | High | 6 new fields, DIM_ORDER | ✅ Done |
+| BPF RingBuf full-packet sampling | Medium | RingBuf map, bpf_xdp_load_bytes | ✅ Done |
+| Real-time metrics dashboard | Medium | Read-only (SSE) | ✅ Done |
+| Token bucket nanosecond precision | Medium | Credit accumulator | ✅ Done |
+| Compound range AND semantics | Medium | None (compiler fix) | ✅ Done |
+| Comprehensive test suite | Medium | None | ✅ Done (80 tests) |
+| Thin LTO build optimization | Low | None (Cargo profile) | ✅ Done |
 | LPM trie prefix sets | High | New map type + predicate | Planned |
 | Bloom filters | Medium | New map type | Planned |
-| Metrics pipeline | Medium | Read-only | Planned |
+| Metrics export pipeline | Low | None (SSE exists) | Planned |
 | HyperLogLog (eBPF) | Medium | Small array | Planned |
 | Vector-native cardinality | Low | None | Planned |
 | Holon primitive integration | Low-Medium | None | Planned |
@@ -269,7 +452,7 @@ and EDN parser support have been deleted.
 
 # Part III — Planned: Prefix Lists
 
-## 5. LPM Tries for IP Prefix Sets
+## 9. LPM Tries for IP Prefix Sets
 
 ### Problem
 
@@ -332,7 +515,7 @@ are the escape hatch for extreme scale if needed.
 
 ---
 
-## 6. Dynamic Prefix Lists (Lazy Accumulation)
+## 10. Dynamic Prefix Lists (Lazy Accumulation)
 
 ### Problem
 
@@ -387,7 +570,7 @@ This is the **separation of policy (tree rule) from data (prefix list).**
 
 ---
 
-## 7. Blue/Green Prefix Lists
+## 11. Blue/Green Prefix Lists
 
 ### Design
 
@@ -422,7 +605,7 @@ for periodic bulk loads from external sources.
 
 ---
 
-## 8. ipset-Style Features
+## 12. ipset-Style Features
 
 ### netfilter ipset Features Worth Emulating
 
@@ -483,57 +666,32 @@ struct PrefixEntry {
 
 # Part IV — Planned: Observability
 
-## 9. Metrics Collection & Emission Pipeline
+## 13. Metrics Collection & Emission Pipeline [PARTIALLY DONE]
 
-### Problem
+### Current State
 
-We have counters scattered across BPF maps (STATS, TREE_COUNTERS, rate
-limiter state) but no systematic way to collect, aggregate, and export them.
-The sidecar currently reads stats inline during the detection loop, but
-there's no dedicated metrics pipeline.
+The real-time metrics dashboard (Section 7 above) implements the core of
+this design. What exists:
 
-### Design: Async Reactor Loop
+- **Async metrics collector:** Dedicated `tokio::spawn` task at 500ms
+  intervals, independent of the detection window
+- **Per-CPU aggregation:** STATS map read with per-CPU summation
+- **Delta computation:** Monotonic counter tracking with cumulative offsets
+  across blue/green tree flips
+- **Rate limiter state:** All `TREE_RATE_STATE` buckets read and reported
+- **SSE emission:** Server-Sent Events push JSON metrics to the browser
+- **Structured log emission:** `RATE_LIMIT` and `METRICS SANITY` lines
+  in the sidecar log file
 
-A dedicated async task in the sidecar that periodically:
+### What Remains
 
-1. **Drains counters** from BPF maps (STATS, TREE_COUNTERS, rate state)
-2. **Aggregates** per-CPU values into totals
-3. **Computes deltas** (rate of change since last collection)
-4. **Emits** to one or more sinks (log, file, socket, prometheus endpoint)
-
-```rust
-async fn metrics_reactor(filter: Arc<VethFilter>, interval: Duration) {
-    let mut ticker = tokio::time::interval(interval);
-    let mut prev_stats = FilterStats::default();
-
-    loop {
-        ticker.tick().await;
-
-        let stats = filter.stats().await?;
-        let counters = filter.read_counters().await?;  // TREE_COUNTERS
-        let rate_states = filter.read_rate_states().await?;  // TREE_RATE_STATE
-
-        let delta = stats.delta(&prev_stats);
-        prev_stats = stats.clone();
-
-        emit_metrics(&delta, &counters, &rate_states).await;
-    }
-}
-```
-
-**Collection interval:** 1–5 seconds. Independent of detection window cadence.
-
-### Emission Sinks
-
-| Sink | Complexity | Integration |
+| Sink | Status | Notes |
 |---|---|---|
-| **Structured JSON log file** | Low | grep/jq friendly |
-| **Unix socket (line protocol)** | Low | Telegraf/Vector compatible |
-| **Prometheus `/metrics` endpoint** | Medium | Industry standard |
-| **StatsD UDP** | Low | Broad ecosystem |
-
-**Recommendation:** Start with structured JSON log (one line per collection).
-Add Prometheus endpoint later.
+| **Structured JSON log file** | ✅ Done | Via sidecar log + SSE JSON |
+| **SSE to browser** | ✅ Done | Dashboard at `--metrics-port` |
+| **Unix socket (line protocol)** | Planned | Telegraf/Vector compatible |
+| **Prometheus `/metrics` endpoint** | Planned | Industry standard scrape |
+| **StatsD UDP** | Planned | Broad ecosystem |
 
 ### Counter Draining
 
@@ -543,7 +701,7 @@ cycle). For high-fidelity: per-CPU counter map (same as STATS today).
 
 ---
 
-## 10. HyperLogLog for Cardinality Estimation
+## 14. HyperLogLog for Cardinality Estimation
 
 ### What It Does
 
@@ -616,7 +774,7 @@ powerful anomaly signal that complements Holon's drift detection.
 
 # Part V — Planned: Holon Primitive Integration
 
-## 11. Vector-Native Cardinality & Field Diversity
+## 15. Vector-Native Cardinality & Field Diversity
 
 ### The Core Insight: Magnitude Encodes Diversity
 
@@ -743,12 +901,12 @@ These techniques appear novel in the VSA/HDC literature:
 
 ---
 
-## 12. Holon Primitive Applications
+## 16. Holon Primitive Applications
 
 These are holon-rs primitives we're not using that have direct applications
 in the detection loop. No eBPF changes for any of them.
 
-### 14a. Accumulator Decay (Continuous Detection)
+### 16a. Accumulator Decay (Continuous Detection)
 
 **What it does:** `accumulator.decay(factor)` multiplies all sums by a
 factor (e.g., 0.99). Old observations lose weight exponentially.
@@ -780,7 +938,7 @@ mid-window. Smoother drift signal. Naturally adapts to attack speed.
 **Trade-off:** Harder to reason about effective window size. The effective
 window is `1 / (1 - decay_factor)` packets.
 
-### 14b. Negate (Attack Peeling)
+### 16b. Negate (Attack Peeling)
 
 **What it does:** `Primitives::negate(superposition, component)` removes
 a known component from a superposition.
@@ -800,7 +958,7 @@ if residual_drift < threshold {
 **Iterative peeling:** Detect → mitigate → peel → detect again. Finds N
 layered attacks by removing each detected pattern.
 
-### 14c. Prototype (Robust Attack Profiling)
+### 16c. Prototype (Robust Attack Profiling)
 
 **What it does:** `Primitives::prototype(vectors, threshold)` extracts the
 common pattern across multiple vectors using majority agreement.
@@ -818,7 +976,7 @@ if anomalous_windows.len() >= 3 {
 **Benefits:** Rules based on consensus across windows, not one snapshot.
 Noisy single-window artifacts filtered out.
 
-### 14d. Resonance (Anomaly Isolation)
+### 16d. Resonance (Anomaly Isolation)
 
 **What it does:** `Primitives::resonance(vec, reference)` keeps only
 dimensions where `vec` and `reference` agree.
@@ -831,7 +989,7 @@ let anomaly_signal = Primitives::difference(&recent_vec, &normal_component);
 // Analyze pure anomaly signal with baseline noise removed
 ```
 
-### 14e. Complexity (Baseline-Free Anomaly Signal)
+### 16e. Complexity (Baseline-Free Anomaly Signal)
 
 **What it does:** `Primitives::complexity(vec)` returns 0.0–1.0 measure
 of how "mixed" a vector is.
@@ -847,7 +1005,7 @@ let c = Primitives::complexity(&recent_vec);
 Works from packet 1 (no warmup needed). Good for the warmup period when
 baseline isn't established yet.
 
-### 14f. Sequence Encoding (Flow-Level Detection)
+### 16f. Sequence Encoding (Flow-Level Detection)
 
 **What it does:** `encode_sequence(items, Ngram { n: 3 })` encodes
 3-element windows of a sequence, capturing local ordering patterns.
@@ -866,7 +1024,7 @@ let flow_drift = holon.similarity(&flow_acc.normalize(), &baseline_flow_vec);
 **Detects what per-packet can't:** SYN→RST→SYN→RST loops, slow scans,
 protocol anomalies (data before handshake).
 
-### 14g. Weighted Bundle (Confidence-Weighted Accumulation)
+### 16g. Weighted Bundle (Confidence-Weighted Accumulation)
 
 **What it does:** `accumulator.add_weighted(example, weight)` adds a
 vector with a weight factor.
@@ -898,22 +1056,26 @@ Attack onset shows up sooner (first anomalous packets get high weight).
 
 ## Suggested Implementation Order
 
-**Next batch — Scale features (eBPF map extensions):**
-1. Dynamic prefix lists (LPM tries with TTL + counters)
-2. Blue/green prefix list swaps
-3. Holon integration (auto-populate prefix lists from detection)
+**Next batch — Detection enrichment (no eBPF changes, high impact):**
+1. Payload-based detection (leverage full-packet RingBuf data for deeper analysis)
+2. Vector-native cardinality (unbinding as diversity estimator)
+3. Magnitude spectrum (per-field diversity profile)
+4. Accumulator decay (continuous detection — eliminates window boundary blind spots)
+5. Complexity as auxiliary signal (baseline-free, works during warmup)
 
-**Holon detection enrichment (no eBPF changes):**
-4. Vector-native cardinality (unbinding as diversity estimator)
-5. Magnitude spectrum (per-field diversity profile)
-6. Accumulator decay (continuous detection)
-7. Attack peeling via negate (layered attack detection)
-8. Prototype for robust attack profiling
-9. Complexity as auxiliary signal (baseline-free, works during warmup)
+**Scale features (eBPF map extensions):**
+6. Dynamic prefix lists (LPM tries with TTL + counters)
+7. Blue/green prefix list swaps
+8. Holon integration (auto-populate prefix lists from detection)
 
-**eBPF observability:**
-10. Metrics reactor (async collection + emission pipeline)
-11. HyperLogLog in `veth_filter` (ground-truth cardinality for dashboards)
+**Advanced detection (no eBPF changes):**
+9. Attack peeling via negate (layered attack detection)
+10. Prototype for robust attack profiling
+11. Sequence encoding for flow-level anomaly detection
+
+**Observability extensions:**
+12. Prometheus `/metrics` endpoint (industry-standard scrape target)
+13. HyperLogLog in `veth_filter` (ground-truth cardinality for dashboards)
 
 **Later:**
-12. Bloom filters (if needed for extreme-scale prefix sets)
+14. Bloom filters (if needed for extreme-scale prefix sets)
