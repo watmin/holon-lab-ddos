@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 use clap::Parser;
 use edn_rs::Edn;
-use holon::{Holon, Primitives, SegmentMethod, Vector};
+use holon::{Holon, Primitives, ScalarValue, SegmentMethod, Vector, WalkableValue};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -105,6 +105,15 @@ struct Args {
     /// Metrics server port (0 to disable)
     #[arg(long, default_value = "9100")]
     metrics_port: u16,
+
+    /// Similarity threshold for payload window anomaly (0.0 - 1.0).
+    /// If omitted, auto-calibrated from warmup data (recommended).
+    #[arg(long)]
+    payload_threshold: Option<f64>,
+
+    /// Minimum anomalous payloads per destination before deriving rules
+    #[arg(long, default_value = "5")]
+    payload_min_anomalies: usize,
 }
 
 // =============================================================================
@@ -731,6 +740,686 @@ impl FieldTracker {
         self.window_count = 0;
         self.last_reset = Instant::now();
     }
+}
+
+// =============================================================================
+// PAYLOAD TRACKER: Windowed Payload Analysis
+// =============================================================================
+
+const PAYLOAD_WINDOW_SIZE: usize = 64;
+const MAX_PAYLOAD_BYTES: usize = 512;
+const NUM_PAYLOAD_WINDOWS: usize = MAX_PAYLOAD_BYTES / PAYLOAD_WINDOW_SIZE; // 8
+
+/// Per-destination payload anomaly tracking state.
+struct DstPayloadState {
+    /// Recent anomalous L4 payloads (truncated to MAX_PAYLOAD_BYTES)
+    anomalous_samples: Vec<Vec<u8>>,
+    /// Recent normal L4 payloads (truncated to MAX_PAYLOAD_BYTES)
+    normal_samples: Vec<Vec<u8>>,
+    /// Count of anomalous payloads seen since last rule derivation
+    anomaly_count: usize,
+    /// L4 header length observed for this destination (derived from packets)
+    l4_header_len: usize,
+    /// Last time this destination had an anomalous payload
+    last_seen: Instant,
+    /// Cooldown: earliest time we can derive rules again (prevents re-derive every tick)
+    next_derive_at: Instant,
+}
+
+impl DstPayloadState {
+    fn new(l4_header_len: usize) -> Self {
+        Self {
+            anomalous_samples: Vec::new(),
+            normal_samples: Vec::new(),
+            anomaly_count: 0,
+            l4_header_len,
+            last_seen: Instant::now(),
+            next_derive_at: Instant::now(),
+        }
+    }
+
+    fn add_anomalous(&mut self, payload: &[u8]) {
+        let truncated: Vec<u8> = payload.iter().take(MAX_PAYLOAD_BYTES).copied().collect();
+        self.anomalous_samples.push(truncated);
+        if self.anomalous_samples.len() > 50 {
+            self.anomalous_samples.remove(0);
+        }
+        self.anomaly_count += 1;
+        self.last_seen = Instant::now();
+    }
+
+    fn add_normal(&mut self, payload: &[u8]) {
+        let truncated: Vec<u8> = payload.iter().take(MAX_PAYLOAD_BYTES).copied().collect();
+        self.normal_samples.push(truncated);
+        if self.normal_samples.len() > 100 {
+            self.normal_samples.remove(0);
+        }
+    }
+}
+
+/// Payload anomaly tracker using windowed VSA accumulators.
+///
+/// During warmup, learns a baseline of "familiar" payload byte patterns.
+/// After warmup, scores each packet's payload against the baseline:
+///   - If any window's absolute similarity is below the threshold, the payload
+///     is classified as anomalous.
+///   - Anomalous/normal payloads are stored per destination.
+///   - When enough anomalies accumulate, drill-down + gap-probe + greedy
+///     selection derive `l4-match` rules scoped to that destination.
+/// Global maximum payload rules across all destinations
+const MAX_PAYLOAD_RULES_TOTAL: usize = 64;
+
+struct PayloadTracker {
+    holon: Arc<Holon>,
+    /// One f64 accumulator per window (NUM_PAYLOAD_WINDOWS x dims)
+    accumulators: Vec<Vec<f64>>,
+    /// Frozen baselines after warmup
+    baselines: Vec<Option<Vector>>,
+    /// Total packets learned during warmup
+    packet_count: usize,
+    /// Whether baseline is frozen
+    baseline_frozen: bool,
+    /// Per-destination anomaly tracking
+    dst_states: HashMap<u32, DstPayloadState>,
+    /// Absolute similarity threshold: windows scoring below this are anomalous.
+    /// Auto-calibrated as (baseline_mean - 3*stddev) during freeze, or CLI override.
+    anomaly_threshold: f64,
+    /// User-supplied threshold override (None = auto-calibrate)
+    threshold_override: Option<f64>,
+    /// Minimum anomalies per dst before deriving rules
+    min_anomalies_for_rules: usize,
+    /// Warmup payloads kept for threshold calibration (cleared after freeze)
+    warmup_payloads: Vec<Vec<u8>>,
+    /// Whether to use rate-limit (vs drop) for derived rules
+    use_rate_limit: bool,
+    /// Sample rate (for estimating pps in rate-limit rules)
+    sample_rate: u32,
+    /// Active payload rules keyed by (offset, length, match_hex) -> rule_key
+    /// Used for dedup: don't re-derive rules already in the tree
+    active_rule_keys: HashMap<String, String>,
+}
+
+impl PayloadTracker {
+    fn new(
+        holon: Arc<Holon>,
+        threshold_override: Option<f64>,
+        min_anomalies: usize,
+        use_rate_limit: bool,
+        sample_rate: u32,
+    ) -> Self {
+        let dims = holon.dimensions();
+        let accumulators = vec![vec![0.0; dims]; NUM_PAYLOAD_WINDOWS];
+        let baselines = vec![None; NUM_PAYLOAD_WINDOWS];
+
+        Self {
+            holon,
+            accumulators,
+            baselines,
+            packet_count: 0,
+            baseline_frozen: false,
+            dst_states: HashMap::new(),
+            anomaly_threshold: threshold_override.unwrap_or(0.7),
+            threshold_override,
+            min_anomalies_for_rules: min_anomalies,
+            warmup_payloads: Vec::new(),
+            use_rate_limit,
+            sample_rate,
+            active_rule_keys: HashMap::new(),
+        }
+    }
+
+    /// How many windows actually contain data for a payload of this length.
+    fn active_windows(payload_len: usize) -> usize {
+        if payload_len == 0 { return 0; }
+        std::cmp::min(
+            (payload_len + PAYLOAD_WINDOW_SIZE - 1) / PAYLOAD_WINDOW_SIZE,
+            NUM_PAYLOAD_WINDOWS,
+        )
+    }
+
+    /// Build a WalkableValue::Map for a window's bytes.
+    /// Returns None if the window falls entirely outside the payload.
+    fn window_walkable(payload: &[u8], window_idx: usize) -> Option<WalkableValue> {
+        let start = window_idx * PAYLOAD_WINDOW_SIZE;
+        if start >= payload.len() {
+            return None;
+        }
+        let end = std::cmp::min(start + PAYLOAD_WINDOW_SIZE, payload.len());
+
+        let items: Vec<(String, WalkableValue)> = (start..end)
+            .map(|i| (
+                format!("p{}", i - start),
+                WalkableValue::Scalar(ScalarValue::String(format!("0x{:02x}", payload[i]))),
+            ))
+            .collect();
+
+        Some(WalkableValue::Map(items))
+    }
+
+    /// Learn from a payload during warmup.
+    fn learn(&mut self, payload: &[u8]) {
+        if self.baseline_frozen { return; }
+
+        let truncated = &payload[..std::cmp::min(payload.len(), MAX_PAYLOAD_BYTES)];
+        let n_windows = Self::active_windows(truncated.len());
+
+        for w in 0..n_windows {
+            if let Some(wv) = Self::window_walkable(truncated, w) {
+                let vec = self.holon.encode_walkable_value(&wv);
+                for (i, &v) in vec.data().iter().enumerate() {
+                    self.accumulators[w][i] += v as f64;
+                }
+            }
+        }
+
+        // Keep warmup payloads for threshold calibration (cap at 500)
+        if self.warmup_payloads.len() < 500 {
+            self.warmup_payloads.push(truncated.to_vec());
+        }
+
+        self.packet_count += 1;
+    }
+
+    /// Freeze baseline after warmup, then auto-calibrate the anomaly threshold
+    /// by replaying stored warmup payloads against the frozen baselines.
+    fn freeze_baseline(&mut self) {
+        if self.packet_count == 0 { return; }
+
+        // Step 1: Normalize accumulators into bipolar baseline vectors
+        for w in 0..NUM_PAYLOAD_WINDOWS {
+            let mut baseline = vec![0i8; self.holon.dimensions()];
+            for (i, &sum) in self.accumulators[w].iter().enumerate() {
+                let avg = sum / self.packet_count as f64;
+                baseline[i] = if avg > 0.01 { 1 }
+                              else if avg < -0.01 { -1 }
+                              else { 0 };
+            }
+            self.baselines[w] = Some(Vector::from_data(baseline));
+        }
+
+        self.baseline_frozen = true;
+
+        // Step 2: Auto-calibrate threshold by replaying warmup payloads
+        if self.threshold_override.is_some() {
+            // User explicitly provided a threshold; skip calibration
+            info!("Payload threshold: {:.4} (CLI override)", self.anomaly_threshold);
+            self.warmup_payloads.clear();
+            return;
+        }
+
+        let mut all_min_sims: Vec<f64> = Vec::new();
+        for payload in &self.warmup_payloads {
+            let n_windows = Self::active_windows(payload.len());
+            let mut min_sim = f64::MAX;
+            for w in 0..n_windows {
+                if let Some(sim) = self.score_window(payload, w) {
+                    if sim < min_sim { min_sim = sim; }
+                }
+            }
+            if min_sim < f64::MAX {
+                all_min_sims.push(min_sim);
+            }
+        }
+
+        if all_min_sims.is_empty() {
+            self.anomaly_threshold = 0.7; // conservative fallback
+            info!("Payload threshold: {:.4} (fallback, no warmup similarities)", self.anomaly_threshold);
+            self.warmup_payloads.clear();
+            return;
+        }
+
+        let n = all_min_sims.len() as f64;
+        let mean = all_min_sims.iter().sum::<f64>() / n;
+        let variance = all_min_sims.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / n;
+        let raw_stddev = variance.sqrt();
+
+        // Floor stddev at 0.1: when all warmup payloads are identical (stddev=0),
+        // the threshold would be mean-0.05=0.95 which flags everything.
+        // With floor=0.1: threshold = 1.0 - 0.3 = 0.7 — much more selective.
+        let stddev = raw_stddev.max(0.1);
+
+        // Threshold = mean - 3*stddev, but floor at 0.3 to avoid insensitivity
+        // and cap at mean - 0.05 to ensure we catch at least modest deviations
+        let calibrated = (mean - 3.0 * stddev).max(0.3).min(mean - 0.05);
+        self.anomaly_threshold = calibrated;
+
+        info!("Payload threshold auto-calibrated: {:.4} (mean={:.4}, stddev={:.4}, n={})",
+              self.anomaly_threshold, mean, stddev, all_min_sims.len());
+
+        // Free warmup payloads
+        self.warmup_payloads.clear();
+    }
+
+    /// Score a single window against its baseline.  Returns similarity or None
+    /// if the window has no baseline or falls outside the payload.
+    fn score_window(&self, payload: &[u8], window_idx: usize) -> Option<f64> {
+        let baseline = self.baselines[window_idx].as_ref()?;
+        let wv = Self::window_walkable(payload, window_idx)?;
+        let vec = self.holon.encode_walkable_value(&wv);
+        Some(self.holon.similarity(&vec, baseline))
+    }
+
+    /// Process a batch of samples: score each against baseline, classify, store.
+    fn process_window_samples(&mut self, samples: &[PacketSample]) {
+        if !self.baseline_frozen || samples.is_empty() {
+            return;
+        }
+
+        for sample in samples {
+            let l4_payload = sample.l4_payload();
+            if l4_payload.is_empty() { continue; }
+            let l4_hdr_len = sample.l4_header_len().unwrap_or(0);
+
+            let truncated = &l4_payload[..std::cmp::min(l4_payload.len(), MAX_PAYLOAD_BYTES)];
+            let n_windows = Self::active_windows(truncated.len());
+
+            // Check if any active window scores below the anomaly threshold
+            let mut is_anomalous = false;
+            for w in 0..n_windows {
+                if let Some(sim) = self.score_window(truncated, w) {
+                    if sim < self.anomaly_threshold {
+                        is_anomalous = true;
+                        break;
+                    }
+                }
+            }
+
+            let dst_state = self.dst_states
+                .entry(sample.dst_ip)
+                .or_insert_with(|| DstPayloadState::new(l4_hdr_len));
+
+            // Update l4_header_len from most recent packet
+            dst_state.l4_header_len = l4_hdr_len;
+
+            if is_anomalous {
+                dst_state.add_anomalous(l4_payload);
+            } else {
+                dst_state.add_normal(l4_payload);
+            }
+        }
+    }
+
+    /// Expire old destination states.
+    fn expire_old_dsts(&mut self, ttl: Duration) {
+        let now = Instant::now();
+        self.dst_states.retain(|_, state| now.duration_since(state.last_seen) < ttl);
+    }
+
+    /// Track that a rule has been inserted into the active rule set.
+    fn mark_rule_active(&mut self, pattern_key: String, rule_key: String) {
+        self.active_rule_keys.insert(pattern_key, rule_key);
+    }
+
+    /// Remove tracking for an expired rule.
+    fn mark_rule_expired(&mut self, rule_key: &str) {
+        self.active_rule_keys.retain(|_, v| v != rule_key);
+    }
+
+    /// Extract a stable dedup key from a payload RuleSpec's BytePattern.
+    /// Format: "off:{offset},len:{length},match:{hex}" — unique per pattern.
+    fn pattern_dedup_key(spec: &RuleSpec) -> Option<String> {
+        for c in &spec.constraints {
+            if let Predicate::RawByteMatch(bp) = c {
+                let match_hex: String = bp.match_bytes[..bp.length as usize]
+                    .iter().map(|b| format!("{:02x}", b)).collect();
+                let mask_hex: String = bp.mask_bytes[..bp.length as usize]
+                    .iter().map(|b| format!("{:02x}", b)).collect();
+                return Some(format!("off:{},len:{},m:{},k:{}", bp.offset, bp.length, match_hex, mask_hex));
+            }
+        }
+        None
+    }
+
+    /// Check all destinations and derive rules for those ready.
+    /// `estimated_current_pps` and `rate_factor` come from the FieldTracker's
+    /// vector-derived magnitude ratio -- the same source used for system rules.
+    fn check_and_derive_rules(&mut self, estimated_current_pps: f64, rate_factor: f64) -> Vec<RuleSpec> {
+        let mut rules = Vec::new();
+        let now = Instant::now();
+        let use_rate_limit = self.use_rate_limit;
+        let allowed_pps = (estimated_current_pps * rate_factor).max(100.0) as u32;
+
+        for (&dst_ip, state) in &mut self.dst_states {
+            if now < state.next_derive_at {
+                continue;
+            }
+            if state.anomaly_count < self.min_anomalies_for_rules
+                || state.anomalous_samples.is_empty()
+                || state.normal_samples.is_empty()
+            {
+                continue;
+            }
+
+            if let Some(derived) = Self::derive_rules_for_dst(
+                &self.holon,
+                &self.baselines,
+                self.anomaly_threshold,
+                dst_ip,
+                state,
+                use_rate_limit,
+                allowed_pps,
+            ) {
+                state.next_derive_at = now + Duration::from_secs(4);
+                state.anomalous_samples.clear();
+                state.anomaly_count = 0;
+                rules.extend(derived);
+            }
+        }
+
+        // Dedup against active rules
+        rules.retain(|spec| {
+            if let Some(pk) = Self::pattern_dedup_key(spec) {
+                !self.active_rule_keys.contains_key(&pk)
+            } else {
+                true
+            }
+        });
+
+        // Enforce global budget
+        let total_active = self.active_rule_keys.len();
+        if total_active + rules.len() > MAX_PAYLOAD_RULES_TOTAL {
+            let allowed = MAX_PAYLOAD_RULES_TOTAL.saturating_sub(total_active);
+            rules.truncate(allowed);
+        }
+
+        rules
+    }
+
+    /// Derive l4-match rules for a specific destination using multi-byte patterns.
+    fn derive_rules_for_dst(
+        holon: &Holon,
+        baselines: &[Option<Vector>],
+        threshold: f64,
+        dst_ip: u32,
+        state: &DstPayloadState,
+        use_rate_limit: bool,
+        allowed_pps: u32,
+    ) -> Option<Vec<RuleSpec>> {
+        let l4_hdr_len = state.l4_header_len;
+
+        // Step 1: Drill down anomalous windows to find unfamiliar positions
+        let mut all_unfamiliar: HashSet<usize> = HashSet::new();
+
+        for atk_payload in &state.anomalous_samples {
+            let truncated = &atk_payload[..std::cmp::min(atk_payload.len(), MAX_PAYLOAD_BYTES)];
+            let n_windows = Self::active_windows(truncated.len());
+
+            for w in 0..n_windows {
+                let baseline = match baselines[w].as_ref() {
+                    Some(b) => b,
+                    None => continue,
+                };
+                if let Some(wv) = Self::window_walkable(truncated, w) {
+                    let vec = holon.encode_walkable_value(&wv);
+                    let sim = holon.similarity(&vec, baseline);
+                    if sim < threshold {
+                        let start = w * PAYLOAD_WINDOW_SIZE;
+                        let end = std::cmp::min(start + PAYLOAD_WINDOW_SIZE, truncated.len());
+                        for i in start..end {
+                            let field = format!("p{}", i - start);
+                            let value = format!("0x{:02x}", truncated[i]);
+                            let role = holon.get_vector(&field);
+                            let val = holon.get_vector(&value);
+                            let bound = holon.bind(&role, &val);
+                            let pos_sim = holon.similarity(&bound, baseline);
+                            if pos_sim < 0.005 {
+                                all_unfamiliar.insert(i);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if all_unfamiliar.is_empty() {
+            return None;
+        }
+
+        let mut detected: Vec<usize> = all_unfamiliar.into_iter().collect();
+        detected.sort();
+
+        // Step 2: Gap probing -- extend detected positions by checking neighbors
+        let extended = Self::gap_probe(&detected, &state.anomalous_samples, &state.normal_samples);
+
+        // Step 3: Collect per-position byte info and find the consensus attack byte
+        let pos_info = Self::collect_position_info(
+            &extended, &state.anomalous_samples, &state.normal_samples,
+        );
+
+        if pos_info.is_empty() {
+            return None;
+        }
+
+        // Step 4: Build multi-byte l4-match patterns from contiguous/nearby positions
+        let specs = Self::build_multi_byte_rules(
+            dst_ip, &pos_info, l4_hdr_len, use_rate_limit, allowed_pps,
+        );
+
+        if specs.is_empty() { None } else { Some(specs) }
+    }
+
+    /// Gap probing: extend detected positions by checking neighbors in raw bytes.
+    fn gap_probe(
+        detected: &[usize],
+        atk_samples: &[Vec<u8>],
+        leg_samples: &[Vec<u8>],
+    ) -> Vec<usize> {
+        if detected.is_empty() {
+            return vec![];
+        }
+
+        let lo = detected[0].saturating_sub(4);
+        let hi = std::cmp::min(detected[detected.len() - 1] + 4, MAX_PAYLOAD_BYTES - 1);
+
+        let detected_set: HashSet<usize> = detected.iter().copied().collect();
+        let mut probed = Vec::new();
+
+        for pos in lo..=hi {
+            if detected_set.contains(&pos) { continue; }
+
+            let atk_bytes: HashSet<u8> = atk_samples.iter()
+                .take(20)
+                .filter(|p| pos < p.len())
+                .map(|p| p[pos])
+                .collect();
+            let leg_bytes: HashSet<u8> = leg_samples.iter()
+                .filter(|p| pos < p.len())
+                .map(|p| p[pos])
+                .collect();
+
+            if atk_bytes.is_empty() { continue; }
+
+            let unfam_count = atk_bytes.difference(&leg_bytes).count();
+            if unfam_count > 0 {
+                probed.push(pos);
+            }
+        }
+
+        let mut extended = detected.to_vec();
+        extended.extend(probed);
+        extended.sort();
+        extended.dedup();
+        extended
+    }
+
+    /// Per-position info: the consensus attack byte and whether it's unfamiliar.
+    fn collect_position_info(
+        positions: &[usize],
+        atk_samples: &[Vec<u8>],
+        leg_samples: &[Vec<u8>],
+    ) -> Vec<PositionInfo> {
+        let mut result = Vec::new();
+
+        for &pos in positions {
+            let atk_bytes: Vec<u8> = atk_samples.iter()
+                .filter(|p| pos < p.len())
+                .map(|p| p[pos])
+                .collect();
+            let leg_set: HashSet<u8> = leg_samples.iter()
+                .filter(|p| pos < p.len())
+                .map(|p| p[pos])
+                .collect();
+
+            if atk_bytes.is_empty() { continue; }
+
+            // Find the most common attack byte at this position
+            let mut counts: HashMap<u8, usize> = HashMap::new();
+            for &b in &atk_bytes {
+                *counts.entry(b).or_insert(0) += 1;
+            }
+
+            let (&consensus_byte, &consensus_count) = counts.iter()
+                .max_by_key(|(_, c)| *c)
+                .unwrap();
+
+            let is_unfamiliar = !leg_set.contains(&consensus_byte);
+            let consensus_rate = consensus_count as f64 / atk_bytes.len() as f64;
+
+            // Score: prefer bytes that are (a) unfamiliar in normal traffic,
+            // (b) consistent across attack samples, (c) not padding (0x00)
+            let mut score = consensus_rate;
+            if !is_unfamiliar { score *= 0.1; } // heavily penalize familiar bytes
+            if consensus_byte == 0x00 && leg_set.is_empty() {
+                score *= 0.2; // penalize zeros beyond normal payload length
+            }
+
+            result.push(PositionInfo {
+                payload_pos: pos,
+                consensus_byte,
+                is_unfamiliar,
+                consensus_rate,
+                score,
+            });
+        }
+
+        // Sort by score descending
+        result.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        result
+    }
+
+    /// Build multi-byte l4-match rules by grouping positions into spans.
+    ///
+    /// Groups nearby positions (within a gap of 8) into a single BytePattern
+    /// using sparse masks. Positions with familiar bytes get mask=0x00 (don't-care).
+    fn build_multi_byte_rules(
+        dst_ip: u32,
+        pos_info: &[PositionInfo],
+        l4_hdr_len: usize,
+        use_rate_limit: bool,
+        allowed_pps: u32,
+    ) -> Vec<RuleSpec> {
+        if pos_info.is_empty() { return vec![]; }
+
+        // Only keep positions with a reasonable score (unfamiliar or high-consensus)
+        let useful: Vec<&PositionInfo> = pos_info.iter()
+            .filter(|p| p.is_unfamiliar && p.consensus_rate >= 0.5)
+            .collect();
+
+        if useful.is_empty() { return vec![]; }
+
+        // Sort by position for grouping
+        let mut sorted: Vec<&PositionInfo> = useful;
+        sorted.sort_by_key(|p| p.payload_pos);
+
+        // Group into spans: positions within MAX_PATTERN_LEN and with gaps <= 8
+        let mut spans: Vec<Vec<&PositionInfo>> = Vec::new();
+        let mut current_span: Vec<&PositionInfo> = vec![sorted[0]];
+
+        for pi in &sorted[1..] {
+            let span_start = current_span[0].payload_pos;
+            let gap = pi.payload_pos - current_span.last().unwrap().payload_pos;
+            let span_len = pi.payload_pos - span_start + 1;
+
+            if gap <= 8 && span_len <= veth_filter::MAX_PATTERN_LEN {
+                current_span.push(pi);
+            } else {
+                spans.push(current_span);
+                current_span = vec![pi];
+            }
+        }
+        spans.push(current_span);
+
+        let mut specs = Vec::new();
+        for span in &spans {
+            let first_pos = span[0].payload_pos;
+            let last_pos = span.last().unwrap().payload_pos;
+            let pattern_len = last_pos - first_pos + 1;
+
+            if pattern_len > veth_filter::MAX_PATTERN_LEN { continue; }
+
+            let mut match_bytes = [0u8; 64];
+            let mut mask_bytes = [0u8; 64];
+            let mut matched_positions = 0usize;
+
+            for pi in span {
+                let idx = pi.payload_pos - first_pos;
+                match_bytes[idx] = pi.consensus_byte;
+                mask_bytes[idx] = 0xFF;
+                matched_positions += 1;
+            }
+
+            // Require at least 2 matched byte positions for a meaningful rule,
+            // unless the single byte is highly distinctive (non-zero, non-FF)
+            if matched_positions < 2 && (span[0].consensus_byte == 0x00 || span[0].consensus_byte == 0xFF) {
+                continue;
+            }
+
+            let l4_offset = (l4_hdr_len + first_pos) as u16;
+            let l4_match = Predicate::RawByteMatch(Box::new(veth_filter::BytePattern {
+                offset: l4_offset,
+                length: pattern_len as u8,
+                _pad: 0,
+                match_bytes,
+                mask_bytes,
+            }));
+
+            let dst_constraint = Predicate::eq(FieldDim::DstIp, dst_ip);
+            let constraints = vec![dst_constraint, l4_match];
+
+            let stable_name = RuleSpec {
+                constraints: constraints.clone(),
+                actions: vec![],
+                priority: 0,
+                comment: None,
+                label: None,
+            }.constraints_to_edn();
+
+            let action = if use_rate_limit {
+                RuleAction::RateLimit { pps: allowed_pps, name: Some(("system".into(), stable_name.clone())) }
+            } else {
+                RuleAction::Drop { name: Some(("system".into(), stable_name.clone())) }
+            };
+
+            let match_hex: String = match_bytes[..pattern_len]
+                .iter().map(|b| format!("{:02x}", b)).collect();
+            let mask_hex: String = mask_bytes[..pattern_len]
+                .iter().map(|b| format!("{:02x}", b)).collect();
+
+            specs.push(RuleSpec {
+                constraints,
+                actions: vec![action],
+                priority: 100,
+                comment: Some(format!(
+                    "Payload pattern L4+{}..+{} ({} bytes matched, pattern={}, mask={})",
+                    l4_offset, l4_offset as usize + pattern_len - 1,
+                    matched_positions, match_hex, mask_hex,
+                )),
+                label: None,
+            });
+        }
+
+        // Cap at 4 rules per derivation (multi-byte patterns are much more powerful)
+        specs.truncate(4);
+        specs
+    }
+}
+
+struct PositionInfo {
+    payload_pos: usize,
+    consensus_byte: u8,
+    is_unfamiliar: bool,
+    consensus_rate: f64,
+    score: f64,
 }
 
 /// Detection result with enhanced metadata
@@ -1594,6 +2283,19 @@ async fn main() -> Result<()> {
 
     // Create enhanced field tracker
     let tracker = Arc::new(RwLock::new(FieldTracker::new(holon.clone())));
+    
+    // Create payload tracker
+    let payload_tracker = Arc::new(RwLock::new(PayloadTracker::new(
+        holon.clone(),
+        args.payload_threshold,
+        args.payload_min_anomalies,
+        args.rate_limit,
+        args.sample_rate,
+    )));
+    info!("PayloadTracker initialized: {} windows ({}B), threshold={}, min_anomalies={}",
+        NUM_PAYLOAD_WINDOWS, MAX_PAYLOAD_BYTES,
+        args.payload_threshold.map_or("auto".to_string(), |t| format!("{}", t)),
+        args.payload_min_anomalies);
 
     // Take ring buffer for sample reading (single shared buffer across all CPUs)
     let ring_buf = filter.take_ring_buf().await?;
@@ -1841,6 +2543,9 @@ async fn main() -> Result<()> {
     let mut windows_processed = 0u64;
     let mut total_warmup_packets = 0usize;
     let mut warmup_complete = false;
+    
+    // Buffer for collecting samples during current window (for payload analysis)
+    let mut window_samples: Vec<PacketSample> = Vec::new();
 
     let mut last_window_check = Instant::now();
     let check_interval = Duration::from_millis(100);
@@ -1853,10 +2558,18 @@ async fn main() -> Result<()> {
 
         {
             let mut tracker = tracker.write().await;
+
             for _ in 0..MAX_SAMPLES_PER_CHECK {
                 match sample_rx.try_recv() {
                     Ok(sample) => {
                         tracker.add_sample(&sample);
+
+                        // Buffer sample for payload analysis at window boundary
+                        window_samples.push(sample);
+                        if window_samples.len() > 5000 {
+                            window_samples.remove(0);
+                        }
+
                         _samples_processed += 1;
                         samples_since_window_check += 1;
                         got_sample = true;
@@ -1909,6 +2622,13 @@ async fn main() -> Result<()> {
         if window_elapsed {
             windows_processed += 1;
 
+            // Extract window_count and rate_factor at the window scope so both
+            // FieldTracker analysis and PayloadTracker rule derivation can use them.
+            let (ft_window_count, ft_rate_factor) = {
+                let tr = tracker.read().await;
+                (tr.window_count, tr.compute_rate_factor())
+            };
+
             if has_enough_samples {
                 // Get enhanced anomaly details
                 let tracker_read = tracker.read().await;
@@ -1938,16 +2658,28 @@ async fn main() -> Result<()> {
 
                 // Check warmup
                 if !warmup_complete {
+                    // Feed buffered samples to payload tracker for learning
+                    {
+                        let mut pt = payload_tracker.write().await;
+                        for s in &window_samples {
+                            let l4 = s.l4_payload();
+                            if !l4.is_empty() { pt.learn(l4); }
+                        }
+                    }
+                    window_samples.clear();
+
                     let warmup_by_windows = windows_processed >= args.warmup_windows;
                     let warmup_by_packets = total_warmup_packets >= args.warmup_packets;
 
                     if warmup_by_windows || warmup_by_packets {
                         warmup_complete = true;
                         tracker.write().await.freeze_baseline();
+                        payload_tracker.write().await.freeze_baseline();
                         info!("========================================");
                         info!("WARMUP COMPLETE - baseline FROZEN");
                         info!("  Windows: {}, Packets: {}", windows_processed, total_warmup_packets);
                         info!("  Detection now active with extended primitives!");
+                        info!("  Payload tracking: {} windows frozen", NUM_PAYLOAD_WINDOWS);
                         info!("========================================");
                         // Skip detection on this window - baseline was just frozen from this data
                         // Next window will be first real detection
@@ -2264,6 +2996,147 @@ async fn main() -> Result<()> {
                 );
             }
 
+            // ── Payload Anomaly Detection ──
+            // Process window samples for payload-based anomalies
+            if warmup_complete && !window_samples.is_empty() {
+                let mut payload_tracker_write = payload_tracker.write().await;
+                
+                // Process all samples from this window
+                payload_tracker_write.process_window_samples(&window_samples);
+                
+                // Expire old destination states
+                payload_tracker_write.expire_old_dsts(Duration::from_secs(600));
+                
+                // Derive payload rules using FieldTracker's vector-derived PPS + rate_factor
+                let estimated_current_pps = (ft_window_count as f64 * args.sample_rate as f64) / 2.0;
+                let payload_rules = payload_tracker_write.check_and_derive_rules(estimated_current_pps, ft_rate_factor);
+                drop(payload_tracker_write);
+                
+                if !payload_rules.is_empty() {
+                    info!(">>> PAYLOAD ANOMALIES DETECTED: {} rule(s) derived", payload_rules.len());
+                    
+                    // Collect (pattern_key, rule_key) pairs for budget tracking
+                    let mut newly_added: Vec<(String, String)> = Vec::new();
+                    
+                    // Insert through the SAME path as FieldTracker rules:
+                    // dedup, RuleEvent broadcast, tree recompile, DagSnapshot
+                    let mut rules = active_rules.write().await;
+                    for spec in payload_rules {
+                        let rule_key = rule_identity_key(&spec);
+                        
+                        if let Some(existing) = rules.get_mut(&rule_key) {
+                            let spec_changed = existing.spec.to_edn() != spec.to_edn();
+                            existing.last_seen = Instant::now();
+                            if spec_changed {
+                                existing.spec = spec.clone();
+                                if let Some(bk) = spec.bucket_key() {
+                                    let mut bmap = bucket_key_to_spec.write().await;
+                                    bmap.insert(bk, spec.clone());
+                                }
+                                tree_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            if let Some(ref state) = metrics_state {
+                                state.broadcast(metrics_server::MetricsEvent::RuleEvent {
+                                    ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+                                    action: "refreshed".to_string(),
+                                    key: rule_key.clone(),
+                                    spec_summary: spec.to_edn(),
+                                    is_preloaded: false,
+                                    ttl_secs: 300,
+                                });
+                            }
+                        } else {
+                            let action_str = match &spec.actions[0] {
+                                RuleAction::Drop { .. } => "DROP",
+                                RuleAction::RateLimit { .. } => "RATE-LIMIT",
+                                RuleAction::Pass { .. } => "PASS",
+                                RuleAction::Count { .. } => "COUNT",
+                            };
+                            info!("    Adding payload rule [{}]: {}", action_str, spec.describe());
+                            
+                            // Track for budget management
+                            if let Some(pk) = PayloadTracker::pattern_dedup_key(&spec) {
+                                newly_added.push((pk, rule_key.clone()));
+                            }
+                            
+                            rules.insert(rule_key.clone(), ActiveRule {
+                                last_seen: Instant::now(),
+                                spec: spec.clone(),
+                                preloaded: false,
+                            });
+                            
+                            // Emit RuleEvent to metrics server (same as FieldTracker path)
+                            if let Some(ref state) = metrics_state {
+                                state.broadcast(metrics_server::MetricsEvent::RuleEvent {
+                                    ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+                                    action: "added".to_string(),
+                                    key: rule_key.clone(),
+                                    spec_summary: spec.to_edn(),
+                                    is_preloaded: false,
+                                    ttl_secs: 300,
+                                });
+                            }
+                            
+                            if let Some(bk) = spec.bucket_key() {
+                                let mut bmap = bucket_key_to_spec.write().await;
+                                bmap.entry(bk).or_insert_with(|| spec.clone());
+                            }
+                            
+                            tree_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    
+                    // Recompile tree if payload rules were added
+                    if tree_dirty.load(std::sync::atomic::Ordering::SeqCst) && args.enforce {
+                        let all_specs: Vec<RuleSpec> = rules.values()
+                            .map(|r| r.spec.clone())
+                            .collect();
+                        match filter.compile_and_flip_tree(&all_specs).await {
+                            Ok((nodes, manifest, retired)) => {
+                                info!("    Tree recompiled (payload rules): {} total rules -> {} nodes", all_specs.len(), nodes);
+                                
+                                if let Some(ref state) = metrics_state {
+                                    state.accumulate_retired_counts(&retired).await;
+                                }
+                                
+                                let mut tcl = tree_counter_labels.write().await;
+                                tcl.clear();
+                                for entry in &manifest {
+                                    tcl.insert(entry.rule_id, (entry.action_kind().to_string(), entry.label.clone()));
+                                }
+                                drop(tcl);
+                                tree_dirty.store(false, std::sync::atomic::Ordering::SeqCst);
+                                
+                                if let Some(ref state) = metrics_state {
+                                    let mut dag_nodes = filter.serialize_dag().await;
+                                    attach_manifest_labels_to_dag(&mut dag_nodes, &manifest);
+                                    state.broadcast(metrics_server::MetricsEvent::DagSnapshot {
+                                        ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+                                        node_count: dag_nodes.len(),
+                                        rule_count: all_specs.len(),
+                                        nodes: dag_nodes,
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                warn!("    Failed to compile tree (payload rules): {}", e);
+                            }
+                        }
+                    }
+                    
+                    // Update budget tracker with newly added rules
+                    if !newly_added.is_empty() {
+                        let mut pt = payload_tracker.write().await;
+                        for (pk, key) in newly_added {
+                            pt.mark_rule_active(pk, key);
+                        }
+                    }
+                }
+            }
+            
+            // Clear window samples buffer
+            window_samples.clear();
+
             tracker.write().await.reset_window();
 
             // Expire old rules
@@ -2276,6 +3149,12 @@ async fn main() -> Result<()> {
                 .collect();
 
             let had_expired = !expired.is_empty();
+            if had_expired {
+                let mut pt = payload_tracker.write().await;
+                for key in &expired {
+                    pt.mark_rule_expired(key);
+                }
+            }
             for key in expired {
                 if let Some(active) = rules.remove(&key) {
                     info!("<<< EXPIRED RULE: {}", active.spec.describe());

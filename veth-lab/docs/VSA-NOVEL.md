@@ -588,3 +588,318 @@ magnitude — and the literature only uses direction.** Holon uses both.
 And the meta-insight: **a library that provides less domain-specific
 functionality enables more domain-specific discovery.** The primitives you
 don't use today are the tricks you'll discover tomorrow.
+
+---
+
+## 8. Coherence as Baseline-Free Attack Detection (Proposed)
+
+### Classical View
+
+Anomaly detection requires a baseline: accumulate normal traffic, then
+measure drift from that baseline. If you don't have a baseline (cold start,
+model reset, corrupted state), you can't detect anything.
+
+### What We Propose
+
+Use `coherence(vectors)` — mean pairwise cosine similarity — as a
+**baseline-free** attack signal. Coherence measures how *homogeneous* a
+set of vectors is, without any reference to what "normal" looks like:
+
+```python
+window_vecs = [encode(pkt) for pkt in recent_window]
+c = coherence(window_vecs)
+# c → 0.0: diverse traffic (likely normal)
+# c → 1.0: homogeneous traffic (likely attack)
+```
+
+Normal traffic is diverse: different source IPs, different protocols,
+different payload sizes. Coherence near 0 (vectors are nearly orthogonal).
+DDoS traffic is repetitive: same source pattern, same protocol, same
+payload profile. Coherence near 1 (vectors are nearly identical).
+
+### Why This Is Novel
+
+This exploits the **distribution of pairwise similarity** within a window —
+a property no VSA/HDC paper uses. Standard VSA asks "is this vector
+similar to that reference?" (point comparison). Coherence asks "are these
+vectors similar to *each other*?" (distribution property). No baseline,
+no codebook, no training. Just measure the internal structure of a window.
+
+### Combined with Significance
+
+Raw coherence is a number. But is 0.15 "high enough" to be suspicious?
+`significance(coherence, dimensions)` converts it to a z-score:
+
+```python
+z = significance(coherence_val, dimensions)
+# z > 3.0 → statistically significant homogeneity (p < 0.003)
+# z > 5.0 → essentially certain attack signal
+```
+
+This eliminates magic thresholds. The math tells you whether the observed
+coherence is explainable by chance.
+
+---
+
+## 9. Drift Rate for Attack Onset Classification (Proposed)
+
+### Classical View
+
+Drift detection is binary: similarity dropped below threshold → alert.
+The operational response is the same regardless of how the similarity
+dropped.
+
+### What We Propose
+
+Use `drift_rate(stream, window)` — the temporal derivative of similarity —
+to classify the *type* of attack onset:
+
+```python
+rates = drift_rate(window_vectors, window=1)
+# Classify by drift shape:
+#   - Gradual negative drift → organic growth (don't throttle)
+#   - Massive negative spike  → flash flood (block immediately)
+#   - Accelerating negative   → ramp-up attack (escalate response)
+```
+
+### The Three Regimes
+
+| Drift Pattern | Interpretation | Response |
+|---|---|---|
+| Low magnitude, steady | Organic traffic growth | No action |
+| Large negative spike (< -0.5) | Flash flood DDoS | Immediate block |
+| Accelerating negative | Ramp-up attack | Progressive throttle |
+| Oscillating ±0.1 | Pulsed / rotating attack | Pattern-based blocking |
+
+Same raw similarity data, fundamentally different operational responses.
+A flash flood and a gradual shift both produce "low similarity to baseline"
+but require opposite responses (instant block vs. gradual adaptation).
+
+### Why This Is Novel
+
+Standard anomaly detection measures *state* (how different is current from
+baseline). Drift rate measures the *dynamics* (how fast is the state
+changing). This is the difference between a thermometer reading (current
+temperature) and its derivative (heating or cooling rate). Both are useful.
+Neither subsumes the other.
+
+---
+
+## 10. Bundle with Confidence for Trust-Aware Drift (Proposed)
+
+### Classical View
+
+When bundling vectors (majority vote), all dimensions are treated equally.
+The resulting bipolar vector discards the margin of victory per dimension.
+A 512-to-512 vote is the same as a 1000-to-24 vote.
+
+### What We Propose
+
+Use `bundle_with_confidence(vectors)` to preserve per-dimension agreement
+margins, then feed these into `weighted_cosine_similarity` for drift
+detection that trusts high-confidence dimensions more:
+
+```python
+baseline_vec, margins = bundle_with_confidence(baseline_vectors)
+
+# Use margins as weights for drift detection
+drift = 1.0 - weighted_cosine_similarity(recent_vec, baseline_vec, margins)
+```
+
+### Why This Matters for DDoS
+
+In packet traffic, some fields have strong consensus in the baseline (e.g.,
+all traffic goes to the same `dst_ip` → margin = 1.0). Other fields are
+noisy (e.g., `src_port` is ephemeral → margin near 0). Standard cosine
+drift weights both equally. Weighted cosine focuses on the fields that
+matter — detecting when the stable `dst_ip` suddenly diversifies while
+ignoring normal `src_port` churn.
+
+The confidence margins are essentially a learned feature importance that
+emerges from the data, without any machine learning.
+
+### Why This Is Novel
+
+VSA bundles discard margin information. We preserve it and use it as a
+**trust signal** — a per-dimension measure of how much the baseline "knows"
+about each dimension. This is conceptually similar to Fisher information
+in statistics: dimensions with high confidence carry more signal.
+
+---
+
+## 11. Reject for Novel Attack Isolation (Proposed)
+
+### Classical View
+
+`project(vec, subspace)` extracts the component of a vector that lies
+within a known subspace. Used for: "how much does this look like known
+pattern X?"
+
+### What We Propose
+
+Use `reject(vec, subspace)` — the orthogonal complement of project — to
+extract what CANNOT be explained by known patterns:
+
+```python
+# Build subspace from known attack profiles
+known_attacks = [dns_amplification_profile, syn_flood_profile, udp_flood_profile]
+
+# What part of this traffic isn't any known attack?
+residual = reject(anomalous_traffic, known_attacks)
+
+# If residual has high magnitude → novel attack vector
+novelty = cosine_similarity(anomalous_traffic, residual)
+```
+
+### The Peeling Pipeline
+
+Combined with `negate`, this enables layered attack discovery:
+
+```
+1. Detect anomaly (similarity drift)
+2. Project onto known attacks → identify known component
+3. Reject known attacks → isolate novel component
+4. If novel residual is significant → new attack type discovered
+5. Negate the known attack → re-examine remaining traffic
+6. Repeat until residual is noise
+```
+
+This is iterative signal separation — the same principle as independent
+component analysis (ICA) but using VSA algebra.
+
+### Why This Is Novel
+
+VSA uses projection for membership testing ("is this in my subspace?").
+Using the complement — what's NOT in the subspace — as an operational
+signal for novel pattern discovery appears to be new. It's the difference
+between asking "do I recognize this?" and "what don't I recognize?"
+
+---
+
+## 12. Purity and Complexity as Baseline-Free Multi-Signal Detection (Proposed)
+
+### Classical View
+
+Anomaly detection requires a baseline. No baseline → no detection.
+
+### What We Propose
+
+Combine three baseline-free measures for anomaly detection without any
+reference state:
+
+| Measure | What It Captures | Normal Traffic | Attack Traffic |
+|---|---|---|---|
+| `coherence()` | Window homogeneity | Low (~0) | High (~1) |
+| `complexity()` | Pattern mixedness | High (~1) | Low (~0) |
+| `purity()` | Accumulator concentration | Low (~1/N) | High (~1) |
+
+These three are conceptually related but mathematically independent:
+- **Coherence** measures pairwise similarity between individual packets
+- **Complexity** measures entropy of the dimension distribution
+- **Purity** measures accumulator concentration (quantum-inspired)
+
+```python
+# Three independent baseline-free signals
+c = coherence(window_vecs)
+x = complexity(accumulated_vec)
+p = purity(accumulator)
+
+# Combined score (all three point the same direction for attacks)
+anomaly_score = c * (1 - x) * p
+```
+
+### Why This Matters
+
+Cold start is the Achilles heel of baseline-based detection. When the
+sidecar starts, the first N seconds have no baseline. With these three
+measures, you can detect attacks from the first window — no warmup needed.
+
+Also useful for **baseline corruption**: if an attacker slowly ramps up
+over hours (boiling frog), the baseline drifts with the attack. Similarity
+to baseline stays high. But coherence/complexity/purity still detect the
+homogeneity of attack traffic.
+
+### Why This Is Novel
+
+Using quantum-inspired purity alongside classical coherence and information-
+theoretic complexity as three independent axes of the same phenomenon
+(traffic homogeneity) appears to be new. Each measures a different
+mathematical property of the same underlying signal.
+
+---
+
+## 13. Decode Scalar Log: Closing the Rate Limiting Loop (Proposed)
+
+### Classical View
+
+VSA encodes information into vectors. Decoding back to scalar values is
+not a standard operation — vectors are compared by similarity, not decoded.
+
+### What We Propose
+
+Use `decode_scalar_log(vec)` to recover scalar values from rate-encoded
+vectors. This closes the loop on vector-derived rate limiting (Batch 013):
+
+```python
+# Encode baseline rate
+baseline_rate_vec = encode_scalar_log(100.0, 4096)  # 100 pps baseline
+
+# Accumulate rate observations
+for rate in observed_rates:
+    accumulate(acc, encode_scalar_log(rate, 4096))
+
+# Decode back to actual PPS
+effective_rate = decode_scalar_log(normalize(acc))
+# → ~100.0 pps (the consensus rate from all observations)
+```
+
+### The Full Rate Limiting Pipeline
+
+```
+1. Encode each window's packet rate: encode_scalar_log(rate)
+2. Accumulate rate vectors (frequency-preserving)
+3. Compute drift: similarity(current_rate_vec, baseline_rate_vec)
+4. Compute significance: significance(drift, dimensions)
+5. Decode consensus rate: decode_scalar_log(normalized_accumulator)
+6. Generate rate limit rule: limit_pps = decoded_rate * (1 + tolerance)
+```
+
+Every step is a vector operation. The rate limit emerges from the algebra.
+
+### Why This Is Novel
+
+Bidirectional encoding (scalar → vector → scalar) with lossy but useful
+round-tripping. The decoded value isn't the exact input — it's the
+**consensus** of all accumulated observations, weighted by frequency.
+This is implicit averaging in vector space without ever computing a mean.
+
+---
+
+## Updated Summary: Classical vs Holon Usage
+
+| Concept | Classical VSA/HDC | Holon |
+|---|---|---|
+| Accumulator magnitude | Discarded (normalized away) | **Volume proxy** → rate derivation |
+| Unbinding result | Direction query (content retrieval) | **Magnitude query** → cardinality |
+| Superposition | Information storage | **Interference measurement** → correlation |
+| Difference vector | Analogical reasoning (A:B::C:?) | **Per-field attribution** → blame |
+| Scalar encoding | Not standard (discrete codebooks) | **Log-scale for fuzzy fields** → clustering |
+| Baseline comparison | Nearest-neighbor in codebook | **Drift + spectrum** → anomaly + fingerprint |
+| Negation | Remove concept from memory | **Attack peeling** → layered detection |
+| Sequence encoding | Text/NLP | **Flow-level anomaly** → protocol motifs |
+| Complexity | Vector quality metric | **Single-number anomaly** → no baseline needed |
+| Decay | Forgetting in memory | **Continuous detection** → no window boundaries |
+| **Coherence** | Not used | **Baseline-free homogeneity** → cold-start detection |
+| **Drift rate** | Not used | **Attack dynamics** → onset classification |
+| **Confidence margins** | Discarded in bundling | **Trust weights** → dimension-aware drift |
+| **Subspace rejection** | Not used | **Novel pattern isolation** → residual analysis |
+| **Purity** | Not used (quantum concept) | **Accumulator health** → concentration signal |
+| **Scalar decode** | Not standard | **Rate recovery** → closed-loop rate limiting |
+| **Significance** | Not used | **Principled thresholds** → dimension-aware z-scores |
+| Library boundary | Application-specific APIs | **General primitives** → emergent applications |
+
+The expanded common thread: **vectors have more measurable properties than
+the literature uses.** Direction, magnitude, pairwise distribution,
+temporal derivative, per-dimension confidence, subspace residuals, spectral
+purity — each carries independent signal. Traditional VSA exploits one
+(direction via cosine similarity). This system exploits all of them.

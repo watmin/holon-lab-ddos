@@ -1,0 +1,101 @@
+{
+  "name": "Payload Anomaly Detection Test",
+  "description": "Tests windowed payload VSA detection. All phases use 'custom' type so payload_hex is honoured by the generator. Normal phases send familiar game-like payloads; attack phases inject unfamiliar byte patterns at various offsets.",
+  "baseline_pps": 3000,
+  "attack_pps": 15000,
+  "phases": [
+    {
+      "name": "warmup_baseline",
+      "duration_secs": 15,
+      "type": "custom",
+      "description": "Baseline game traffic - legitimate UDP payloads (GME00001BEGI)",
+      "dst_port": 7777,
+      "payload_hex": "474d4530303030303142454749"
+    },
+    {
+      "name": "attack_constant_signature",
+      "duration_secs": 10,
+      "type": "custom",
+      "description": "Attack: constant DEADBEEF prefix replacing normal header bytes",
+      "dst_port": 7777,
+      "payload_hex": "DEADBEEF0000000042454749",
+      "pps": 15000
+    },
+    {
+      "name": "calm1",
+      "duration_secs": 8,
+      "type": "custom",
+      "description": "Recovery - legitimate payloads resume",
+      "dst_port": 7777,
+      "payload_hex": "474d4530303030303142454749"
+    },
+    {
+      "name": "attack_scattered_bytes",
+      "duration_secs": 10,
+      "type": "custom",
+      "description": "Attack: scattered unfamiliar bytes at positions 2,5,8,12 (FF,AC,FB,CA)",
+      "dst_port": 7777,
+      "payload_hex": "4745FF3030AC3030FB303030CA42454749",
+      "pps": 15000
+    },
+    {
+      "name": "calm2",
+      "duration_secs": 8,
+      "type": "custom",
+      "description": "Recovery",
+      "dst_port": 7777,
+      "payload_hex": "474d4530303030303142454749"
+    },
+    {
+      "name": "attack_deep_offset",
+      "duration_secs": 10,
+      "type": "custom",
+      "description": "Attack: shellcode-like pattern at byte 32 (beyond first window)",
+      "dst_port": 7777,
+      "payload_hex": "474d45303030303031424547490000000000000000000000000000000000000000909090EBFE31C0",
+      "pps": 15000
+    },
+    {
+      "name": "calm3",
+      "duration_secs": 8,
+      "type": "custom",
+      "description": "Recovery",
+      "dst_port": 7777,
+      "payload_hex": "474d4530303030303142454749"
+    },
+    {
+      "name": "attack_sandwich",
+      "duration_secs": 10,
+      "type": "custom",
+      "description": "Attack: unfamiliar prefix + familiar middle + unfamiliar suffix",
+      "dst_port": 7777,
+      "payload_hex": "FFACFBCA010203FFFACB",
+      "pps": 15000
+    },
+    {
+      "name": "calm4",
+      "duration_secs": 8,
+      "type": "custom",
+      "description": "Recovery",
+      "dst_port": 7777,
+      "payload_hex": "474d4530303030303142454749"
+    },
+    {
+      "name": "attack_long_signature",
+      "duration_secs": 10,
+      "type": "custom",
+      "description": "Attack: 16-byte constant signature",
+      "dst_port": 7777,
+      "payload_hex": "C0FEBABE1337133713371337DEADBEEFCAFEF00D",
+      "pps": 15000
+    },
+    {
+      "name": "final_baseline",
+      "duration_secs": 10,
+      "type": "custom",
+      "description": "Final recovery - sidecar should have generated payload l4-match rules",
+      "dst_port": 7777,
+      "payload_hex": "474d4530303030303142454749"
+    }
+  ]
+}

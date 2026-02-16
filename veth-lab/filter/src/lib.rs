@@ -1212,6 +1212,88 @@ impl PacketSample {
         else if self.src_port >= 1024 && self.dst_port < 1024 { "outbound" }
         else { "normal" }
     }
+
+    /// Calculate the offset to L4 payload within sample.data.
+    /// Returns None if the packet is too short or malformed.
+    pub fn l4_payload_offset(&self) -> Option<usize> {
+        const ETH_HDR_LEN: usize = 14;
+        
+        if self.cap_len < (ETH_HDR_LEN + 20) as u32 {
+            return None; // Too short for IP header
+        }
+
+        // Parse IP header length from IHL field
+        let ihl = (self.data[ETH_HDR_LEN] & 0x0F) as usize;
+        let ip_hdr_len = ihl * 4;
+        
+        if ip_hdr_len < 20 || ip_hdr_len > 60 {
+            return None; // Invalid IHL
+        }
+
+        let l4_start = ETH_HDR_LEN + ip_hdr_len;
+        
+        if self.cap_len < l4_start as u32 {
+            return None; // Packet truncated before L4
+        }
+
+        // Parse L4 header length
+        let l4_hdr_len = match self.protocol {
+            6 => {
+                // TCP: data offset in upper 4 bits of byte 12
+                if self.cap_len < (l4_start + 13) as u32 {
+                    return None;
+                }
+                let data_offset = (self.data[l4_start + 12] >> 4) as usize;
+                data_offset * 4
+            }
+            17 => 8, // UDP header is always 8 bytes
+            _ => return None, // Only TCP/UDP supported
+        };
+
+        let payload_start = l4_start + l4_hdr_len;
+        
+        if payload_start >= self.cap_len as usize {
+            return None; // No payload
+        }
+
+        Some(payload_start)
+    }
+
+    /// Return the L4 header length in bytes, derived from the packet itself.
+    /// TCP: parsed from data-offset field (min 20). UDP: 8. Returns None for other protos.
+    pub fn l4_header_len(&self) -> Option<usize> {
+        const ETH_HDR_LEN: usize = 14;
+        if self.cap_len < (ETH_HDR_LEN + 20) as u32 {
+            return None;
+        }
+        let ihl = (self.data[ETH_HDR_LEN] & 0x0F) as usize;
+        let ip_hdr_len = ihl * 4;
+        if ip_hdr_len < 20 || ip_hdr_len > 60 {
+            return None;
+        }
+        let l4_start = ETH_HDR_LEN + ip_hdr_len;
+        match self.protocol {
+            6 => {
+                if self.cap_len < (l4_start + 13) as u32 { return None; }
+                let data_offset = (self.data[l4_start + 12] >> 4) as usize;
+                if data_offset < 5 { return None; }
+                Some(data_offset * 4)
+            }
+            17 => Some(8),
+            _ => None,
+        }
+    }
+
+    /// Get L4 payload slice from sample data.
+    /// Returns empty slice if no payload is available.
+    pub fn l4_payload(&self) -> &[u8] {
+        self.l4_payload_offset()
+            .map(|offset| {
+                let end = std::cmp::min(self.cap_len as usize, SAMPLE_DATA_SIZE);
+                &self.data[offset..end]
+            })
+            .unwrap_or(&[])
+    }
     pub fn size_class(&self) -> &'static str {
         match self.pkt_len { 0..=100 => "tiny", 101..=500 => "small", 501..=1500 => "medium", _ => "large" }
     }
