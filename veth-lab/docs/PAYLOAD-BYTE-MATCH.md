@@ -7,7 +7,7 @@
 
 The system autonomously learns what "normal" L4 payloads look like using VSA, then when attack traffic arrives with unfamiliar byte patterns, it drills down to the exact byte positions that differ, groups them into multi-byte signatures, and pushes sparse `l4-match` rules into the eBPF decision tree — all without signatures, training data, or human intervention.
 
-![Payload byte match detection in action](https://github.com/user-attachments/assets/aad82715-3460-4036-8b48-de0e8e79c6c8)
+https://github.com/user-attachments/assets/aad82715-3460-4036-8b48-de0e8e79c6c8
 
 ## How It Works
 
