@@ -19,7 +19,7 @@ use clap::Parser;
 use edn_rs::Edn;
 use holon::{Holon, Primitives, ScalarValue, SegmentMethod, Vector, WalkableValue};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::BufRead;
 use std::net::Ipv4Addr;
@@ -301,7 +301,7 @@ struct FieldTracker {
     /// Whether baseline is frozen (after warmup)
     baseline_frozen: bool,
     /// Window vectors for segment() detection
-    window_history: Vec<Vector>,
+    window_history: VecDeque<Vector>,
     /// Current phase (detected by segment)
     current_phase: String,
     /// Attack codebook for attribution
@@ -327,7 +327,7 @@ impl FieldTracker {
             warmup_windows_count: 0,
             last_reset: Instant::now(),
             baseline_frozen: false,
-            window_history: Vec::new(),
+            window_history: VecDeque::new(),
             current_phase: "learning".to_string(),
             codebook: AttackCodebook::new(),
             variant_detector: VariantDetector::new(),
@@ -606,7 +606,7 @@ impl FieldTracker {
         }
 
         let breakpoints = Primitives::segment(
-            &self.window_history,
+            self.window_history.make_contiguous(),
             5,    // window size for comparison
             0.7,  // threshold (higher = less sensitive)
             SegmentMethod::Diff
@@ -725,11 +725,11 @@ impl FieldTracker {
                         else { 0 }
                     })
                     .collect();
-                self.window_history.push(Vector::from_data(data));
+                self.window_history.push_back(Vector::from_data(data));
 
                 // Keep only last 100 windows
                 if self.window_history.len() > 100 {
-                    self.window_history.remove(0);
+                    self.window_history.pop_front();
                 }
             }
         }
@@ -753,9 +753,9 @@ const NUM_PAYLOAD_WINDOWS: usize = MAX_PAYLOAD_BYTES / PAYLOAD_WINDOW_SIZE; // 8
 /// Per-destination payload anomaly tracking state.
 struct DstPayloadState {
     /// Recent anomalous L4 payloads (truncated to MAX_PAYLOAD_BYTES)
-    anomalous_samples: Vec<Vec<u8>>,
+    anomalous_samples: VecDeque<Vec<u8>>,
     /// Recent normal L4 payloads (truncated to MAX_PAYLOAD_BYTES)
-    normal_samples: Vec<Vec<u8>>,
+    normal_samples: VecDeque<Vec<u8>>,
     /// Count of anomalous payloads seen since last rule derivation
     anomaly_count: usize,
     /// L4 header length observed for this destination (derived from packets)
@@ -769,8 +769,8 @@ struct DstPayloadState {
 impl DstPayloadState {
     fn new(l4_header_len: usize) -> Self {
         Self {
-            anomalous_samples: Vec::new(),
-            normal_samples: Vec::new(),
+            anomalous_samples: VecDeque::new(),
+            normal_samples: VecDeque::new(),
             anomaly_count: 0,
             l4_header_len,
             last_seen: Instant::now(),
@@ -780,9 +780,9 @@ impl DstPayloadState {
 
     fn add_anomalous(&mut self, payload: &[u8]) {
         let truncated: Vec<u8> = payload.iter().take(MAX_PAYLOAD_BYTES).copied().collect();
-        self.anomalous_samples.push(truncated);
+        self.anomalous_samples.push_back(truncated);
         if self.anomalous_samples.len() > 50 {
-            self.anomalous_samples.remove(0);
+            self.anomalous_samples.pop_front();
         }
         self.anomaly_count += 1;
         self.last_seen = Instant::now();
@@ -790,9 +790,9 @@ impl DstPayloadState {
 
     fn add_normal(&mut self, payload: &[u8]) {
         let truncated: Vec<u8> = payload.iter().take(MAX_PAYLOAD_BYTES).copied().collect();
-        self.normal_samples.push(truncated);
+        self.normal_samples.push_back(truncated);
         if self.normal_samples.len() > 100 {
-            self.normal_samples.remove(0);
+            self.normal_samples.pop_front();
         }
     }
 }
@@ -1131,7 +1131,7 @@ impl PayloadTracker {
         baselines: &[Option<Vector>],
         threshold: f64,
         dst_ip: u32,
-        state: &DstPayloadState,
+        state: &mut DstPayloadState,
         use_rate_limit: bool,
         allowed_pps: u32,
     ) -> Option<Vec<RuleSpec>> {
@@ -1140,7 +1140,7 @@ impl PayloadTracker {
         // Step 1: Drill down anomalous windows to find unfamiliar positions
         let mut all_unfamiliar: HashSet<usize> = HashSet::new();
 
-        for atk_payload in &state.anomalous_samples {
+        for atk_payload in state.anomalous_samples.make_contiguous() {
             let truncated = &atk_payload[..std::cmp::min(atk_payload.len(), MAX_PAYLOAD_BYTES)];
             let n_windows = Self::active_windows(truncated.len());
 
@@ -1179,11 +1179,13 @@ impl PayloadTracker {
         detected.sort();
 
         // Step 2: Gap probing -- extend detected positions by checking neighbors
-        let extended = Self::gap_probe(&detected, &state.anomalous_samples, &state.normal_samples);
+        let atk_slice = state.anomalous_samples.make_contiguous();
+        let leg_slice = state.normal_samples.make_contiguous();
+        let extended = Self::gap_probe(&detected, atk_slice, leg_slice);
 
         // Step 3: Collect per-position byte info and find the consensus attack byte
         let pos_info = Self::collect_position_info(
-            &extended, &state.anomalous_samples, &state.normal_samples,
+            &extended, atk_slice, leg_slice,
         );
 
         if pos_info.is_empty() {
@@ -2192,6 +2194,14 @@ fn rule_identity_key(spec: &RuleSpec) -> String {
     format!("{}::{}", constraints_part, action_type)
 }
 
+/// A rule currently active in the decision tree.
+struct ActiveRule {
+    last_seen: Instant,
+    spec: RuleSpec,
+    /// Pre-loaded rules never expire
+    preloaded: bool,
+}
+
 fn attach_manifest_labels_to_dag(
     dag_nodes: &mut [metrics_server::DagNode],
     manifest: &[veth_filter::RuleManifestEntry],
@@ -2211,6 +2221,134 @@ fn attach_manifest_labels_to_dag(
             }
         }
     }
+}
+
+/// Upsert rules into the active rule set.
+///
+/// For each spec: if the rule already exists, refreshes its timestamp and updates the spec
+/// if changed; otherwise inserts a new rule. Broadcasts RuleEvent for both cases.
+/// Returns the rule_keys of newly-added rules so callers can do their own tracking.
+async fn upsert_rules(
+    specs: &[RuleSpec],
+    rules: &mut HashMap<String, ActiveRule>,
+    bucket_key_to_spec: &RwLock<HashMap<u32, RuleSpec>>,
+    tree_dirty: &std::sync::atomic::AtomicBool,
+    metrics_state: &Option<metrics_server::MetricsState>,
+    log_prefix: &str,
+) -> Vec<String> {
+    let mut newly_added = Vec::new();
+
+    for spec in specs {
+        let rule_key = rule_identity_key(spec);
+
+        if let Some(existing) = rules.get_mut(&rule_key) {
+            let spec_changed = existing.spec.to_edn() != spec.to_edn();
+            existing.last_seen = Instant::now();
+            if spec_changed {
+                existing.spec = spec.clone();
+                if let Some(bk) = spec.bucket_key() {
+                    let mut bmap = bucket_key_to_spec.write().await;
+                    bmap.insert(bk, spec.clone());
+                }
+                tree_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+
+            if let Some(ref state) = metrics_state {
+                state.broadcast(metrics_server::MetricsEvent::RuleEvent {
+                    ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+                    action: "refreshed".to_string(),
+                    key: rule_key.clone(),
+                    spec_summary: spec.to_edn(),
+                    is_preloaded: false,
+                    ttl_secs: 300,
+                });
+            }
+        } else {
+            let action_str = match &spec.actions[0] {
+                RuleAction::Drop { .. } => "DROP",
+                RuleAction::RateLimit { .. } => "RATE-LIMIT",
+                RuleAction::Pass { .. } => "PASS",
+                RuleAction::Count { .. } => "COUNT",
+            };
+            info!("    {} [{}]: {}", log_prefix, action_str, spec.describe());
+
+            rules.insert(rule_key.clone(), ActiveRule {
+                last_seen: Instant::now(),
+                spec: spec.clone(),
+                preloaded: false,
+            });
+
+            if let Some(ref state) = metrics_state {
+                state.broadcast(metrics_server::MetricsEvent::RuleEvent {
+                    ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+                    action: "added".to_string(),
+                    key: rule_key.clone(),
+                    spec_summary: spec.to_edn(),
+                    is_preloaded: false,
+                    ttl_secs: 300,
+                });
+            }
+
+            if let Some(bk) = spec.bucket_key() {
+                let mut bmap = bucket_key_to_spec.write().await;
+                bmap.entry(bk).or_insert_with(|| spec.clone());
+            }
+
+            tree_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+            newly_added.push(rule_key);
+        }
+    }
+
+    newly_added
+}
+
+/// Recompile the decision tree and broadcast the updated DAG snapshot.
+///
+/// Shared helper that replaces three nearly-identical blocks (FieldTracker insertion,
+/// PayloadTracker insertion, rule expiry). The guard condition (tree_dirty / enforce)
+/// stays at the call site.
+async fn recompile_tree_and_broadcast(
+    filter: &VethFilter,
+    rules: &HashMap<String, ActiveRule>,
+    tree_counter_labels: &RwLock<HashMap<u32, (String, String)>>,
+    tree_dirty: &std::sync::atomic::AtomicBool,
+    metrics_state: &Option<metrics_server::MetricsState>,
+    log_context: &str,
+) -> Result<()> {
+    let all_specs: Vec<RuleSpec> = rules.values()
+        .map(|r| r.spec.clone())
+        .collect();
+
+    let (nodes, manifest, retired) = filter.compile_and_flip_tree(&all_specs).await?;
+    info!("    Tree recompiled ({}): {} rules -> {} nodes", log_context, all_specs.len(), nodes);
+
+    // Accumulate retired bucket counts BEFORE clearing labels
+    if let Some(ref state) = metrics_state {
+        state.accumulate_retired_counts(&retired).await;
+    }
+
+    // Refresh tree_counter_labels from manifest
+    let mut tcl = tree_counter_labels.write().await;
+    tcl.clear();
+    for entry in &manifest {
+        tcl.insert(entry.rule_id, (entry.action_kind().to_string(), entry.label.clone()));
+    }
+    drop(tcl);
+    tree_dirty.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // Emit DAG snapshot to metrics server
+    if let Some(ref state) = metrics_state {
+        let mut dag_nodes = filter.serialize_dag().await;
+        attach_manifest_labels_to_dag(&mut dag_nodes, &manifest);
+        state.broadcast(metrics_server::MetricsEvent::DagSnapshot {
+            ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+            node_count: dag_nodes.len(),
+            rule_count: all_specs.len(),
+            nodes: dag_nodes,
+        });
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -2357,12 +2495,6 @@ async fn main() -> Result<()> {
 
     // Tracked rules: key -> (last_seen, spec)
     // With tree engine, we maintain the full rule set and recompile on changes.
-    struct ActiveRule {
-        last_seen: Instant,
-        spec: RuleSpec,
-        /// Pre-loaded rules never expire
-        preloaded: bool,
-    }
     let active_rules: Arc<RwLock<HashMap<String, ActiveRule>>> = Arc::new(RwLock::new(HashMap::new()));
     // Whether the tree needs recompilation (set when rules change)
     let tree_dirty: Arc<std::sync::atomic::AtomicBool> = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2545,7 +2677,7 @@ async fn main() -> Result<()> {
     let mut warmup_complete = false;
     
     // Buffer for collecting samples during current window (for payload analysis)
-    let mut window_samples: Vec<PacketSample> = Vec::new();
+    let mut window_samples: VecDeque<PacketSample> = VecDeque::new();
 
     let mut last_window_check = Instant::now();
     let check_interval = Duration::from_millis(100);
@@ -2565,9 +2697,9 @@ async fn main() -> Result<()> {
                         tracker.add_sample(&sample);
 
                         // Buffer sample for payload analysis at window boundary
-                        window_samples.push(sample);
+                        window_samples.push_back(sample);
                         if window_samples.len() > 5000 {
-                            window_samples.remove(0);
+                            window_samples.pop_front();
                         }
 
                         _samples_processed += 1;
@@ -2824,123 +2956,37 @@ async fn main() -> Result<()> {
                     if let Some(spec) =
                         compile_compound_rule(&detections, args.rate_limit, args.sample_rate, window_count)
                     {
-                        // Use constraints + action type for the key (ignore rate value)
-                        let rule_key = rule_identity_key(&spec);
-
                         let mut rules = active_rules.write().await;
-                        if let Some(existing) = rules.get_mut(&rule_key) {
-                            // Refresh timestamp and update spec so action config changes
-                            // (e.g. rate-limit pps) propagate into the next tree compile.
-                            let spec_changed = existing.spec.to_edn() != spec.to_edn();
-                            existing.last_seen = Instant::now();
-                            if spec_changed {
-                                existing.spec = spec.clone();
-                            }
+                        let newly_added = upsert_rules(
+                            &[spec.clone()], &mut rules, &bucket_key_to_spec,
+                            &tree_dirty, &metrics_state, "RULE",
+                        ).await;
 
-                            if spec_changed {
-                                // Update bucket_key_to_spec map for observability
-                                if let Some(bk) = spec.bucket_key() {
-                                    let mut bmap = bucket_key_to_spec.write().await;
-                                    bmap.insert(bk, spec.clone());
-                                }
-                                tree_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
-                            }
-
-                            // Emit refresh event to metrics server
-                            if let Some(ref state) = metrics_state {
-                                state.broadcast(metrics_server::MetricsEvent::RuleEvent {
-                                    ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
-                                    action: "refreshed".to_string(),
-                                    key: rule_key.clone(),
-                                    spec_summary: spec.to_edn(),
-                                    is_preloaded: false,
-                                    ttl_secs: 300,
-                                });
-                            }
-                        } else {
+                        // FieldTracker-specific: log EDN and track action for detection event
+                        if !newly_added.is_empty() {
+                            warn!("    RULE:\n{}", spec.to_edn_pretty());
                             let action_str = match &spec.actions[0] {
                                 RuleAction::Drop { .. } => "DROP",
                                 RuleAction::RateLimit { .. } => "RATE-LIMIT",
                                 RuleAction::Pass { .. } => "PASS",
                                 RuleAction::Count { .. } => "COUNT",
                             };
-                            warn!("    RULE:\n{}", spec.to_edn_pretty());
-                            
-                            // Get rate_pps from first action if it's a rate limit
                             let rate_pps = spec.actions.first().and_then(|a| a.rate_pps());
-                            
                             actions_taken.push(RuleInfo {
                                 rule_type: "tree".to_string(),
                                 value: spec.describe(),
                                 action: action_str.to_string(),
                                 rate_pps,
                             });
-                            rules.insert(rule_key.clone(), ActiveRule {
-                                last_seen: Instant::now(),
-                                spec: spec.clone(),
-                                preloaded: false,
-                            });
-                            
-                            // Emit rule_event to metrics server
-                            if let Some(ref state) = metrics_state {
-                                state.broadcast(metrics_server::MetricsEvent::RuleEvent {
-                                    ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
-                                    action: "added".to_string(),
-                                    key: rule_key.clone(),
-                                    spec_summary: spec.to_edn(),
-                                    is_preloaded: false,
-                                    ttl_secs: 300,
-                                });
-                            }
-                            
-                            // Update bucket_key_to_spec map for observability
-                            if let Some(bk) = spec.bucket_key() {
-                                let mut bmap = bucket_key_to_spec.write().await;
-                                bmap.entry(bk).or_insert_with(|| spec.clone());
-                            }
-
-                            tree_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
 
                         // Recompile and flip tree if rules changed
                         if tree_dirty.load(std::sync::atomic::Ordering::SeqCst) && args.enforce {
-                            let all_specs: Vec<RuleSpec> = rules.values()
-                                .map(|r| r.spec.clone())
-                                .collect();
-                            match filter.compile_and_flip_tree(&all_specs).await {
-                                Ok((nodes, manifest, retired)) => {
-                                    info!("    Tree recompiled: {} rules -> {} nodes", all_specs.len(), nodes);
-                                    
-                                    // Accumulate retired bucket counts BEFORE clearing labels
-                                    // (we need the old label mapping to attribute the counts)
-                                    if let Some(ref state) = metrics_state {
-                                        state.accumulate_retired_counts(&retired).await;
-                                    }
-                                    
-                                    // Refresh tree_counter_labels from manifest
-                                    let mut tcl = tree_counter_labels.write().await;
-                                    tcl.clear();
-                                    for entry in &manifest {
-                                        tcl.insert(entry.rule_id, (entry.action_kind().to_string(), entry.label.clone()));
-                                    }
-                                    drop(tcl);
-                                    tree_dirty.store(false, std::sync::atomic::Ordering::SeqCst);
-                                    
-                                    // Emit DAG snapshot to metrics server
-                                    if let Some(ref state) = metrics_state {
-                                        let mut dag_nodes = filter.serialize_dag().await;
-                                        attach_manifest_labels_to_dag(&mut dag_nodes, &manifest);
-                                        state.broadcast(metrics_server::MetricsEvent::DagSnapshot {
-                                            ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
-                                            node_count: dag_nodes.len(),
-                                            rule_count: all_specs.len(),
-                                            nodes: dag_nodes,
-                                        });
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("    Failed to compile tree: {}", e);
-                                }
+                            if let Err(e) = recompile_tree_and_broadcast(
+                                &filter, &rules, &tree_counter_labels,
+                                &tree_dirty, &metrics_state, "field tracker",
+                            ).await {
+                                warn!("    Failed to compile tree: {}", e);
                             }
                         } else if !args.enforce {
                             info!("    Would compile tree (dry-run): {} rules", rules.len());
@@ -3002,7 +3048,7 @@ async fn main() -> Result<()> {
                 let mut payload_tracker_write = payload_tracker.write().await;
                 
                 // Process all samples from this window
-                payload_tracker_write.process_window_samples(&window_samples);
+                payload_tracker_write.process_window_samples(window_samples.make_contiguous());
                 
                 // Expire old destination states
                 payload_tracker_write.expire_old_dsts(Duration::from_secs(600));
@@ -3014,121 +3060,34 @@ async fn main() -> Result<()> {
                 
                 if !payload_rules.is_empty() {
                     info!(">>> PAYLOAD ANOMALIES DETECTED: {} rule(s) derived", payload_rules.len());
-                    
-                    // Collect (pattern_key, rule_key) pairs for budget tracking
-                    let mut newly_added: Vec<(String, String)> = Vec::new();
-                    
-                    // Insert through the SAME path as FieldTracker rules:
-                    // dedup, RuleEvent broadcast, tree recompile, DagSnapshot
+
                     let mut rules = active_rules.write().await;
-                    for spec in payload_rules {
-                        let rule_key = rule_identity_key(&spec);
-                        
-                        if let Some(existing) = rules.get_mut(&rule_key) {
-                            let spec_changed = existing.spec.to_edn() != spec.to_edn();
-                            existing.last_seen = Instant::now();
-                            if spec_changed {
-                                existing.spec = spec.clone();
-                                if let Some(bk) = spec.bucket_key() {
-                                    let mut bmap = bucket_key_to_spec.write().await;
-                                    bmap.insert(bk, spec.clone());
-                                }
-                                tree_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
-                            }
-                            if let Some(ref state) = metrics_state {
-                                state.broadcast(metrics_server::MetricsEvent::RuleEvent {
-                                    ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
-                                    action: "refreshed".to_string(),
-                                    key: rule_key.clone(),
-                                    spec_summary: spec.to_edn(),
-                                    is_preloaded: false,
-                                    ttl_secs: 300,
-                                });
-                            }
-                        } else {
-                            let action_str = match &spec.actions[0] {
-                                RuleAction::Drop { .. } => "DROP",
-                                RuleAction::RateLimit { .. } => "RATE-LIMIT",
-                                RuleAction::Pass { .. } => "PASS",
-                                RuleAction::Count { .. } => "COUNT",
-                            };
-                            info!("    Adding payload rule [{}]: {}", action_str, spec.describe());
-                            
-                            // Track for budget management
-                            if let Some(pk) = PayloadTracker::pattern_dedup_key(&spec) {
-                                newly_added.push((pk, rule_key.clone()));
-                            }
-                            
-                            rules.insert(rule_key.clone(), ActiveRule {
-                                last_seen: Instant::now(),
-                                spec: spec.clone(),
-                                preloaded: false,
-                            });
-                            
-                            // Emit RuleEvent to metrics server (same as FieldTracker path)
-                            if let Some(ref state) = metrics_state {
-                                state.broadcast(metrics_server::MetricsEvent::RuleEvent {
-                                    ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
-                                    action: "added".to_string(),
-                                    key: rule_key.clone(),
-                                    spec_summary: spec.to_edn(),
-                                    is_preloaded: false,
-                                    ttl_secs: 300,
-                                });
-                            }
-                            
-                            if let Some(bk) = spec.bucket_key() {
-                                let mut bmap = bucket_key_to_spec.write().await;
-                                bmap.entry(bk).or_insert_with(|| spec.clone());
-                            }
-                            
-                            tree_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
-                        }
-                    }
-                    
+                    let newly_added_keys = upsert_rules(
+                        &payload_rules, &mut rules, &bucket_key_to_spec,
+                        &tree_dirty, &metrics_state, "Payload rule",
+                    ).await;
+
                     // Recompile tree if payload rules were added
                     if tree_dirty.load(std::sync::atomic::Ordering::SeqCst) && args.enforce {
-                        let all_specs: Vec<RuleSpec> = rules.values()
-                            .map(|r| r.spec.clone())
-                            .collect();
-                        match filter.compile_and_flip_tree(&all_specs).await {
-                            Ok((nodes, manifest, retired)) => {
-                                info!("    Tree recompiled (payload rules): {} total rules -> {} nodes", all_specs.len(), nodes);
-                                
-                                if let Some(ref state) = metrics_state {
-                                    state.accumulate_retired_counts(&retired).await;
-                                }
-                                
-                                let mut tcl = tree_counter_labels.write().await;
-                                tcl.clear();
-                                for entry in &manifest {
-                                    tcl.insert(entry.rule_id, (entry.action_kind().to_string(), entry.label.clone()));
-                                }
-                                drop(tcl);
-                                tree_dirty.store(false, std::sync::atomic::Ordering::SeqCst);
-                                
-                                if let Some(ref state) = metrics_state {
-                                    let mut dag_nodes = filter.serialize_dag().await;
-                                    attach_manifest_labels_to_dag(&mut dag_nodes, &manifest);
-                                    state.broadcast(metrics_server::MetricsEvent::DagSnapshot {
-                                        ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
-                                        node_count: dag_nodes.len(),
-                                        rule_count: all_specs.len(),
-                                        nodes: dag_nodes,
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                warn!("    Failed to compile tree (payload rules): {}", e);
-                            }
+                        if let Err(e) = recompile_tree_and_broadcast(
+                            &filter, &rules, &tree_counter_labels,
+                            &tree_dirty, &metrics_state, "payload rules",
+                        ).await {
+                            warn!("    Failed to compile tree (payload rules): {}", e);
                         }
                     }
-                    
-                    // Update budget tracker with newly added rules
-                    if !newly_added.is_empty() {
+
+                    // PayloadTracker-specific: track pattern keys for budget management
+                    if !newly_added_keys.is_empty() {
+                        let added_set: HashSet<&str> = newly_added_keys.iter().map(|s| s.as_str()).collect();
                         let mut pt = payload_tracker.write().await;
-                        for (pk, key) in newly_added {
-                            pt.mark_rule_active(pk, key);
+                        for spec in &payload_rules {
+                            let key = rule_identity_key(spec);
+                            if added_set.contains(key.as_str()) {
+                                if let Some(pk) = PayloadTracker::pattern_dedup_key(spec) {
+                                    pt.mark_rule_active(pk, key);
+                                }
+                            }
                         }
                     }
                 }
@@ -3182,45 +3141,15 @@ async fn main() -> Result<()> {
                     } else {
                         info!("Tree cleared (all rules expired)");
                     }
+                    tree_dirty.store(false, std::sync::atomic::Ordering::SeqCst);
                 } else {
-                    let all_specs: Vec<RuleSpec> = rules.values()
-                        .map(|r| r.spec.clone())
-                        .collect();
-                    match filter.compile_and_flip_tree(&all_specs).await {
-                        Ok((nodes, manifest, retired)) => {
-                            info!("Tree recompiled after expiry: {} rules -> {} nodes", all_specs.len(), nodes);
-                            
-                            // Accumulate retired bucket counts BEFORE clearing labels
-                            if let Some(ref state) = metrics_state {
-                                state.accumulate_retired_counts(&retired).await;
-                            }
-                            
-                            // Refresh tree_counter_labels from manifest
-                            let mut tcl = tree_counter_labels.write().await;
-                            tcl.clear();
-                            for entry in &manifest {
-                                tcl.insert(entry.rule_id, (entry.action_kind().to_string(), entry.label.clone()));
-                            }
-                            drop(tcl);
-                            
-                            // Emit DAG snapshot to metrics server
-                            if let Some(ref state) = metrics_state {
-                                let mut dag_nodes = filter.serialize_dag().await;
-                                attach_manifest_labels_to_dag(&mut dag_nodes, &manifest);
-                                state.broadcast(metrics_server::MetricsEvent::DagSnapshot {
-                                    ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
-                                    node_count: dag_nodes.len(),
-                                    rule_count: all_specs.len(),
-                                    nodes: dag_nodes,
-                                });
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to recompile tree after expiry: {}", e);
-                        }
+                    if let Err(e) = recompile_tree_and_broadcast(
+                        &filter, &rules, &tree_counter_labels,
+                        &tree_dirty, &metrics_state, "after expiry",
+                    ).await {
+                        warn!("Failed to recompile tree after expiry: {}", e);
                     }
                 }
-                tree_dirty.store(false, std::sync::atomic::Ordering::SeqCst);
             }
         }
 
