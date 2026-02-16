@@ -3,6 +3,8 @@
 **Date:** 2026-02-16
 **Status:** COMPLETE AND VALIDATED
 
+https://github.com/user-attachments/assets/efdc15d5-c87a-41e1-b568-e5ff2fa96760
+
 ## Overview
 
 The sidecar replaces fixed-time window processing with continuous, per-packet
