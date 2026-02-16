@@ -41,7 +41,7 @@ struct Args {
     #[arg(short, long, default_value = "veth-filter")]
     interface: String,
 
-    /// Detection window in seconds
+    /// (Deprecated) Detection window in seconds. Ignored — decay-based processing is always active.
     #[arg(short, long, default_value = "2")]
     window: u64,
 
@@ -50,9 +50,28 @@ struct Args {
     #[arg(short, long, default_value = "0.85")]
     threshold: f64,
 
-    /// Minimum packets in window before detection
+    /// Minimum packets before analysis tick runs detection
     #[arg(short, long, default_value = "50")]
     min_packets: usize,
+
+    /// Decay half-life in packets. Controls how fast the accumulator forgets.
+    /// At 3000 pps baseline with half-life 1000: ~333ms memory. At 15000 pps attack: ~67ms.
+    #[arg(long, default_value = "1000")]
+    decay_half_life: usize,
+
+    /// Analysis tick every N packets (hybrid: whichever fires first with --analysis-max-ms)
+    #[arg(long, default_value = "200")]
+    analysis_interval: usize,
+
+    /// Maximum milliseconds between analysis ticks (hybrid: whichever fires first with --analysis-interval)
+    #[arg(long, default_value = "200")]
+    analysis_max_ms: u64,
+
+    /// Time-based half-life (ms) for the rate vector accumulator.
+    /// Controls how fast the rate vector forgets old traffic volume.
+    /// Magnitude of the rate vector is proportional to PPS at steady state.
+    #[arg(long, default_value = "2000")]
+    rate_half_life_ms: u64,
 
     /// Concentration threshold for field values (0.0 - 1.0)
     /// Higher = only flag very concentrated values
@@ -67,8 +86,7 @@ struct Args {
     #[arg(long, default_value = "4096")]
     dimensions: usize,
 
-    /// Warmup windows before detection starts
-    /// During warmup, baseline is learned but no anomalies are flagged
+    /// (Deprecated) Warmup windows — ignored. Use --warmup-packets instead.
     #[arg(long, default_value = "5")]
     warmup_windows: u64,
 
@@ -258,46 +276,69 @@ struct AnomalyDetails {
 // Field Tracker with Extended Primitives
 // =============================================================================
 
-/// Tracked statistics for a field value
+/// Tracked statistics for a field value with lazy exponential decay.
+///
+/// Instead of resetting counts each window, each entry decays independently
+/// based on how many packets have elapsed since its last update.
 struct ValueStats {
-    count: u64,
+    count: f64,
     last_seen: Instant,
+    /// Packet counter at last update (for lazy decay computation)
+    last_decay_pkt: u64,
+}
+
+impl ValueStats {
+    /// Return the decayed count as of `current_pkt` using per-packet factor `alpha`.
+    fn decayed_count(&self, current_pkt: u64, alpha: f64) -> f64 {
+        let elapsed = current_pkt.saturating_sub(self.last_decay_pkt);
+        if elapsed == 0 { return self.count; }
+        self.count * alpha.powi(elapsed as i32)
+    }
+
+    /// Decay to `current_pkt`, then add 1.0.
+    fn add_one(&mut self, current_pkt: u64, alpha: f64) {
+        let elapsed = current_pkt.saturating_sub(self.last_decay_pkt);
+        if elapsed > 0 {
+            self.count *= alpha.powi(elapsed as i32);
+            self.last_decay_pkt = current_pkt;
+        }
+        self.count += 1.0;
+        self.last_seen = Instant::now();
+    }
 }
 
 impl Default for ValueStats {
     fn default() -> Self {
         Self {
-            count: 0,
+            count: 0.0,
             last_seen: Instant::now(),
+            last_decay_pkt: 0,
         }
     }
 }
 
-/// Enhanced field tracker using Holon primitives
+/// Enhanced field tracker using Holon primitives with per-packet decay.
+///
+/// Instead of fixed 2-second windows with hard resets, the accumulator decays
+/// exponentially after each packet so recent traffic naturally dominates.
 struct FieldTracker {
     holon: Arc<Holon>,
     /// Baseline accumulator (float, averaged during warmup)
     baseline_acc: Vec<f64>,
     /// Baseline vector (frozen after warmup, used for comparison)
     baseline_vec: Vector,
-    /// Recent accumulator (current window)
+    /// Recent accumulator — decays per-packet after warmup
     recent_acc: Vec<f64>,
-    /// Packet counts per field value (for concentration)
+    /// Packet counts per field value (for concentration, with lazy decay)
     value_counts: HashMap<String, ValueStats>,
     /// Baseline value counts (accumulated during warmup)
     baseline_value_counts: HashMap<String, u64>,
     /// Values that were concentrated during baseline (key: "field:value")
     baseline_concentrated: HashSet<String>,
-    /// Total packets in current window
-    window_count: usize,
     /// Total packets seen during warmup (for proper averaging)
     warmup_total_packets: usize,
-    /// Baseline accumulator magnitude PER WINDOW (for rate ratio calculation)
-    baseline_magnitude_per_window: f64,
-    /// Number of warmup windows (for averaging)
-    warmup_windows_count: usize,
-    /// Last window reset time
-    last_reset: Instant,
+    /// Number of warmup ticks (for averaging)
+    warmup_ticks_count: usize,
     /// Whether baseline is frozen (after warmup)
     baseline_frozen: bool,
     /// Window vectors for segment() detection
@@ -308,11 +349,33 @@ struct FieldTracker {
     codebook: AttackCodebook,
     /// Variant detector
     variant_detector: VariantDetector,
+    /// Per-packet decay factor: 0.5^(1/half_life)
+    decay_factor: f64,
+    /// Monotonic packet counter (for lazy value-count decay)
+    packets_processed: u64,
+    /// Decaying effective packet count (for concentration denominator)
+    total_effective: f64,
+    /// Baseline per-effective-packet magnitude (set at freeze)
+    baseline_steady_magnitude: f64,
+    /// Time-decayed rate accumulator — magnitude encodes PPS
+    rate_acc: Vec<f64>,
+    /// Wall-clock time of last time-based decay application
+    rate_last_update: Instant,
+    /// Time-decay constant: ln(2) / half_life_seconds
+    rate_lambda: f64,
+    /// ||rate_acc|| at freeze time (baseline PPS encoded as magnitude)
+    baseline_rate_magnitude: f64,
 }
 
 impl FieldTracker {
-    fn new(holon: Arc<Holon>) -> Self {
+    fn new(holon: Arc<Holon>, decay_half_life: usize, rate_half_life_ms: u64) -> Self {
         let dims = holon.dimensions();
+        let decay_factor = if decay_half_life > 0 {
+            0.5_f64.powf(1.0 / decay_half_life as f64)
+        } else {
+            1.0 // no decay
+        };
+        let rate_lambda = (2.0_f64).ln() / (rate_half_life_ms as f64 / 1000.0);
         Self {
             holon,
             baseline_acc: vec![0.0; dims],
@@ -321,48 +384,41 @@ impl FieldTracker {
             value_counts: HashMap::new(),
             baseline_value_counts: HashMap::new(),
             baseline_concentrated: HashSet::new(),
-            window_count: 0,
             warmup_total_packets: 0,
-            baseline_magnitude_per_window: 0.0,
-            warmup_windows_count: 0,
-            last_reset: Instant::now(),
+            warmup_ticks_count: 0,
             baseline_frozen: false,
             window_history: VecDeque::new(),
             current_phase: "learning".to_string(),
             codebook: AttackCodebook::new(),
             variant_detector: VariantDetector::new(),
+            decay_factor,
+            packets_processed: 0,
+            total_effective: 0.0,
+            baseline_steady_magnitude: 0.0,
+            rate_acc: vec![0.0; dims],
+            rate_last_update: Instant::now(),
+            rate_lambda,
+            baseline_rate_magnitude: 0.0,
         }
     }
 
-    /// Freeze the baseline (called after warmup)
+    /// Freeze the baseline (called after warmup).
+    ///
+    /// After freezing, snapshots the rate vector magnitude (baseline PPS) and
+    /// clears the direction accumulator for decay-based monitoring.
     fn freeze_baseline(&mut self) {
+        // Fold any remaining recent_acc into baseline before freezing
+        self.accumulate_warmup();
+
         self.baseline_frozen = true;
         self.current_phase = "monitoring".to_string();
 
-        // Add the final window to the baseline accumulator
-        for (i, &v) in self.recent_acc.iter().enumerate() {
-            self.baseline_acc[i] += v;
-        }
-        self.warmup_total_packets += self.window_count;
-        
-        // Add final window's value counts to baseline
-        for (key, stats) in &self.value_counts {
-            *self.baseline_value_counts.entry(key.clone()).or_default() += stats.count;
-        }
-
         // Create normalized baseline vector from accumulated warmup data
-        // Use a lower threshold (0.01) to preserve more signal
         let norm = self.baseline_acc.iter().map(|x| x * x).sum::<f64>().sqrt();
-        
-        // Store baseline magnitude PER WINDOW for rate ratio calculation
-        // We divide by warmup_windows_count to get average magnitude per window
-        // This makes ||recent_window|| / ||baseline_per_window|| comparable
-        let windows_count = self.warmup_windows_count.max(1) as f64;
-        self.baseline_magnitude_per_window = norm / windows_count;
-        
-        info!("Baseline magnitude: total={:.2}, per_window={:.2} ({} windows)",
-              norm, self.baseline_magnitude_per_window, self.warmup_windows_count);
-        
+
+        info!("Baseline magnitude: total={:.2} ({} ticks, {} packets)",
+              norm, self.warmup_ticks_count, self.warmup_total_packets);
+
         if norm > 0.0 {
             let data: Vec<i8> = self.baseline_acc.iter()
                 .map(|&x| {
@@ -376,18 +432,16 @@ impl FieldTracker {
         }
 
         // Compute what was concentrated during baseline (threshold 0.5 = majority)
-        // Group by field
         let mut field_totals: HashMap<&str, u64> = HashMap::new();
         let mut field_values: HashMap<&str, Vec<(&str, u64)>> = HashMap::new();
-        
+
         for (key, &count) in &self.baseline_value_counts {
             if let Some((field, value)) = key.split_once(':') {
                 *field_totals.entry(field).or_default() += count;
                 field_values.entry(field).or_default().push((value, count));
             }
         }
-        
-        // Mark concentrated values (>50% of field traffic)
+
         for (field, total) in &field_totals {
             if let Some(values) = field_values.get(field) {
                 for (value, count) in values {
@@ -399,22 +453,32 @@ impl FieldTracker {
                 }
             }
         }
-        
+
         info!("Baseline concentrated values: {:?}", self.baseline_concentrated);
 
-        // Debug: count non-zero dimensions
         let nnz = self.baseline_vec.data().iter().filter(|&&x| x != 0).count();
-        info!("Baseline built from {} total packets, {} non-zero dimensions ({:.1}%)", 
+        info!("Baseline built from {} total packets, {} non-zero dimensions ({:.1}%)",
               self.warmup_total_packets, nnz, 100.0 * nnz as f64 / self.baseline_vec.dimensions() as f64);
 
-        // Add normal baseline to codebook
         self.codebook.add_pattern("normal_baseline", self.baseline_vec.clone());
 
-        // IMPORTANT: Reset recent_acc so first detection window starts fresh
-        // Otherwise we'd compare the last warmup window against itself (drift=0)
+        // Store baseline per-effective-packet magnitude (kept for diagnostic use).
+        let warmup_pkts = self.warmup_total_packets.max(1) as f64;
+        self.baseline_steady_magnitude = norm / warmup_pkts;
+
+        // Snapshot rate accumulator magnitude — this encodes baseline PPS.
+        // The rate_acc has been running with time-based decay since startup,
+        // so after ~10s of warmup (many half-lives) it's at steady state.
+        self.baseline_rate_magnitude = self.rate_acc.iter()
+            .map(|x| x * x).sum::<f64>().sqrt();
+        info!("Rate vector baseline magnitude: {:.2} (time-decay lambda={:.4}, half-life={:.1}ms)",
+              self.baseline_rate_magnitude, self.rate_lambda, (2.0_f64).ln() / self.rate_lambda * 1000.0);
+
+        // Clear direction state for decay-based processing.
+        // Do NOT clear rate_acc — it's already at steady state.
         self.recent_acc.fill(0.0);
-        self.window_count = 0;
         self.value_counts.clear();
+        self.total_effective = 0.0;
     }
 
     /// Add a learned attack pattern to codebook
@@ -430,18 +494,52 @@ impl FieldTracker {
         }
     }
 
-    /// Add a packet sample to the tracker (using Walkable encoding)
+    /// Add a packet sample to the tracker (using Walkable encoding).
+    ///
+    /// After warmup, applies per-packet exponential decay to `recent_acc` so
+    /// recent traffic naturally dominates the accumulator.
     fn add_sample(&mut self, sample: &PacketSample) {
+        // Apply per-packet decay BEFORE adding (so the new sample is at full weight)
+        if self.baseline_frozen {
+            let alpha = self.decay_factor;
+            for v in &mut self.recent_acc {
+                *v *= alpha;
+            }
+            self.total_effective = self.total_effective * alpha + 1.0;
+        } else {
+            self.total_effective += 1.0;
+        }
+
         // Use Walkable encoding (5x faster than JSON)
         let vec = self.holon.encode_walkable(sample);
 
-        // Add to recent accumulator
+        // Add to recent accumulator (per-packet-decayed, direction only)
         for (i, v) in vec.data().iter().enumerate() {
             self.recent_acc[i] += *v as f64;
         }
 
+        // Time-based decay for rate accumulator (runs during warmup AND monitoring
+        // so the accumulator reaches steady state before freeze)
+        let now = Instant::now();
+        let dt = now.duration_since(self.rate_last_update).as_secs_f64();
+        if dt > 0.0 {
+            let decay = (-self.rate_lambda * dt).exp();
+            for v in &mut self.rate_acc {
+                *v *= decay;
+            }
+            self.rate_last_update = now;
+        }
+        // Add same VSA vector to rate accumulator (magnitude encodes PPS)
+        for (i, v) in vec.data().iter().enumerate() {
+            self.rate_acc[i] += *v as f64;
+        }
+
+        self.packets_processed += 1;
+
         // Track individual field values for concentration analysis
         // All values are raw numbers — same as wireshark/eBPF sees
+        let pkt = self.packets_processed;
+        let alpha = self.decay_factor;
         let mut fields = vec![
             ("src_ip", sample.src_ip_addr().to_string()),
             ("dst_ip", sample.dst_ip_addr().to_string()),
@@ -472,39 +570,40 @@ impl FieldTracker {
         for (field, value) in fields {
             let key = format!("{}:{}", field, value);
             let entry = self.value_counts.entry(key).or_default();
-            entry.count += 1;
-            entry.last_seen = Instant::now();
+            if self.baseline_frozen {
+                entry.add_one(pkt, alpha);
+            } else {
+                entry.count += 1.0;
+                entry.last_seen = Instant::now();
+            }
         }
-
-        self.window_count += 1;
     }
 
-    /// Compute magnitude ratio: ||recent_window|| / ||baseline_per_window||
+    /// Compute magnitude ratio: ||recent_acc|| / ||baseline_steady||
     /// This gives us the rate multiplier - purely from vector operations
     /// If ratio = 10, we're seeing 10x the traffic rate
-    fn compute_magnitude_ratio(&self) -> f64 {
-        if self.baseline_magnitude_per_window < 1e-10 || self.window_count == 0 {
-            return 1.0;
-        }
-        let recent_magnitude = self.recent_acc.iter().map(|x| x * x).sum::<f64>().sqrt();
-        recent_magnitude / self.baseline_magnitude_per_window
-    }
-    
-    /// Compute rate factor from magnitude ratio
-    /// rate_factor = 1 / magnitude_ratio (capped at 1.0)
-    /// If we're seeing 100x traffic, rate_factor = 0.01 (throttle to 1%)
+    /// Compute rate factor from the time-decayed rate accumulator.
+    ///
+    /// The rate_acc uses wall-clock time-based decay (e^{-lambda * dt}), making
+    /// its magnitude proportional to PPS at steady state.  The ratio of current
+    /// magnitude to baseline magnitude gives the traffic volume multiplier:
+    ///   ratio ≈ current_pps / baseline_pps
+    ///   rate_factor = 1 / ratio  (capped at 1.0)
+    ///
+    /// This vector encodes both DIRECTION (traffic pattern) and VOLUME (PPS),
+    /// making it distributable to a fleet of scrubbers.
+    #[allow(dead_code)]
     fn compute_rate_factor(&self) -> f64 {
-        let ratio = self.compute_magnitude_ratio();
-        if ratio > 0.0 {
-            (1.0 / ratio).min(1.0)
-        } else {
-            1.0
-        }
+        if self.baseline_rate_magnitude < 1e-10 { return 1.0; }
+        let current_mag = self.rate_acc.iter()
+            .map(|x| x * x).sum::<f64>().sqrt();
+        let ratio = current_mag / self.baseline_rate_magnitude;
+        if ratio > 0.0 { (1.0 / ratio).min(1.0) } else { 1.0 }
     }
 
     /// Compute detailed anomaly analysis using similarity_profile
     fn compute_anomaly_details(&self) -> AnomalyDetails {
-        if self.window_count == 0 {
+        if self.total_effective < 1.0 {
             return AnomalyDetails {
                 drift: 1.0,
                 anomalous_ratio: 0.0,
@@ -582,8 +681,7 @@ impl FieldTracker {
         // Debug: log vector stats periodically
         let recent_nnz = recent_vec.data().iter().filter(|&&x| x != 0).count();
         let baseline_nnz = self.baseline_vec.data().iter().filter(|&&x| x != 0).count();
-        if self.window_count > 100 {
-            // Log for high-traffic windows (likely attack)
+        if self.total_effective > 100.0 {
             tracing::debug!(
                 "Vector stats: recent_nnz={}, baseline_nnz={}, drift={:.3}",
                 recent_nnz, baseline_nnz, drift
@@ -624,9 +722,9 @@ impl FieldTracker {
         None
     }
 
-    /// Attribute current window to known patterns
+    /// Attribute current accumulator state to known patterns
     fn attribute_pattern(&self) -> Option<(String, f64)> {
-        if self.codebook.is_empty() || self.window_count == 0 {
+        if self.codebook.is_empty() || self.total_effective < 1.0 {
             return None;
         }
 
@@ -649,39 +747,50 @@ impl FieldTracker {
         self.codebook.attribute(&window_vec)
     }
 
-    /// Find concentrated field values (potential attack indicators)
+    /// Find concentrated field values (potential attack indicators).
+    ///
+    /// Uses decayed counts so concentration naturally reflects recent traffic.
     fn find_concentrated_values(&self, threshold: f64) -> Vec<(String, String, f64)> {
         let mut results = Vec::new();
 
-        if self.window_count == 0 {
+        if self.total_effective < 1.0 {
             return results;
         }
 
-        // Group by field
-        let mut field_totals: HashMap<&str, u64> = HashMap::new();
-        let mut field_values: HashMap<&str, Vec<(&str, u64)>> = HashMap::new();
+        let pkt = self.packets_processed;
+        let alpha = self.decay_factor;
+
+        // Group by field using decayed counts
+        let mut field_totals: HashMap<&str, f64> = HashMap::new();
+        let mut field_values: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
 
         for (key, stats) in &self.value_counts {
             if let Some((field, value)) = key.split_once(':') {
-                *field_totals.entry(field).or_default() += stats.count;
-                field_values.entry(field).or_default().push((value, stats.count));
+                let dc = if self.baseline_frozen {
+                    stats.decayed_count(pkt, alpha)
+                } else {
+                    stats.count
+                };
+                if dc < 0.01 { continue; } // prune negligible entries
+                *field_totals.entry(field).or_default() += dc;
+                field_values.entry(field).or_default().push((value, dc));
             }
         }
 
         // Find concentrated values that are NEW (not in baseline)
         for (field, total) in field_totals {
+            if total < 0.01 { continue; }
             if let Some(values) = field_values.get(field) {
                 for (value, count) in values {
-                    let concentration = *count as f64 / total as f64;
+                    let concentration = *count / total;
                     if concentration >= threshold {
                         let key = format!("{}:{}", field, value);
-                        
+
                         // Skip values that were concentrated during baseline
-                        // These are "expected" concentrations
                         if self.baseline_concentrated.contains(&key) {
                             continue;
                         }
-                        
+
                         results.push((
                             field.to_string(),
                             value.to_string(),
@@ -697,49 +806,55 @@ impl FieldTracker {
         results
     }
 
-    /// Reset the window
-    fn reset_window(&mut self) {
-        // During warmup, accumulate into baseline_acc (will be normalized when frozen)
-        if !self.baseline_frozen && self.window_count > 0 {
-            for (i, &v) in self.recent_acc.iter().enumerate() {
-                self.baseline_acc[i] += v;
-            }
-            self.warmup_total_packets += self.window_count;
-            self.warmup_windows_count += 1;
-            
-            // Also accumulate value counts into baseline for concentration tracking
-            for (key, stats) in &self.value_counts {
-                *self.baseline_value_counts.entry(key.clone()).or_default() += stats.count;
-            }
-        }
+    /// Snapshot the current accumulator state into window_history for segment() detection.
+    /// Called at each analysis tick (replaces the window_history push from reset_window).
+    fn snapshot_history(&mut self) {
+        if self.total_effective < 1.0 { return; }
 
-        // Save window vector for segment() history
-        if self.window_count > 0 {
-            let norm = self.recent_acc.iter().map(|x| x * x).sum::<f64>().sqrt();
-            if norm > 0.0 {
-                let data: Vec<i8> = self.recent_acc.iter()
-                    .map(|&x| {
-                        let normalized = x / norm;
-                        if normalized > 0.01 { 1 }
-                        else if normalized < -0.01 { -1 }
-                        else { 0 }
-                    })
-                    .collect();
-                self.window_history.push_back(Vector::from_data(data));
+        let norm = self.recent_acc.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm > 0.0 {
+            let data: Vec<i8> = self.recent_acc.iter()
+                .map(|&x| {
+                    let normalized = x / norm;
+                    if normalized > 0.01 { 1 }
+                    else if normalized < -0.01 { -1 }
+                    else { 0 }
+                })
+                .collect();
+            self.window_history.push_back(Vector::from_data(data));
 
-                // Keep only last 100 windows
-                if self.window_history.len() > 100 {
-                    self.window_history.pop_front();
-                }
+            if self.window_history.len() > 100 {
+                self.window_history.pop_front();
             }
         }
+    }
 
-        // Clear recent
+    /// During warmup: fold current recent_acc into baseline_acc and clear for next tick.
+    /// This is the warmup-only equivalent of the old reset_window() baseline path.
+    fn accumulate_warmup(&mut self) {
+        if self.baseline_frozen { return; }
+        if self.total_effective < 1.0 { return; }
+
+        for (i, &v) in self.recent_acc.iter().enumerate() {
+            self.baseline_acc[i] += v;
+        }
+        self.warmup_total_packets += self.total_effective as usize;
+        self.warmup_ticks_count += 1;
+
+        // Accumulate value counts into baseline for concentration tracking
+        for (key, stats) in &self.value_counts {
+            *self.baseline_value_counts.entry(key.clone()).or_default() += stats.count as u64;
+        }
+
+        // Snapshot history during warmup too
+        self.snapshot_history();
+
+        // Clear for next warmup tick (no decay during warmup)
         self.recent_acc.fill(0.0);
         self.value_counts.clear();
-        self.window_count = 0;
-        self.last_reset = Instant::now();
+        self.total_effective = 0.0;
     }
+
 }
 
 // =============================================================================
@@ -999,43 +1114,45 @@ impl PayloadTracker {
         Some(self.holon.similarity(&vec, baseline))
     }
 
-    /// Process a batch of samples: score each against baseline, classify, store.
-    fn process_window_samples(&mut self, samples: &[PacketSample]) {
-        if !self.baseline_frozen || samples.is_empty() {
-            return;
-        }
+    /// Score and classify a single sample against baseline, storing in per-dst state.
+    fn process_single_sample(&mut self, sample: &PacketSample) {
+        if !self.baseline_frozen { return; }
 
-        for sample in samples {
-            let l4_payload = sample.l4_payload();
-            if l4_payload.is_empty() { continue; }
-            let l4_hdr_len = sample.l4_header_len().unwrap_or(0);
+        let l4_payload = sample.l4_payload();
+        if l4_payload.is_empty() { return; }
+        let l4_hdr_len = sample.l4_header_len().unwrap_or(0);
 
-            let truncated = &l4_payload[..std::cmp::min(l4_payload.len(), MAX_PAYLOAD_BYTES)];
-            let n_windows = Self::active_windows(truncated.len());
+        let truncated = &l4_payload[..std::cmp::min(l4_payload.len(), MAX_PAYLOAD_BYTES)];
+        let n_windows = Self::active_windows(truncated.len());
 
-            // Check if any active window scores below the anomaly threshold
-            let mut is_anomalous = false;
-            for w in 0..n_windows {
-                if let Some(sim) = self.score_window(truncated, w) {
-                    if sim < self.anomaly_threshold {
-                        is_anomalous = true;
-                        break;
-                    }
+        let mut is_anomalous = false;
+        for w in 0..n_windows {
+            if let Some(sim) = self.score_window(truncated, w) {
+                if sim < self.anomaly_threshold {
+                    is_anomalous = true;
+                    break;
                 }
             }
+        }
 
-            let dst_state = self.dst_states
-                .entry(sample.dst_ip)
-                .or_insert_with(|| DstPayloadState::new(l4_hdr_len));
+        let dst_state = self.dst_states
+            .entry(sample.dst_ip)
+            .or_insert_with(|| DstPayloadState::new(l4_hdr_len));
 
-            // Update l4_header_len from most recent packet
-            dst_state.l4_header_len = l4_hdr_len;
+        dst_state.l4_header_len = l4_hdr_len;
 
-            if is_anomalous {
-                dst_state.add_anomalous(l4_payload);
-            } else {
-                dst_state.add_normal(l4_payload);
-            }
+        if is_anomalous {
+            dst_state.add_anomalous(l4_payload);
+        } else {
+            dst_state.add_normal(l4_payload);
+        }
+    }
+
+    /// Process a batch of samples (delegates to process_single_sample).
+    #[allow(dead_code)]
+    fn process_window_samples(&mut self, samples: &[PacketSample]) {
+        for sample in samples {
+            self.process_single_sample(sample);
         }
     }
 
@@ -1071,8 +1188,8 @@ impl PayloadTracker {
     }
 
     /// Check all destinations and derive rules for those ready.
-    /// `estimated_current_pps` and `rate_factor` come from the FieldTracker's
-    /// vector-derived magnitude ratio -- the same source used for system rules.
+    /// `estimated_current_pps` is the per-tick PPS estimate from sample counts.
+    /// `rate_factor` comes from the FieldTracker's time-decayed rate vector.
     fn check_and_derive_rules(&mut self, estimated_current_pps: f64, rate_factor: f64) -> Vec<RuleSpec> {
         let mut rules = Vec::new();
         let now = Instant::now();
@@ -1478,10 +1595,9 @@ impl Detection {
     }
 
     /// Compile a single detection into a RuleSpec
-    fn compile_rule_spec(&self, use_rate_limit: bool, sample_rate: u32, window_samples: usize) -> Option<RuleSpec> {
+    fn compile_rule_spec(&self, use_rate_limit: bool, estimated_pps: f64) -> Option<RuleSpec> {
         let constraint = self.to_constraint()?;
-        let estimated_current_pps = (window_samples as f64 * sample_rate as f64) / 2.0;
-        let allowed_pps = (estimated_current_pps * self.rate_factor).max(100.0) as u32;
+        let allowed_pps = (estimated_pps * self.rate_factor).max(100.0) as u32;
         
         // Build a stable name from constraints so bucket_key() doesn't change
         // when pps wobbles across detection windows. This preserves eBPF token
@@ -2138,12 +2254,11 @@ fn parse_edn_action(edn: &Edn) -> Result<Option<RuleAction>> {
 fn compile_compound_rule(
     detections: &[Detection],
     use_rate_limit: bool,
-    sample_rate: u32,
-    window_samples: usize,
+    estimated_pps: f64,
 ) -> Option<RuleSpec> {
     if detections.is_empty() { return None; }
     if detections.len() == 1 {
-        return detections[0].compile_rule_spec(use_rate_limit, sample_rate, window_samples);
+        return detections[0].compile_rule_spec(use_rate_limit, estimated_pps);
     }
 
     let constraints: Vec<Predicate> = detections.iter()
@@ -2151,9 +2266,8 @@ fn compile_compound_rule(
         .collect();
     if constraints.is_empty() { return None; }
 
-    let estimated_current_pps = (window_samples as f64 * sample_rate as f64) / 2.0;
     let rate_factor = detections[0].rate_factor;
-    let allowed_pps = (estimated_current_pps * rate_factor).max(100.0) as u32;
+    let allowed_pps = (estimated_pps * rate_factor).max(100.0) as u32;
     
     // Build a stable name from constraints so bucket_key() doesn't change
     // when pps wobbles across detection windows. This preserves eBPF token
@@ -2419,8 +2533,8 @@ async fn main() -> Result<()> {
     let holon = Arc::new(Holon::new(args.dimensions));
     info!("Holon initialized with {} dimensions", args.dimensions);
 
-    // Create enhanced field tracker
-    let tracker = Arc::new(RwLock::new(FieldTracker::new(holon.clone())));
+    // Create enhanced field tracker with decay
+    let tracker = Arc::new(RwLock::new(FieldTracker::new(holon.clone(), args.decay_half_life, args.rate_half_life_ms)));
     
     // Create payload tracker
     let payload_tracker = Arc::new(RwLock::new(PayloadTracker::new(
@@ -2610,10 +2724,20 @@ async fn main() -> Result<()> {
         }
     }
 
+    if args.window != 2 {
+        warn!("--window is deprecated and ignored; decay-based processing is always active");
+    }
+
     let preloaded_count = active_rules.read().await.values().filter(|r| r.preloaded).count();
-    info!("Starting enhanced detection loop...");
+    info!("Starting enhanced detection loop (decay-based)...");
     info!("  Pre-loaded rules: {} (permanent)", preloaded_count);
-    info!("  Warmup: {} windows or {} packets", args.warmup_windows, args.warmup_packets);
+    info!("  Decay half-life: {} packets (factor={:.6})",
+          args.decay_half_life, 0.5_f64.powf(1.0 / args.decay_half_life.max(1) as f64));
+    info!("  Analysis trigger: every {} packets or {} ms (hybrid)",
+          args.analysis_interval, args.analysis_max_ms);
+    info!("  Rate vector half-life: {}ms (time-based decay for PPS encoding)",
+          args.rate_half_life_ms);
+    info!("  Warmup: {} packets", args.warmup_packets);
     info!("");
 
     // ── Start metrics server if enabled ──
@@ -2670,40 +2794,56 @@ async fn main() -> Result<()> {
         None
     };
 
-    let window_duration = Duration::from_secs(args.window);
+    let analysis_max_dur = Duration::from_millis(args.analysis_max_ms);
     let mut _samples_processed = 0u64;
-    let mut windows_processed = 0u64;
+    let mut ticks_processed = 0u64;
     let mut total_warmup_packets = 0usize;
     let mut warmup_complete = false;
-    
-    // Buffer for collecting samples during current window (for payload analysis)
-    let mut window_samples: VecDeque<PacketSample> = VecDeque::new();
 
-    let mut last_window_check = Instant::now();
-    let check_interval = Duration::from_millis(100);
-    const MAX_SAMPLES_PER_CHECK: usize = 200;
-    let mut samples_since_window_check = 0usize;
+    // Scalar PPS baseline for instant-response rate limiting.
+    // The rate vector (time-decayed) also encodes PPS but lags behind rate
+    // changes — it's useful for fleet distribution, not local rate_factor.
+    // warmup_first_sample is set when the first sample arrives (not at program init)
+    // to avoid counting pre-traffic dead time in the PPS calculation.
+    let mut warmup_first_sample: Option<Instant> = None;
+    let mut baseline_pps: f64 = 0.0;
+
+    // Hybrid analysis trigger state
+    let mut packets_since_tick = 0usize;
+    let mut last_tick = Instant::now();
+
+    const MAX_SAMPLES_PER_BATCH: usize = 200;
 
     loop {
         let mut got_sample = false;
         let mut matched_rule_keys: Vec<String> = Vec::new();
 
+        // ── Per-packet processing ──
         {
-            let mut tracker = tracker.write().await;
+            let mut tracker_w = tracker.write().await;
+            let mut pt = payload_tracker.write().await;
 
-            for _ in 0..MAX_SAMPLES_PER_CHECK {
+            for _ in 0..MAX_SAMPLES_PER_BATCH {
                 match sample_rx.try_recv() {
                     Ok(sample) => {
-                        tracker.add_sample(&sample);
+                        // Record first sample time for accurate PPS calculation
+                        if warmup_first_sample.is_none() {
+                            warmup_first_sample = Some(Instant::now());
+                        }
 
-                        // Buffer sample for payload analysis at window boundary
-                        window_samples.push_back(sample);
-                        if window_samples.len() > 5000 {
-                            window_samples.pop_front();
+                        // FieldTracker: add_sample includes per-packet decay after warmup
+                        tracker_w.add_sample(&sample);
+
+                        // PayloadTracker: inline per-packet processing
+                        if warmup_complete {
+                            pt.process_single_sample(&sample);
+                        } else {
+                            let l4 = sample.l4_payload();
+                            if !l4.is_empty() { pt.learn(l4); }
                         }
 
                         _samples_processed += 1;
-                        samples_since_window_check += 1;
+                        packets_since_tick += 1;
                         got_sample = true;
 
                         if sample.matched_rule != 0 {
@@ -2731,10 +2871,12 @@ async fn main() -> Result<()> {
             }
         }
 
-        let should_check_window = last_window_check.elapsed() >= check_interval
-            || samples_since_window_check >= 1000;
+        // ── Hybrid analysis trigger ──
+        let tick_elapsed = last_tick.elapsed();
+        let should_tick = packets_since_tick >= args.analysis_interval
+            || tick_elapsed >= analysis_max_dur;
 
-        if !should_check_window {
+        if !should_tick {
             if !got_sample {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             } else {
@@ -2743,412 +2885,390 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        last_window_check = Instant::now();
-        samples_since_window_check = 0;
+        // Compute PPS estimate for this tick (before resetting counters)
+        let tick_secs = tick_elapsed.as_secs_f64().max(0.001);
+        let estimated_pps = (packets_since_tick as f64 * args.sample_rate as f64) / tick_secs;
+
+        ticks_processed += 1;
+        packets_since_tick = 0;
+        last_tick = Instant::now();
 
         let tracker_read = tracker.read().await;
-        let window_elapsed = tracker_read.last_reset.elapsed() >= window_duration;
-        let has_enough_samples = tracker_read.window_count >= args.min_packets;
+        let current_phase = tracker_read.current_phase.clone();
         drop(tracker_read);
 
-        if window_elapsed {
-            windows_processed += 1;
+        // ── Warmup path ──
+        // During warmup: accumulate into baseline regardless of sample count.
+        // Check warmup completion thresholds every tick.
+        if !warmup_complete {
+            let effective = tracker.read().await.total_effective;
+            {
+                let mut tracker_w = tracker.write().await;
+                total_warmup_packets += tracker_w.total_effective as usize;
+                tracker_w.accumulate_warmup();
+            }
 
-            // Extract window_count and rate_factor at the window scope so both
-            // FieldTracker analysis and PayloadTracker rule derivation can use them.
-            let (ft_window_count, ft_rate_factor) = {
-                let tr = tracker.read().await;
-                (tr.window_count, tr.compute_rate_factor())
-            };
+            let warmup_by_packets = total_warmup_packets >= args.warmup_packets;
 
-            if has_enough_samples {
-                // Get enhanced anomaly details
-                let tracker_read = tracker.read().await;
-                let anomaly = tracker_read.compute_anomaly_details();
-                let concentrated = tracker_read.find_concentrated_values(args.concentration);
-                let window_count = tracker_read.window_count;
-                let current_phase = tracker_read.current_phase.clone();
-                let attribution = tracker_read.attribute_pattern();
-                // Get vector-derived rate factor: 1/magnitude_ratio
-                let rate_factor = tracker_read.compute_rate_factor();
-                drop(tracker_read);
+            if warmup_by_packets {
+                warmup_complete = true;
+                tracker.write().await.freeze_baseline();
+                payload_tracker.write().await.freeze_baseline();
 
-                total_warmup_packets += window_count;
+                // Compute scalar baseline PPS for instant-response rate limiting.
+                // Use time since first sample (not program init) to exclude pre-traffic dead time.
+                let warmup_secs = warmup_first_sample
+                    .map(|t| t.elapsed().as_secs_f64())
+                    .unwrap_or(1.0)
+                    .max(0.1);
+                baseline_pps = (total_warmup_packets as f64 * args.sample_rate as f64) / warmup_secs;
 
-                let stats = filter.stats().await.ok();
-                let hard_drops = stats.as_ref().map(|s| s.dropped_packets).unwrap_or(0);
-                let rate_drops = stats.as_ref().map(|s| s.rate_limited_packets).unwrap_or(0);
-                let drops = hard_drops + rate_drops;
-                let total = stats.as_ref().map(|s| s.total_packets).unwrap_or(0);
-                let dfs_comp = stats.as_ref().map(|s| s.dfs_completions).unwrap_or(0);
-                let tc_entries = stats.as_ref().map(|s| s.tail_call_entries).unwrap_or(0);
-                let d_eval2 = stats.as_ref().map(|s| s.diag_eval2).unwrap_or(0);
-                let d_root = stats.as_ref().map(|s| s.diag_root_ok).unwrap_or(0);
-                let d_state = stats.as_ref().map(|s| s.diag_state_ok).unwrap_or(0);
-                let d_tc_try = stats.as_ref().map(|s| s.diag_tc_attempt).unwrap_or(0);
-                let d_tc_fail = stats.as_ref().map(|s| s.diag_tc_fail).unwrap_or(0);
-
-                // Check warmup
-                if !warmup_complete {
-                    // Feed buffered samples to payload tracker for learning
-                    {
-                        let mut pt = payload_tracker.write().await;
-                        for s in &window_samples {
-                            let l4 = s.l4_payload();
-                            if !l4.is_empty() { pt.learn(l4); }
-                        }
-                    }
-                    window_samples.clear();
-
-                    let warmup_by_windows = windows_processed >= args.warmup_windows;
-                    let warmup_by_packets = total_warmup_packets >= args.warmup_packets;
-
-                    if warmup_by_windows || warmup_by_packets {
-                        warmup_complete = true;
-                        tracker.write().await.freeze_baseline();
-                        payload_tracker.write().await.freeze_baseline();
-                        info!("========================================");
-                        info!("WARMUP COMPLETE - baseline FROZEN");
-                        info!("  Windows: {}, Packets: {}", windows_processed, total_warmup_packets);
-                        info!("  Detection now active with extended primitives!");
-                        info!("  Payload tracking: {} windows frozen", NUM_PAYLOAD_WINDOWS);
-                        info!("========================================");
-                        // Skip detection on this window - baseline was just frozen from this data
-                        // Next window will be first real detection
-                        continue;
-                    } else {
-                        info!(
-                            "Window {} [WARMUP]: {} packets, drift={:.3} | XDP total: {}, dropped: {} (hard:{} rate:{}) | DFS tc:{} comp:{} | DIAG eval2:{} root:{} state:{} tc_try:{} tc_fail:{} | warmup {}/{} windows, {}/{} packets",
-                            windows_processed, window_count, anomaly.drift, total, drops, hard_drops, rate_drops,
-                            tc_entries, dfs_comp,
-                            d_eval2, d_root, d_state, d_tc_try, d_tc_fail,
-                            windows_processed, args.warmup_windows,
-                            total_warmup_packets, args.warmup_packets
-                        );
-                        tracker.write().await.reset_window();
-                        continue;
-                    }
-                }
-
-                // Check for phase changes
-                if let Some(new_phase) = tracker.write().await.detect_phase_changes() {
-                    warn!(">>> PHASE CHANGE DETECTED: {}", new_phase);
-                }
-
-                info!(
-                    "Window {}: {} packets, drift={:.3}, anom_ratio={:.1}%, phase={} | XDP total: {}, dropped: {} (hard:{} rate:{}) | DFS tc:{} comp:{} | DIAG eval2:{} root:{} state:{} tc_try:{} tc_fail:{}",
-                    windows_processed, window_count, anomaly.drift, anomaly.anomalous_ratio * 100.0,
-                    current_phase, total, drops, hard_drops, rate_drops, tc_entries, dfs_comp,
-                    d_eval2, d_root, d_state, d_tc_try, d_tc_fail
-                );
-                
-                // Print TREE_COUNTERS stats every 10 windows, grouped by action kind
-                if windows_processed % 10 == 0 {
-                    if let Ok(counter_values) = filter.read_counters().await {
-                        if !counter_values.is_empty() {
-                            let tcl = tree_counter_labels.read().await;
-                            
-                            // Partition entries by action kind using the manifest
-                            let mut pass_entries: Vec<(u32, u64, String)> = Vec::new();
-                            let mut count_entries: Vec<(u32, u64, String)> = Vec::new();
-                            let mut drop_entries: Vec<(u32, u64, String)> = Vec::new();
-                            let mut other_entries: Vec<(u32, u64, String, String)> = Vec::new();
-
-                            for &(key, value) in &counter_values {
-                                if let Some((kind, label)) = tcl.get(&key) {
-                                    match kind.as_str() {
-                                        "pass" => pass_entries.push((key, value, label.clone())),
-                                        "count" => count_entries.push((key, value, label.clone())),
-                                        "drop" => drop_entries.push((key, value, label.clone())),
-                                        other => other_entries.push((key, value, label.clone(), other.to_string())),
-                                    }
-                                } else {
-                                    // Entry not in manifest — could be from a previous compilation
-                                    other_entries.push((key, value, format!("unknown-0x{:08x}", key), "?".to_string()));
-                                }
-                            }
-
-                            if !pass_entries.is_empty() {
-                                info!("=== Pass Actions (window {}) ===", windows_processed);
-                                pass_entries.sort_by_key(|(_, v, _)| std::cmp::Reverse(*v));
-                                for (_, value, label) in &pass_entries {
-                                    info!("  {} {} packets passed", label, value);
-                                }
-                            }
-
-                            if !count_entries.is_empty() {
-                                info!("=== Count Actions (window {}) ===", windows_processed);
-                                count_entries.sort_by_key(|(_, v, _)| std::cmp::Reverse(*v));
-                                for (_, value, label) in &count_entries {
-                                    info!("  {} {} packets", label, value);
-                                }
-                            }
-
-                            if !drop_entries.is_empty() {
-                                info!("=== Drop Actions (window {}) ===", windows_processed);
-                                drop_entries.sort_by_key(|(_, v, _)| std::cmp::Reverse(*v));
-                                for (_, value, label) in &drop_entries {
-                                    info!("  {} {} packets dropped", label, value);
-                                }
-                            }
-
-                            if !other_entries.is_empty() {
-                                for (key, value, label, kind) in &other_entries {
-                                    info!("  [{}] {} {} packets (key 0x{:08x})", kind, label, value, key);
-                                }
-                            }
-                        }
-                    }
-
-                    // Report rate limiter stats
-                    if let Ok(rate_stats) = filter.read_rate_limit_stats().await {
-                        if !rate_stats.is_empty() {
-                            info!("=== Rate Limiters (window {}) ===", windows_processed);
-                            let mut sorted = rate_stats.clone();
-                            sorted.sort_by_key(|(_, allowed, dropped)| std::cmp::Reverse(allowed + dropped));
-                            
-                            let rate_map = rate_limiter_names.read().await;
-                            let bucket_map = bucket_key_to_spec.read().await;
-                            
-                            for (key, allowed, dropped) in sorted {
-                                // First check if it's a named rate limiter
-                                if let Some((ns, name)) = rate_map.get(&key) {
-                                    info!("  [{} {}] allowed: {}  dropped: {}", ns, name, allowed, dropped);
-                                } else {
-                                    // Unnamed limiter - look up rule by bucket_key
-                                    let label = bucket_map.get(&key)
-                                        .map(|spec| spec.display_label())
-                                        .unwrap_or_else(|| format!("unknown-0x{:08x}", key));
-                                    info!("  {} allowed: {}  dropped: {}", label, allowed, dropped);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Log attribution if available
-                if let Some((pattern, confidence)) = &attribution {
-                    info!("    Attribution: {} ({:.1}% confidence)", pattern, confidence * 100.0);
-                }
-
-                // Check for anomaly
-                if anomaly.drift < args.threshold && !concentrated.is_empty() {
-                    warn!(">>> ANOMALY DETECTED: drift={:.3}, anomalous_ratio={:.1}%",
-                          anomaly.drift, anomaly.anomalous_ratio * 100.0);
-
-                    let mut actions_taken = Vec::new();
-
-                    // Build detections from concentrated fields
-                    let detections: Vec<Detection> = concentrated.iter().map(|(field, value, conc)| {
-                        warn!("    Concentrated: {}={} ({:.1}%)", field, value, conc * 100.0);
-                        Detection {
-                            field: field.clone(),
-                            value: value.clone(),
-                            concentration: *conc,
-                            drift: anomaly.drift,
-                            anomalous_ratio: anomaly.anomalous_ratio,
-                            attributed_pattern: attribution.as_ref().map(|(p, _)| p.clone()),
-                            rate_factor,
-                        }
-                    }).collect();
-
-                    // Compile compound rule from all concentrated detections
-                    if let Some(spec) =
-                        compile_compound_rule(&detections, args.rate_limit, args.sample_rate, window_count)
-                    {
-                        let mut rules = active_rules.write().await;
-                        let newly_added = upsert_rules(
-                            &[spec.clone()], &mut rules, &bucket_key_to_spec,
-                            &tree_dirty, &metrics_state, "RULE",
-                        ).await;
-
-                        // FieldTracker-specific: log EDN and track action for detection event
-                        if !newly_added.is_empty() {
-                            warn!("    RULE:\n{}", spec.to_edn_pretty());
-                            let action_str = match &spec.actions[0] {
-                                RuleAction::Drop { .. } => "DROP",
-                                RuleAction::RateLimit { .. } => "RATE-LIMIT",
-                                RuleAction::Pass { .. } => "PASS",
-                                RuleAction::Count { .. } => "COUNT",
-                            };
-                            let rate_pps = spec.actions.first().and_then(|a| a.rate_pps());
-                            actions_taken.push(RuleInfo {
-                                rule_type: "tree".to_string(),
-                                value: spec.describe(),
-                                action: action_str.to_string(),
-                                rate_pps,
-                            });
-                        }
-
-                        // Recompile and flip tree if rules changed
-                        if tree_dirty.load(std::sync::atomic::Ordering::SeqCst) && args.enforce {
-                            if let Err(e) = recompile_tree_and_broadcast(
-                                &filter, &rules, &tree_counter_labels,
-                                &tree_dirty, &metrics_state, "field tracker",
-                            ).await {
-                                warn!("    Failed to compile tree: {}", e);
-                            }
-                        } else if !args.enforce {
-                            info!("    Would compile tree (dry-run): {} rules", rules.len());
-                        }
-                    }
-
-                    // Create detection event for logging
-                    let event = DetectionEvent {
-                        timestamp: Utc::now(),
-                        window_id: windows_processed,
-                        drift: anomaly.drift,
-                        anomalous_ratio: anomaly.anomalous_ratio,
-                        phase: current_phase.clone(),
-                        attributed_pattern: attribution.as_ref().map(|(p, _)| p.clone()),
-                        attributed_confidence: attribution.as_ref().map(|(_, c)| *c).unwrap_or(0.0),
-                        concentrated_fields: concentrated.clone(),
-                        action_taken: actions_taken,
-                        variant_similarity: None,
-                    };
-
-                    // Log as JSON for easy parsing
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        info!("DETECTION_EVENT: {}", json);
-                    }
-
-                    // Learn attack pattern for future attribution
-                    if attribution.as_ref().map(|(p, _)| p.as_str()) != Some("normal_baseline") {
-                        let norm = tracker.read().await.recent_acc.iter()
-                            .map(|x| x * x).sum::<f64>().sqrt();
-                        if norm > 0.0 {
-                            let data: Vec<i8> = tracker.read().await.recent_acc.iter()
-                                .map(|&x| {
-                                    let normalized = x / norm;
-                                    if normalized > 0.01 { 1 }
-                                    else if normalized < -0.01 { -1 }
-                                    else { 0 }
-                                })
-                                .collect();
-                            let attack_vec = Vector::from_data(data);
-                            let attack_name = format!("attack_w{}", windows_processed);
-                            tracker.write().await.add_attack_pattern(&attack_name, attack_vec);
-                        }
-                    }
-                } else if anomaly.drift >= args.threshold {
-                    info!("    Status: NORMAL (drift above threshold)");
-                }
+                info!("========================================");
+                info!("WARMUP COMPLETE - baseline FROZEN");
+                info!("  Ticks: {}, Packets: {}", ticks_processed, total_warmup_packets);
+                info!("  Baseline PPS: {:.0} (scalar, instant-response)",
+                      baseline_pps);
+                info!("  Rate vector: PPS encoded as magnitude (time-decay half-life: {}ms)",
+                      args.rate_half_life_ms);
+                info!("  Decay half-life: {} packets", args.decay_half_life);
+                info!("  Detection now active with extended primitives!");
+                info!("  Payload tracking: {} windows frozen", NUM_PAYLOAD_WINDOWS);
+                info!("========================================");
             } else {
                 info!(
-                    "Window {}: {} packets (below minimum {}, skipping analysis)",
-                    windows_processed,
-                    tracker.read().await.window_count,
-                    args.min_packets
+                    "Tick {} [WARMUP]: {:.0} eff this tick, {}/{} total packets",
+                    ticks_processed, effective,
+                    total_warmup_packets, args.warmup_packets
                 );
             }
+            continue;
+        }
 
-            // ── Payload Anomaly Detection ──
-            // Process window samples for payload-based anomalies
-            if warmup_complete && !window_samples.is_empty() {
-                let mut payload_tracker_write = payload_tracker.write().await;
-                
-                // Process all samples from this window
-                payload_tracker_write.process_window_samples(window_samples.make_contiguous());
-                
-                // Expire old destination states
-                payload_tracker_write.expire_old_dsts(Duration::from_secs(600));
-                
-                // Derive payload rules using FieldTracker's vector-derived PPS + rate_factor
-                let estimated_current_pps = (ft_window_count as f64 * args.sample_rate as f64) / 2.0;
-                let payload_rules = payload_tracker_write.check_and_derive_rules(estimated_current_pps, ft_rate_factor);
-                drop(payload_tracker_write);
-                
-                if !payload_rules.is_empty() {
-                    info!(">>> PAYLOAD ANOMALIES DETECTED: {} rule(s) derived", payload_rules.len());
+        // ── Post-warmup analysis ──
+        let has_enough_samples = tracker.read().await.total_effective >= args.min_packets as f64;
+        if !has_enough_samples {
+            // Too few decayed samples for meaningful analysis — skip this tick
+            tracker.write().await.snapshot_history();
+            continue;
+        }
 
-                    let mut rules = active_rules.write().await;
-                    let newly_added_keys = upsert_rules(
-                        &payload_rules, &mut rules, &bucket_key_to_spec,
-                        &tree_dirty, &metrics_state, "Payload rule",
-                    ).await;
+        // Scalar PPS-based rate factor: instant response to traffic changes.
+        // The rate vector (time-decayed) encodes PPS too, but lags behind —
+        // useful for fleet distribution, not local rate limiting.
+        let ft_rate_factor = if estimated_pps > 0.0 {
+            (baseline_pps / estimated_pps).min(1.0)
+        } else {
+            1.0
+        };
 
-                    // Recompile tree if payload rules were added
-                    if tree_dirty.load(std::sync::atomic::Ordering::SeqCst) && args.enforce {
-                        if let Err(e) = recompile_tree_and_broadcast(
-                            &filter, &rules, &tree_counter_labels,
-                            &tree_dirty, &metrics_state, "payload rules",
-                        ).await {
-                            warn!("    Failed to compile tree (payload rules): {}", e);
+        let stats = filter.stats().await.ok();
+        let hard_drops = stats.as_ref().map(|s| s.dropped_packets).unwrap_or(0);
+        let rate_drops = stats.as_ref().map(|s| s.rate_limited_packets).unwrap_or(0);
+        let drops = hard_drops + rate_drops;
+        let total = stats.as_ref().map(|s| s.total_packets).unwrap_or(0);
+        let dfs_comp = stats.as_ref().map(|s| s.dfs_completions).unwrap_or(0);
+        let tc_entries = stats.as_ref().map(|s| s.tail_call_entries).unwrap_or(0);
+        let d_eval2 = stats.as_ref().map(|s| s.diag_eval2).unwrap_or(0);
+        let d_root = stats.as_ref().map(|s| s.diag_root_ok).unwrap_or(0);
+        let d_state = stats.as_ref().map(|s| s.diag_state_ok).unwrap_or(0);
+        let d_tc_try = stats.as_ref().map(|s| s.diag_tc_attempt).unwrap_or(0);
+        let d_tc_fail = stats.as_ref().map(|s| s.diag_tc_fail).unwrap_or(0);
+
+        // ── Post-warmup analysis ──
+        let tracker_read = tracker.read().await;
+        let anomaly = tracker_read.compute_anomaly_details();
+        let concentrated = tracker_read.find_concentrated_values(args.concentration);
+        let attribution = tracker_read.attribute_pattern();
+        // Same scalar rate_factor for compound rules
+        let rate_factor = ft_rate_factor;
+        drop(tracker_read);
+
+        // Check for phase changes
+        if let Some(new_phase) = tracker.write().await.detect_phase_changes() {
+            warn!(">>> PHASE CHANGE DETECTED: {}", new_phase);
+        }
+
+        info!(
+            "Tick {}: {:.0} eff, drift={:.3}, anom_ratio={:.1}%, phase={} | XDP total: {}, dropped: {} (hard:{} rate:{}) | DFS tc:{} comp:{} | DIAG eval2:{} root:{} state:{} tc_try:{} tc_fail:{}",
+            ticks_processed, tracker.read().await.total_effective, anomaly.drift, anomaly.anomalous_ratio * 100.0,
+            current_phase, total, drops, hard_drops, rate_drops, tc_entries, dfs_comp,
+            d_eval2, d_root, d_state, d_tc_try, d_tc_fail
+        );
+
+        // Print TREE_COUNTERS stats every 10 ticks
+        if ticks_processed % 10 == 0 {
+            if let Ok(counter_values) = filter.read_counters().await {
+                if !counter_values.is_empty() {
+                    let tcl = tree_counter_labels.read().await;
+
+                    let mut pass_entries: Vec<(u32, u64, String)> = Vec::new();
+                    let mut count_entries: Vec<(u32, u64, String)> = Vec::new();
+                    let mut drop_entries: Vec<(u32, u64, String)> = Vec::new();
+                    let mut other_entries: Vec<(u32, u64, String, String)> = Vec::new();
+
+                    for &(key, value) in &counter_values {
+                        if let Some((kind, label)) = tcl.get(&key) {
+                            match kind.as_str() {
+                                "pass" => pass_entries.push((key, value, label.clone())),
+                                "count" => count_entries.push((key, value, label.clone())),
+                                "drop" => drop_entries.push((key, value, label.clone())),
+                                other => other_entries.push((key, value, label.clone(), other.to_string())),
+                            }
+                        } else {
+                            other_entries.push((key, value, format!("unknown-0x{:08x}", key), "?".to_string()));
                         }
                     }
 
-                    // PayloadTracker-specific: track pattern keys for budget management
-                    if !newly_added_keys.is_empty() {
-                        let added_set: HashSet<&str> = newly_added_keys.iter().map(|s| s.as_str()).collect();
-                        let mut pt = payload_tracker.write().await;
-                        for spec in &payload_rules {
-                            let key = rule_identity_key(spec);
-                            if added_set.contains(key.as_str()) {
-                                if let Some(pk) = PayloadTracker::pattern_dedup_key(spec) {
-                                    pt.mark_rule_active(pk, key);
-                                }
+                    if !pass_entries.is_empty() {
+                        info!("=== Pass Actions (tick {}) ===", ticks_processed);
+                        pass_entries.sort_by_key(|(_, v, _)| std::cmp::Reverse(*v));
+                        for (_, value, label) in &pass_entries {
+                            info!("  {} {} packets passed", label, value);
+                        }
+                    }
+
+                    if !count_entries.is_empty() {
+                        info!("=== Count Actions (tick {}) ===", ticks_processed);
+                        count_entries.sort_by_key(|(_, v, _)| std::cmp::Reverse(*v));
+                        for (_, value, label) in &count_entries {
+                            info!("  {} {} packets", label, value);
+                        }
+                    }
+
+                    if !drop_entries.is_empty() {
+                        info!("=== Drop Actions (tick {}) ===", ticks_processed);
+                        drop_entries.sort_by_key(|(_, v, _)| std::cmp::Reverse(*v));
+                        for (_, value, label) in &drop_entries {
+                            info!("  {} {} packets dropped", label, value);
+                        }
+                    }
+
+                    if !other_entries.is_empty() {
+                        for (key, value, label, kind) in &other_entries {
+                            info!("  [{}] {} {} packets (key 0x{:08x})", kind, label, value, key);
+                        }
+                    }
+                }
+            }
+
+            // Report rate limiter stats
+            if let Ok(rate_stats) = filter.read_rate_limit_stats().await {
+                if !rate_stats.is_empty() {
+                    info!("=== Rate Limiters (tick {}) ===", ticks_processed);
+                    let mut sorted = rate_stats.clone();
+                    sorted.sort_by_key(|(_, allowed, dropped)| std::cmp::Reverse(allowed + dropped));
+
+                    let rate_map = rate_limiter_names.read().await;
+                    let bucket_map = bucket_key_to_spec.read().await;
+
+                    for (key, allowed, dropped) in sorted {
+                        if let Some((ns, name)) = rate_map.get(&key) {
+                            info!("  [{} {}] allowed: {}  dropped: {}", ns, name, allowed, dropped);
+                        } else {
+                            let label = bucket_map.get(&key)
+                                .map(|spec| spec.display_label())
+                                .unwrap_or_else(|| format!("unknown-0x{:08x}", key));
+                            info!("  {} allowed: {}  dropped: {}", label, allowed, dropped);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Log attribution if available
+        if let Some((pattern, confidence)) = &attribution {
+            info!("    Attribution: {} ({:.1}% confidence)", pattern, confidence * 100.0);
+        }
+
+        // Check for anomaly
+        if anomaly.drift < args.threshold && !concentrated.is_empty() {
+            warn!(">>> ANOMALY DETECTED: drift={:.3}, anomalous_ratio={:.1}%",
+                  anomaly.drift, anomaly.anomalous_ratio * 100.0);
+
+            let mut actions_taken = Vec::new();
+
+            let detections: Vec<Detection> = concentrated.iter().map(|(field, value, conc)| {
+                warn!("    Concentrated: {}={} ({:.1}%)", field, value, conc * 100.0);
+                Detection {
+                    field: field.clone(),
+                    value: value.clone(),
+                    concentration: *conc,
+                    drift: anomaly.drift,
+                    anomalous_ratio: anomaly.anomalous_ratio,
+                    attributed_pattern: attribution.as_ref().map(|(p, _)| p.clone()),
+                    rate_factor,
+                }
+            }).collect();
+
+            if let Some(spec) =
+                compile_compound_rule(&detections, args.rate_limit, estimated_pps)
+            {
+                let mut rules = active_rules.write().await;
+                let newly_added = upsert_rules(
+                    &[spec.clone()], &mut rules, &bucket_key_to_spec,
+                    &tree_dirty, &metrics_state, "RULE",
+                ).await;
+
+                if !newly_added.is_empty() {
+                    warn!("    RULE:\n{}", spec.to_edn_pretty());
+                    let action_str = match &spec.actions[0] {
+                        RuleAction::Drop { .. } => "DROP",
+                        RuleAction::RateLimit { .. } => "RATE-LIMIT",
+                        RuleAction::Pass { .. } => "PASS",
+                        RuleAction::Count { .. } => "COUNT",
+                    };
+                    let rate_pps = spec.actions.first().and_then(|a| a.rate_pps());
+                    actions_taken.push(RuleInfo {
+                        rule_type: "tree".to_string(),
+                        value: spec.describe(),
+                        action: action_str.to_string(),
+                        rate_pps,
+                    });
+                }
+
+                if tree_dirty.load(std::sync::atomic::Ordering::SeqCst) && args.enforce {
+                    if let Err(e) = recompile_tree_and_broadcast(
+                        &filter, &rules, &tree_counter_labels,
+                        &tree_dirty, &metrics_state, "field tracker",
+                    ).await {
+                        warn!("    Failed to compile tree: {}", e);
+                    }
+                } else if !args.enforce {
+                    info!("    Would compile tree (dry-run): {} rules", rules.len());
+                }
+            }
+
+            let event = DetectionEvent {
+                timestamp: Utc::now(),
+                window_id: ticks_processed,
+                drift: anomaly.drift,
+                anomalous_ratio: anomaly.anomalous_ratio,
+                phase: current_phase.clone(),
+                attributed_pattern: attribution.as_ref().map(|(p, _)| p.clone()),
+                attributed_confidence: attribution.as_ref().map(|(_, c)| *c).unwrap_or(0.0),
+                concentrated_fields: concentrated.clone(),
+                action_taken: actions_taken,
+                variant_similarity: None,
+            };
+
+            if let Ok(json) = serde_json::to_string(&event) {
+                info!("DETECTION_EVENT: {}", json);
+            }
+
+            // Learn attack pattern for future attribution
+            if attribution.as_ref().map(|(p, _)| p.as_str()) != Some("normal_baseline") {
+                let norm = tracker.read().await.recent_acc.iter()
+                    .map(|x| x * x).sum::<f64>().sqrt();
+                if norm > 0.0 {
+                    let data: Vec<i8> = tracker.read().await.recent_acc.iter()
+                        .map(|&x| {
+                            let normalized = x / norm;
+                            if normalized > 0.01 { 1 }
+                            else if normalized < -0.01 { -1 }
+                            else { 0 }
+                        })
+                        .collect();
+                    let attack_vec = Vector::from_data(data);
+                    let attack_name = format!("attack_t{}", ticks_processed);
+                    tracker.write().await.add_attack_pattern(&attack_name, attack_vec);
+                }
+            }
+        } else if anomaly.drift >= args.threshold {
+            info!("    Status: NORMAL (drift above threshold)");
+        }
+
+        // ── Payload rule derivation (at tick) ──
+        {
+            let mut payload_tracker_write = payload_tracker.write().await;
+
+            payload_tracker_write.expire_old_dsts(Duration::from_secs(600));
+
+            let payload_rules = payload_tracker_write.check_and_derive_rules(estimated_pps, ft_rate_factor);
+            drop(payload_tracker_write);
+
+            if !payload_rules.is_empty() {
+                info!(">>> PAYLOAD ANOMALIES DETECTED: {} rule(s) derived", payload_rules.len());
+
+                let mut rules = active_rules.write().await;
+                let newly_added_keys = upsert_rules(
+                    &payload_rules, &mut rules, &bucket_key_to_spec,
+                    &tree_dirty, &metrics_state, "Payload rule",
+                ).await;
+
+                if tree_dirty.load(std::sync::atomic::Ordering::SeqCst) && args.enforce {
+                    if let Err(e) = recompile_tree_and_broadcast(
+                        &filter, &rules, &tree_counter_labels,
+                        &tree_dirty, &metrics_state, "payload rules",
+                    ).await {
+                        warn!("    Failed to compile tree (payload rules): {}", e);
+                    }
+                }
+
+                if !newly_added_keys.is_empty() {
+                    let added_set: HashSet<&str> = newly_added_keys.iter().map(|s| s.as_str()).collect();
+                    let mut pt = payload_tracker.write().await;
+                    for spec in &payload_rules {
+                        let key = rule_identity_key(spec);
+                        if added_set.contains(key.as_str()) {
+                            if let Some(pk) = PayloadTracker::pattern_dedup_key(spec) {
+                                pt.mark_rule_active(pk, key);
                             }
                         }
                     }
                 }
             }
-            
-            // Clear window samples buffer
-            window_samples.clear();
+        }
 
-            tracker.write().await.reset_window();
+        // Snapshot history for segment detection
+        tracker.write().await.snapshot_history();
 
-            // Expire old rules
-            let rule_ttl = Duration::from_secs(300);
-            let mut rules = active_rules.write().await;
-            let expired: Vec<String> = rules
-                .iter()
-                .filter(|(_, active)| !active.preloaded && active.last_seen.elapsed() > rule_ttl)
-                .map(|(k, _)| k.clone())
-                .collect();
+        // ── Expire old rules ──
+        let rule_ttl = Duration::from_secs(300);
+        let mut rules = active_rules.write().await;
+        let expired: Vec<String> = rules
+            .iter()
+            .filter(|(_, active)| !active.preloaded && active.last_seen.elapsed() > rule_ttl)
+            .map(|(k, _)| k.clone())
+            .collect();
 
-            let had_expired = !expired.is_empty();
-            if had_expired {
-                let mut pt = payload_tracker.write().await;
-                for key in &expired {
-                    pt.mark_rule_expired(key);
+        let had_expired = !expired.is_empty();
+        if had_expired {
+            let mut pt = payload_tracker.write().await;
+            for key in &expired {
+                pt.mark_rule_expired(key);
+            }
+        }
+        for key in expired {
+            if let Some(active) = rules.remove(&key) {
+                info!("<<< EXPIRED RULE: {}", active.spec.describe());
+
+                if let Some(ref state) = metrics_state {
+                    state.broadcast(metrics_server::MetricsEvent::RuleEvent {
+                        ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+                        action: "expired".to_string(),
+                        key: key.clone(),
+                        spec_summary: active.spec.to_edn(),
+                        is_preloaded: false,
+                        ttl_secs: 300,
+                    });
                 }
             }
-            for key in expired {
-                if let Some(active) = rules.remove(&key) {
-                    info!("<<< EXPIRED RULE: {}", active.spec.describe());
-                    
-                    // Emit rule_event to metrics server
-                    if let Some(ref state) = metrics_state {
-                        state.broadcast(metrics_server::MetricsEvent::RuleEvent {
-                            ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
-                            action: "expired".to_string(),
-                            key: key.clone(),
-                            spec_summary: active.spec.to_edn(),
-                            is_preloaded: false,
-                            ttl_secs: 300,
-                        });
-                    }
-                }
-            }
+        }
 
-            // Recompile tree if rules were expired
-            if had_expired && args.enforce {
-                if rules.is_empty() {
-                    // No rules left: clear the tree
-                    if let Err(e) = filter.clear_tree().await {
-                        warn!("Failed to clear tree: {}", e);
-                    } else {
-                        info!("Tree cleared (all rules expired)");
-                    }
-                    tree_dirty.store(false, std::sync::atomic::Ordering::SeqCst);
+        if had_expired && args.enforce {
+            if rules.is_empty() {
+                if let Err(e) = filter.clear_tree().await {
+                    warn!("Failed to clear tree: {}", e);
                 } else {
-                    if let Err(e) = recompile_tree_and_broadcast(
-                        &filter, &rules, &tree_counter_labels,
-                        &tree_dirty, &metrics_state, "after expiry",
-                    ).await {
-                        warn!("Failed to recompile tree after expiry: {}", e);
-                    }
+                    info!("Tree cleared (all rules expired)");
+                }
+                tree_dirty.store(false, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                if let Err(e) = recompile_tree_and_broadcast(
+                    &filter, &rules, &tree_counter_labels,
+                    &tree_dirty, &metrics_state, "after expiry",
+                ).await {
+                    warn!("Failed to recompile tree after expiry: {}", e);
                 }
             }
         }

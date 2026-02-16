@@ -28,16 +28,20 @@ threshold = (mean - 3 × stddev).clamp(0.3, mean - 0.05)
 
 A standard deviation floor of 0.1 prevents over-sensitivity when warmup traffic is uniform (e.g., all packets carry the same game protocol header).
 
-### Phase 2: Detection — Score Every Packet
+### Phase 2: Detection — Score Every Packet (Inline)
 
-After warmup, each incoming packet is scored against the baseline:
+After warmup, each incoming packet is scored **inline** as it arrives (no batching):
 
 1. Encode each active window into a VSA vector
 2. Compute `similarity(window_vec, baseline_vec)` — the absolute cosine similarity
 3. If **any** window scores below the threshold → the payload is **anomalous**
 4. Anomalous and normal payloads are stored per-destination IP for rule derivation
 
+The FieldTracker simultaneously applies **per-packet exponential decay** to its accumulator, so recent traffic naturally dominates — no fixed window boundaries or hard resets.
+
 ### Phase 3: Rule Derivation — From Anomaly to Byte Pattern
+
+Rule derivation runs at each **analysis tick** (hybrid trigger: every N packets or T ms, whichever comes first).
 
 When a destination accumulates enough anomalies (default: 3), the system derives concrete byte-match rules through a four-step pipeline:
 
@@ -101,16 +105,19 @@ Generated rules use the `l4-match` predicate with sparse byte masks:
 | `l4-match offset` | Byte offset from start of L4 payload |
 | `match_bytes` | Hex string of expected byte values |
 | `mask_bytes` | Hex string: `ff` = must match, `00` = don't care |
-| `rate-limit pps` | Derived from FieldTracker's vector-based `rate_factor` |
+| `rate-limit pps` | Derived from baseline PPS (see [DECAY-PROCESSING.md](DECAY-PROCESSING.md)) |
 
 ## Constants
 
-| Constant | Value | Purpose |
-|----------|-------|---------|
+| Constant / CLI Arg | Default | Purpose |
+|---------------------|---------|---------|
 | `PAYLOAD_WINDOW_SIZE` | 64 bytes | VSA encoding window granularity |
 | `MAX_PAYLOAD_BYTES` | 2048 bytes | Full XDP capture size (`SAMPLE_DATA_SIZE`) |
 | `NUM_PAYLOAD_WINDOWS` | 32 | Windows per payload (2048 / 64) |
 | `MAX_PAYLOAD_RULES_TOTAL` | 64 | Global budget across all destinations |
+| `--decay-half-life` | 1000 packets | Per-packet exponential decay half-life |
+| `--analysis-interval` | 200 packets | Analysis tick packet threshold (hybrid) |
+| `--analysis-max-ms` | 200 ms | Analysis tick time threshold (hybrid) |
 
 ## Test Scenario
 
@@ -131,5 +138,5 @@ All five attacks are detected with multi-byte rules derived autonomously. Recove
 1. **Zero signatures** — the system has never seen these attacks before; it learns "normal" and derives byte-level rules from deviations
 2. **VSA drill-down** — instead of pattern matching, the system uses vector similarity at progressively finer granularity (window → position → byte)
 3. **Sparse masks** — generated rules match only the discriminative bytes, tolerating variation in padding or sequence numbers
-4. **Vector-derived rate limits** — the allowed PPS comes from the FieldTracker's `rate_factor`, itself a VSA-derived compression ratio, not a hardcoded value
+4. **Baseline-derived rate limits** — the allowed PPS is derived from warmup traffic measurements, with a time-decayed rate vector encoding PPS for fleet distribution (see [DECAY-PROCESSING.md](DECAY-PROCESSING.md))
 5. **Self-calibrating threshold** — the anomaly threshold adapts to the observed variance in baseline traffic, no tuning required
