@@ -1361,7 +1361,8 @@ impl Walkable for PacketSample {
             ("direction", WalkableValue::Scalar(ScalarValue::String(self.direction().to_string()))),
             ("size_class", WalkableValue::Scalar(ScalarValue::String(self.size_class().to_string()))),
             ("pkt_len", WalkableValue::Scalar(ScalarValue::log(self.pkt_len as f64))),
-            // p0f-level fields (raw numeric values)
+            // p0f-level fields: TTL stays discrete (64 vs 128 vs 255 are strong OS/attack
+            // indicators — log-scale compresses exactly the signal we need for detection).
             ("ttl", WalkableValue::Scalar(ScalarValue::Int(self.ttl as i64))),
             ("df_bit", WalkableValue::Scalar(ScalarValue::Int(self.df_bit as i64))),
             // IPv4 header fingerprinting fields
@@ -1375,7 +1376,7 @@ impl Walkable for PacketSample {
         // TCP-only fields
         if self.protocol == 6 {
             items.push(("tcp_flags", WalkableValue::Scalar(ScalarValue::Int(self.tcp_flags as i64))));
-            items.push(("tcp_window", WalkableValue::Scalar(ScalarValue::Int(self.tcp_window as i64))));
+            items.push(("tcp_window", WalkableValue::Scalar(ScalarValue::log(self.tcp_window.max(1) as f64))));
         }
         items
     }
@@ -1393,7 +1394,8 @@ impl Walkable for PacketSample {
         visitor("direction", WalkableRef::string(self.direction()));
         visitor("size_class", WalkableRef::string(self.size_class()));
         visitor("pkt_len", WalkableRef::Scalar(ScalarRef::log(self.pkt_len as f64)));
-        // p0f-level fields (raw numeric values)
+        // p0f-level fields: TTL stays discrete (64 vs 128 vs 255 are strong OS/attack
+        // indicators — log-scale compresses exactly the signal we need for detection).
         visitor("ttl", WalkableRef::int(self.ttl as i64));
         visitor("df_bit", WalkableRef::int(self.df_bit as i64));
         // IPv4 header fingerprinting fields
@@ -1406,7 +1408,7 @@ impl Walkable for PacketSample {
         // TCP-only fields
         if self.protocol == 6 {
             visitor("tcp_flags", WalkableRef::int(self.tcp_flags as i64));
-            visitor("tcp_window", WalkableRef::int(self.tcp_window as i64));
+            visitor("tcp_window", WalkableRef::Scalar(ScalarRef::log(self.tcp_window.max(1) as f64)));
         }
     }
 }

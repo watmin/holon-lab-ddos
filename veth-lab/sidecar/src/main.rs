@@ -343,6 +343,10 @@ struct FieldTracker {
     baseline_frozen: bool,
     /// Window vectors for segment() detection
     window_history: VecDeque<Vector>,
+    /// Drift-to-baseline similarity history for drift_rate computation.
+    /// With decay-based accumulators, consecutive window vectors are nearly identical,
+    /// so drift_rate must operate on the similarity-to-baseline time series instead.
+    drift_history: VecDeque<f64>,
     /// Current phase (detected by segment)
     current_phase: String,
     /// Attack codebook for attribution
@@ -388,6 +392,7 @@ impl FieldTracker {
             warmup_ticks_count: 0,
             baseline_frozen: false,
             window_history: VecDeque::new(),
+            drift_history: VecDeque::new(),
             current_phase: "learning".to_string(),
             codebook: AttackCodebook::new(),
             variant_detector: VariantDetector::new(),
@@ -401,6 +406,19 @@ impl FieldTracker {
             baseline_rate_magnitude: 0.0,
         }
     }
+
+    /// Compute per-field diversity spectrum via unbinding.
+    /// 
+    /// Returns [(field_name, diversity_score)] sorted by diversity (low to high).
+    /// Low diversity (→1.0) = concentrated (few unique values, possibly attack).
+    /// High diversity (→0.0) = dispersed (many unique values, likely normal).
+    // NOTE: magnitude_spectrum via unbinding was removed. The approach of
+    // element-wise multiplying the accumulator by bipolar role vectors (±1)
+    // and measuring L2 norm is mathematically degenerate: |a*r|² = a²·r² = a²
+    // regardless of which role vector r is used, since r² = 1 for all bipolar
+    // elements. This produces identical "diversity" values for every field.
+    // Per-field diversity is already correctly measured by find_concentrated_values()
+    // which uses actual per-value counters.
 
     /// Freeze the baseline (called after warmup).
     ///
@@ -720,6 +738,39 @@ impl FieldTracker {
         }
 
         None
+    }
+
+    /// Record the current drift-to-baseline similarity for drift_rate computation.
+    /// Must be called each post-warmup analysis tick with the latest anomaly.drift.
+    fn record_drift(&mut self, drift: f64) {
+        self.drift_history.push_back(drift);
+        if self.drift_history.len() > 100 {
+            self.drift_history.pop_front();
+        }
+    }
+
+    /// Compute drift rate: average per-tick change in drift-to-baseline similarity.
+    ///
+    /// With decay-based accumulators, consecutive window vectors are nearly identical
+    /// (differ by ~15 new packets out of thousands), so the old approach of computing
+    /// Primitives::drift_rate on bipolarized window snapshots always returned ~0.
+    ///
+    /// Instead, we track the drift-to-baseline similarity time series directly
+    /// (e.g. 0.986, 0.966, 0.945, ...) and compute the average delta over `window` ticks.
+    ///
+    /// Negative = similarity decreasing (attack onset).
+    /// Large negative (< -0.02) = flash flood (instant onset at full volume).
+    /// Moderate negative (< -0.005) = ramp-up attack (gradual escalation).
+    fn compute_drift_rate(&self, window: usize) -> Option<f64> {
+        if self.drift_history.len() < window + 1 {
+            return None;
+        }
+        let len = self.drift_history.len();
+        let mut total_delta = 0.0;
+        for i in (len - window)..len {
+            total_delta += self.drift_history[i] - self.drift_history[i - 1];
+        }
+        Some(total_delta / window as f64)
     }
 
     /// Attribute current accumulator state to known patterns
@@ -2316,6 +2367,41 @@ struct ActiveRule {
     preloaded: bool,
 }
 
+/// Check if a candidate rule is redundant given the current active rules.
+///
+/// Returns Some(reason) if the candidate should be suppressed:
+///   - "subsumed": an existing rule's constraints are a subset of the candidate's,
+///     meaning the existing (broader) rule already catches all matching traffic.
+///   - "over-broad": the candidate's constraints are a strict subset of an existing
+///     rule's, meaning it would dangerously broaden filtering to include legitimate traffic.
+fn rule_is_redundant(candidate: &RuleSpec, existing_rules: &HashMap<String, ActiveRule>) -> Option<&'static str> {
+    if candidate.constraints.is_empty() {
+        return Some("empty");
+    }
+    let candidate_action_type = candidate.actions.first().map(|a| std::mem::discriminant(a));
+
+    for (_, active) in existing_rules.iter() {
+        let existing = &active.spec;
+        if existing.constraints.is_empty() { continue; }
+
+        let existing_action_type = existing.actions.first().map(|a| std::mem::discriminant(a));
+        if candidate_action_type != existing_action_type { continue; }
+
+        let existing_subset_of_candidate = existing.constraints.iter()
+            .all(|ec| candidate.constraints.contains(ec));
+        let candidate_subset_of_existing = candidate.constraints.iter()
+            .all(|cc| existing.constraints.contains(cc));
+
+        if existing_subset_of_candidate && candidate.constraints.len() > existing.constraints.len() {
+            return Some("subsumed");
+        }
+        if candidate_subset_of_existing && candidate.constraints.len() < existing.constraints.len() {
+            return Some("over-broad");
+        }
+    }
+    None
+}
+
 fn attach_manifest_labels_to_dag(
     dag_nodes: &mut [metrics_server::DagNode],
     manifest: &[veth_filter::RuleManifestEntry],
@@ -2519,6 +2605,7 @@ async fn main() -> Result<()> {
     info!("  - invert() for pattern attribution");
     info!("  - analogy() for zero-shot variant detection");
     info!("  - Magnitude-aware $log encoding for packet sizes");
+    info!("  - Drift rate (similarity-derivative) for attack onset classification");
     info!("");
 
     // Load XDP filter
@@ -2799,6 +2886,8 @@ async fn main() -> Result<()> {
     let mut ticks_processed = 0u64;
     let mut total_warmup_packets = 0usize;
     let mut warmup_complete = false;
+    // Tick at which the current anomaly was first detected (for log suppression)
+    let mut anomaly_active_since: Option<u64> = None;
 
     // Scalar PPS baseline for instant-response rate limiting.
     // The rate vector (time-decayed) also encodes PPS but lags behind rate
@@ -2983,9 +3072,93 @@ async fn main() -> Result<()> {
         let rate_factor = ft_rate_factor;
         drop(tracker_read);
 
-        // Check for phase changes
-        if let Some(new_phase) = tracker.write().await.detect_phase_changes() {
-            warn!(">>> PHASE CHANGE DETECTED: {}", new_phase);
+        // Record drift value and check for phase changes
+        {
+            let mut tw = tracker.write().await;
+            tw.record_drift(anomaly.drift);
+            if let Some(new_phase) = tw.detect_phase_changes() {
+                warn!(">>> PHASE CHANGE DETECTED: {}", new_phase);
+            }
+        }
+
+        // Compute drift rate (attack onset classification)
+        // Thresholds calibrated for decay-based processing where drift_rate
+        // measures per-tick change in drift-to-baseline similarity:
+        //   Normal noise: |rate| < 0.002/tick
+        //   Flash flood (5:1 ratio): ~ -0.015 to -0.020/tick
+        //   Ramp-up (gradual): ~ -0.003 to -0.010/tick
+        let drift_rate_val = tracker.read().await.compute_drift_rate(3);
+        match drift_rate_val {
+            Some(drift_rate) => {
+                if drift_rate < -0.02 {
+                    warn!(">>> FLASH FLOOD DETECTED: drift_rate={:.4}/tick (instant attack onset)", drift_rate);
+                } else if drift_rate < -0.005 {
+                    warn!(">>> RAMP-UP ATTACK: drift_rate={:.4}/tick (accelerating threat)", drift_rate);
+                }
+                if ticks_processed % 10 == 0 {
+                    info!("    Drift rate: {:.4}/tick", drift_rate);
+                }
+            }
+            None => {
+                if ticks_processed % 50 == 0 {
+                    info!("    Drift rate: N/A (drift_history len={})", tracker.read().await.drift_history.len());
+                }
+            }
+        }
+
+        // ── Early detection via drift_rate ──
+        // When drift_rate confirms attack onset but drift hasn't crossed the
+        // anomaly threshold yet, probe for newly-concentrated fields at a lower
+        // bar. The drift_rate provides detection confidence; concentration only
+        // identifies which fields to target in the rule.
+        let early_threshold = (args.threshold + 0.10).min(0.98);
+        if let Some(dr) = drift_rate_val {
+            if dr < -0.005
+                && anomaly.drift < early_threshold
+                && anomaly.drift >= args.threshold
+                && anomaly_active_since.is_none()
+            {
+                let early_concentrated = tracker.read().await.find_concentrated_values(0.10);
+                if early_concentrated.len() >= 2 {
+                    warn!(">>> EARLY DETECTION (drift_rate={:.4}/tick, drift={:.3}): {} emerging fields",
+                          dr, anomaly.drift, early_concentrated.len());
+
+                    let detections: Vec<Detection> = early_concentrated.iter().map(|(field, value, conc)| {
+                        warn!("    Emerging: {}={} ({:.1}%)", field, value, conc * 100.0);
+                        Detection {
+                            field: field.clone(),
+                            value: value.clone(),
+                            concentration: *conc,
+                            drift: anomaly.drift,
+                            anomalous_ratio: anomaly.anomalous_ratio,
+                            attributed_pattern: attribution.as_ref().map(|(p, _)| p.clone()),
+                            rate_factor,
+                        }
+                    }).collect();
+
+                    if let Some(spec) = compile_compound_rule(&detections, args.rate_limit, estimated_pps) {
+                        let mut rules = active_rules.write().await;
+                        if rule_is_redundant(&spec, &rules).is_none() {
+                            let newly_added = upsert_rules(
+                                &[spec.clone()], &mut rules, &bucket_key_to_spec,
+                                &tree_dirty, &metrics_state, "EARLY-RULE",
+                            ).await;
+                            if !newly_added.is_empty() {
+                                warn!("    EARLY RULE:\n{}", spec.to_edn_pretty());
+                                anomaly_active_since = Some(ticks_processed);
+                                if tree_dirty.load(std::sync::atomic::Ordering::SeqCst) && args.enforce {
+                                    if let Err(e) = recompile_tree_and_broadcast(
+                                        &filter, &rules, &tree_counter_labels,
+                                        &tree_dirty, &metrics_state, "early detection",
+                                    ).await {
+                                        warn!("    Failed to compile tree: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         info!(
@@ -3082,13 +3255,27 @@ async fn main() -> Result<()> {
 
         // Check for anomaly
         if anomaly.drift < args.threshold && !concentrated.is_empty() {
-            warn!(">>> ANOMALY DETECTED: drift={:.3}, anomalous_ratio={:.1}%",
-                  anomaly.drift, anomaly.anomalous_ratio * 100.0);
+            let is_new_anomaly = anomaly_active_since.is_none();
+            let ticks_in_anomaly = anomaly_active_since
+                .map(|start| ticks_processed - start)
+                .unwrap_or(0);
+            if is_new_anomaly {
+                anomaly_active_since = Some(ticks_processed);
+            }
+
+            // Log first detection, then suppress to every 20 ticks
+            if is_new_anomaly || ticks_in_anomaly % 20 == 0 {
+                warn!(">>> ANOMALY DETECTED: drift={:.3}, anomalous_ratio={:.1}%{}",
+                      anomaly.drift, anomaly.anomalous_ratio * 100.0,
+                      if !is_new_anomaly { format!(" (ongoing, tick {})", ticks_in_anomaly) } else { String::new() });
+                for (field, value, conc) in &concentrated {
+                    warn!("    Concentrated: {}={} ({:.1}%)", field, value, conc * 100.0);
+                }
+            }
 
             let mut actions_taken = Vec::new();
 
             let detections: Vec<Detection> = concentrated.iter().map(|(field, value, conc)| {
-                warn!("    Concentrated: {}={} ({:.1}%)", field, value, conc * 100.0);
                 Detection {
                     field: field.clone(),
                     value: value.clone(),
@@ -3104,6 +3291,13 @@ async fn main() -> Result<()> {
                 compile_compound_rule(&detections, args.rate_limit, estimated_pps)
             {
                 let mut rules = active_rules.write().await;
+
+                // Check for subsumption/broadening before adding
+                if let Some(reason) = rule_is_redundant(&spec, &rules) {
+                    info!("    Rule suppressed ({}): {}", reason, spec.describe());
+                    drop(rules);
+                } else {
+
                 let newly_added = upsert_rules(
                     &[spec.clone()], &mut rules, &bucket_key_to_spec,
                     &tree_dirty, &metrics_state, "RULE",
@@ -3136,6 +3330,7 @@ async fn main() -> Result<()> {
                 } else if !args.enforce {
                     info!("    Would compile tree (dry-run): {} rules", rules.len());
                 }
+                } // else (not redundant)
             }
 
             let event = DetectionEvent {
@@ -3174,7 +3369,15 @@ async fn main() -> Result<()> {
                 }
             }
         } else if anomaly.drift >= args.threshold {
-            info!("    Status: NORMAL (drift above threshold)");
+            if anomaly_active_since.is_some() {
+                let duration = anomaly_active_since
+                    .map(|start| ticks_processed - start)
+                    .unwrap_or(0);
+                info!("    Status: NORMAL (recovered after {} ticks)", duration);
+                anomaly_active_since = None;
+            } else {
+                info!("    Status: NORMAL (drift above threshold)");
+            }
         }
 
         // ── Payload rule derivation (at tick) ──

@@ -1,0 +1,105 @@
+{
+  "name": "VSA Enhancements Test",
+  "description": "Tests drift rate for attack onset classification and log-scale tcp_window encoding. Warmup phase sized for 2000-packet sidecar warmup at 3000pps/50 sample rate (~34s needed).",
+  "baseline_pps": 3000,
+  "attack_pps": 15000,
+  "phases": [
+    {
+      "name": "warmup",
+      "duration_secs": 40,
+      "type": "normal",
+      "description": "Baseline learning - 40s ensures 2000+ warmup packets at 3000pps/50 sample",
+      "os_profile": "linux",
+      "dst_port": 8888
+    },
+    {
+      "name": "normal_stable",
+      "duration_secs": 10,
+      "type": "normal",
+      "description": "Post-warmup stable baseline - verify drift near threshold, drift_rate near zero",
+      "os_profile": "linux",
+      "dst_port": 8888
+    },
+    {
+      "name": "attack_amplification",
+      "duration_secs": 15,
+      "type": "attack",
+      "description": "DNS amplification - single source, TTL=255, dst_port=9999. Should trigger FLASH FLOOD drift_rate",
+      "dst_port": 9999,
+      "ttl": 255,
+      "df": false,
+      "pps": 15000
+    },
+    {
+      "name": "calm1",
+      "duration_secs": 15,
+      "type": "normal",
+      "description": "Recovery - drift rate should go positive",
+      "os_profile": "linux",
+      "dst_port": 8888
+    },
+    {
+      "name": "attack_syn_flash",
+      "duration_secs": 12,
+      "type": "syn_flood",
+      "description": "SYN flood flash onset at 15k pps. drift_rate should detect flash flood (< -0.5)",
+      "dst_port": 443,
+      "ttl": 128,
+      "pps": 15000
+    },
+    {
+      "name": "calm2",
+      "duration_secs": 15,
+      "type": "normal",
+      "description": "Recovery",
+      "os_profile": "linux",
+      "dst_port": 8888
+    },
+    {
+      "name": "attack_ramp_phase1",
+      "duration_secs": 8,
+      "type": "attack",
+      "description": "Botnet ramp-up phase 1 - 5k pps",
+      "dst_port": 9999,
+      "ttl": 64,
+      "df": false,
+      "pps": 5000
+    },
+    {
+      "name": "attack_ramp_phase2",
+      "duration_secs": 8,
+      "type": "attack",
+      "description": "Botnet ramp-up phase 2 - 10k pps",
+      "dst_port": 9999,
+      "ttl": 64,
+      "df": false,
+      "pps": 10000
+    },
+    {
+      "name": "attack_ramp_phase3",
+      "duration_secs": 8,
+      "type": "attack",
+      "description": "Botnet ramp-up phase 3 - 15k pps. drift_rate should show ramp-up (< -0.1)",
+      "dst_port": 9999,
+      "ttl": 64,
+      "df": false,
+      "pps": 15000
+    },
+    {
+      "name": "calm3",
+      "duration_secs": 15,
+      "type": "normal",
+      "description": "Recovery",
+      "os_profile": "linux",
+      "dst_port": 8888
+    },
+    {
+      "name": "final_baseline",
+      "duration_secs": 10,
+      "type": "normal",
+      "description": "Final recovery - return to baseline",
+      "os_profile": "linux",
+      "dst_port": 8888
+    }
+  ]
+}
