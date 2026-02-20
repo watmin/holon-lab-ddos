@@ -174,6 +174,53 @@ let breakpoints = Primitives::segment(&window_history, 5, 0.7, SegmentMethod::Di
 
 In HDC terms, this is **temporal pattern analysis** on a sequence of holographic snapshots.
 
+### Step 7: Subspace Anomaly Detection (OnlineSubspace / CCIPCA)
+
+While drift detection operates on the normalized accumulator prototype, a parallel **manifold-aware detector** scores individual packet vectors against a learned subspace:
+
+```
+residual(x) = ||x − mean − Σ projᵢ(x) · componentᵢ||
+```
+
+During warmup, an `OnlineSubspace` (CCIPCA — Candid Covariance-free Incremental PCA, Weng et al. 2003) incrementally learns the k-dimensional manifold that normal traffic occupies in the 4096-dimensional encoded space. It tracks:
+
+- A **running mean** of all observations
+- **k unnormalized eigenvectors** whose L2 norms approximate eigenvalues
+- An **adaptive threshold**: EMA(residual) + σ_mult × √variance
+
+After warmup, each encoded packet is scored by projecting onto the learned components and measuring the reconstruction error. Normal packets lie near the learned manifold (low residual); packets with novel field combinations project poorly and produce high residuals.
+
+The key advantage over cosine drift: the subspace detector works on **individual vectors** and fires on the **first anomalous tick**, not after accumulating a window of deviant traffic.
+
+### Step 8: Engram Memory (Attack Pattern Library)
+
+When an anomaly persists (≥5 consecutive ticks above threshold), the system **mints an engram** — a named snapshot of the attack's learned manifold:
+
+```
+Attack subspace (trained on 98 ticks of attack vectors)
+    ↓ snapshot()
+Engram { name, subspace_snapshot, eigenvalue_signature, surprise, metadata }
+    ↓ add to library
+EngramLibrary { engram_1, engram_2, ... }
+```
+
+On subsequent anomalies, the library is checked on the **first tick** using two-tier matching:
+
+1. **Eigenvalue pre-filter** (O(k·n)) — ranks engrams by eigenvalue energy similarity
+2. **Full residual** (O(k·dim)) — scores top candidates against their stored subspace
+
+If a match is found (residual below the engram's own threshold × 2.0), stored mitigation rules are deployed **immediately** — bypassing drift accumulation and concentration analysis entirely. This closes the detection gap from seconds to milliseconds.
+
+The engram also stores a **surprise fingerprint** computed at mint time — per-field attribution scores derived by unbinding the anomalous component with each field's role vector:
+
+```
+anomaly = x − reconstruct(x)          // out-of-subspace component
+for each field:
+    surprise[field] = ||bind(anomaly, role_field)||    // energy from that field
+```
+
+This exploits VSA's binding algebra: unbinding isolates how much each field contributed to the out-of-manifold direction.
+
 ## How Holon Derives Rate Limits
 
 This is the part that makes the system fully autonomous. No hardcoded "normal rate." No hardcoded "attack threshold." Everything comes from the vector algebra.
@@ -285,6 +332,10 @@ The rule is a **crystallization of vector knowledge into discrete logic.** The V
 | `analogy()` | Algebraic analogy: A⊗B⊗C → D | Zero-shot attack variant detection |
 | Accumulator bundling | Superposition: A + B + C + ... | Baseline learning, window aggregation |
 | Magnitude ratio | L2 norm ratio of accumulators | Volume estimation, rate derivation |
+| `OnlineSubspace` (CCIPCA) | Incremental PCA on encoded vectors | Learn k-dimensional manifold of normal traffic; residual = anomaly score |
+| `EngramLibrary` | Subspace snapshot memory with two-tier matching | Store attack manifolds; instant re-detection via eigenvalue pre-filter → full residual |
+| `anomalous_component()` | Reconstruction residual: x − reconstruct(x) | Isolate out-of-subspace signal for surprise fingerprinting |
+| Surprise fingerprint | Unbind anomalous component with role vectors | Per-field attribution: which fields drove the anomaly |
 
 ## The Key Insight
 

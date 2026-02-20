@@ -3,7 +3,7 @@
 **Planning document for implementation. Each section is a self-contained spec
 that can be handed to a capable model for implementation.**
 
-**Last updated:** 2026-02-15
+**Last updated:** 2026-02-20
 
 ---
 
@@ -376,6 +376,11 @@ Added targeted tests for all edge cases identified after the fixes:
 | Compound range AND semantics | Medium | None (compiler fix) | ✅ Done |
 | Comprehensive test suite | Medium | None | ✅ Done (80 tests) |
 | Thin LTO build optimization | Low | None (Cargo profile) | ✅ Done |
+| OnlineSubspace (CCIPCA) | High | None | ✅ Done |
+| Engram library + two-tier matching | High | None | ✅ Done |
+| Surprise fingerprint (field attribution) | Medium | None | ✅ Done |
+| Instant rule deploy on engram hit | Medium | None | ✅ Done |
+| Payload-level engrams | Medium | None | ✅ Done |
 | LPM trie prefix sets | High | New map type + predicate | Planned |
 | Bloom filters | Medium | New map type | Planned |
 | Metrics export pipeline | Low | None (SSE exists) | Planned |
@@ -1057,7 +1062,7 @@ Attack onset shows up sooner (first anomalous packets get high weight).
 ## Suggested Implementation Order
 
 **Next batch — Detection enrichment (no eBPF changes, high impact):**
-1. Payload-based detection (leverage full-packet RingBuf data for deeper analysis)
+1. ~~Payload-based detection~~ → ✅ Done (payload subspace + payload engrams)
 2. Vector-native cardinality (unbinding as diversity estimator)
 3. Magnitude spectrum (per-field diversity profile)
 4. Accumulator decay (continuous detection — eliminates window boundary blind spots)

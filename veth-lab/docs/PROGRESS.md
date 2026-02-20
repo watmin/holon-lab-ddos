@@ -1,10 +1,10 @@
 # Veth Lab: Holon-Powered XDP DDoS Mitigation
 
-**Status:** Tree Rete Engine Live — 1M Rules Proven  
+**Status:** Engram Memory Live — Instant Rule Deploy on Known Attacks  
 **Date:** February 2026  
-**Latest Update:** February 14, 2026  
-**Result:** Scalable decision-tree rule engine with BPF tail-call DFS, blue/green atomic deployment, and s-expression rule representation  
-**Key Achievement:** 1,000,000 rules loaded and dropping packets, BPF tail-call architecture, stack-based DFS trie traversal, ~5 tail calls per packet regardless of rule count
+**Latest Update:** February 20, 2026  
+**Result:** Manifold-aware anomaly detection with attack pattern memory; sub-second rule deployment on re-detected attacks  
+**Key Achievement:** Engram system fires ~765ms before drift-based detection, deploying stored mitigation rules instantly via learned subspace matching
 
 ## Overview
 
@@ -16,6 +16,9 @@ The system demonstrates:
 - Decision-tree rule discrimination (Tree Rete) with O(depth) packet evaluation
 - Blue/green atomic deployment for zero-downtime rule updates
 - S-expression rule representation for human-readable rule visibility
+- Manifold-aware anomaly detection via online PCA (CCIPCA)
+- Attack pattern memory (engrams) with instant rule deployment on re-detection
+- Payload-level subspace scoring and engram lifecycle
 - Reproducible local testing using network namespaces
 
 ## Motivation
@@ -44,16 +47,18 @@ Holon offers a different approach:
 │  │  │ Perf     │  │ Holon-rs │  │ Anomaly Detection    │      ││
 │  │  │ Reader   │──│ Encoder  │──│ - Drift Analysis     │      ││
 │  │  └──────────┘  └──────────┘  │ - Concentration      │      ││
-│  │       ▲                      └──────────┬───────────┘      ││
+│  │       ▲                      │ - Subspace (CCIPCA)  │      ││
+│  │       │                      │ - Surprise Fingerprint│      ││
+│  │       │ samples              └──────────┬───────────┘      ││
 │  │       │                                 │                   ││
-│  │       │ samples              ┌──────────▼───────────┐      ││
-│  │       │                      │ Tree Compiler        │      ││
-│  │       │                      │ - RuleSpec → Tree    │      ││
-│  │       │                      │ - Blue/Green Flip    │      ││
-│  │       │                      │ - S-expr Logging     │      ││
-│  │       │                      └──────────┬───────────┘      ││
-│  │       │                                 │ compile_and_flip  ││
-│  │       │                                 ▼                   ││
+│  │       │  ┌─────────────────┐  ┌─────────▼────────────┐     ││
+│  │       │  │ Engram Library  │  │ Tree Compiler        │     ││
+│  │       │  │ - Attack Memory │──│ - RuleSpec → Tree    │     ││
+│  │       │  │ - Instant Deploy│  │ - Blue/Green Flip    │     ││
+│  │       │  │ - JSON Persist  │  │ - S-expr Logging     │     ││
+│  │       │  └─────────────────┘  └──────────┬───────────┘     ││
+│  │       │                                  │ compile_and_flip ││
+│  │       │                                  ▼                  ││
 │  │  ┌────┴─────────────────────────────────────────────┐      ││
 │  │  │              XDP Program (veth-filter)            │      ││
 │  │  │                                                   │      ││
@@ -507,6 +512,10 @@ An unintentional stress test occurred when a rate-limiting bug caused the genera
 | Feb 14 | **Range predicates** — `>`, `<`, `>=`, `<=` via guard edges with runtime evaluation. No tree expansion needed |
 | Feb 14 | **MaskEq + byte matching** — `(mask-eq)`, `(protocol-match)`, `(tcp-flags-match)` for bitmask fields. `(l4-match)` for arbitrary transport-offset byte matching (1-64 bytes). Three-tiered system: MaskEq guard edges, custom dimension fan-out (1-4B), pattern guards (5-64B) |
 | Feb 14 | **Per-rule metrics manifest** — All actions support `:name`. Compiler returns `RuleManifestEntry` manifest. Deterministic custom dim assignment for stable `rule_id`s. Comprehensive 9-rule integration test verified all predicates and action types |
+| Feb 15–18 | **OnlineSubspace (CCIPCA)** — Manifold-aware anomaly detection in `holon-rs`. Incremental PCA learns k-dimensional manifold of normal traffic. Residual scoring replaces cosine-only drift for superior separation. Adaptive threshold (EMA + σ). Snapshot/restore for persistence |
+| Feb 18–19 | **Engram library** — `Engram` + `EngramLibrary` in `holon-rs`. Subspace snapshots as named attack memories. Two-tier matching (eigenvalue pre-filter → full residual). `SubspaceDetector` + `PayloadSubspaceDetector` wrappers in sidecar. Surprise fingerprint via anomalous-component unbinding |
+| Feb 19 | **Domain-mismatch fix** — Subspace must score raw encoded vectors (elements in {-1,0,1}, L2 norm ~56), not normalized accumulators (norm=1). Per-tick max residual tracking from raw per-packet scoring |
+| Feb 20 | **Instant rule deploy on engram hit** — Store active rules (as EDN) in engram metadata at mint time. On re-detection, parse stored EDN → `RuleSpec`, deploy via `upsert_rules`, recompile XDP tree. Fires ~765ms before drift-based detection. Payload engram lifecycle with `PayloadEngramEvent` enum. EDN IP-address quoting fix for round-trip correctness |
 
 ## Future Work
 
@@ -532,6 +541,12 @@ An unintentional stress test occurred when a rate-limiting bug caused the genera
 - [x] **Per-rule drop/pass metrics** — DROP and PASS actions increment `TREE_COUNTERS` for per-rule attribution in logs
 - [x] **Rule manifest** — Compiler returns `RuleManifestEntry` for authoritative action-type and label mapping
 - [x] **Named actions on all types** — `:name ["ns" "metric"]` supported on pass, drop, rate-limit, and count
+- [x] **OnlineSubspace (CCIPCA)** — Manifold-aware anomaly detection with incremental PCA, adaptive threshold, snapshot/restore
+- [x] **Engram memory** — Named subspace snapshots with two-tier matching (eigenvalue pre-filter → full residual), JSON persistence
+- [x] **Surprise fingerprint** — Per-field anomaly attribution via anomalous-component unbinding with role vectors
+- [x] **Instant rule deploy** — Store rules in engram metadata at mint time, deploy on re-detection ~765ms before drift detector
+- [x] **Payload-level engrams** — Per-window subspace scoring, `PayloadSubspaceDetector`, `PayloadEngramEvent` lifecycle
+- [x] **Subspace domain-mismatch fix** — Raw encoded vectors for subspace scoring, not normalized accumulators
 
 ### Short Term
 - [ ] Make rule TTL configurable via CLI
