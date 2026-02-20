@@ -233,21 +233,6 @@ impl VariantDetector {
         self.known_port_vec = Some(port_vec);
     }
 
-    /// Detect variant attacks using analogy
-    fn detect_variant(&self, sample_vec: &Vector, sample_port: u16, holon: &Holon) -> Option<f64> {
-        let known_proto = self.known_attack_proto.as_ref()?;
-        let known_port = self.known_port_vec.as_ref()?;
-
-        // Generate port vector for sample
-        let sample_port_vec = holon.get_vector(&format!("port_{}", sample_port));
-
-        // A:B :: C:? - if known_attack is to known_port as ? is to sample_port
-        let inferred_attack = Primitives::analogy(known_proto, known_port, &sample_port_vec);
-
-        // How similar is the sample to the inferred attack?
-        Some(holon.similarity(sample_vec, &inferred_attack))
-    }
-
     fn is_trained(&self) -> bool {
         self.known_attack_proto.is_some()
     }
@@ -264,12 +249,6 @@ struct AnomalyDetails {
     drift: f64,
     /// Fraction of dimensions that disagree with baseline
     anomalous_ratio: f64,
-    /// Similarity profile vector
-    profile: Vector,
-    /// Agreement strength (mean of agreeing dimensions)
-    agreement_strength: f64,
-    /// Disagreement strength (mean abs of disagreeing dimensions)
-    disagreement_strength: f64,
 }
 
 // =============================================================================
@@ -625,9 +604,6 @@ impl FieldTracker {
             return AnomalyDetails {
                 drift: 1.0,
                 anomalous_ratio: 0.0,
-                profile: Vector::zeros(self.holon.dimensions()),
-                agreement_strength: 1.0,
-                disagreement_strength: 0.0,
             };
         }
 
@@ -651,46 +627,28 @@ impl FieldTracker {
         // Compute similarity profile (per-dimension agreement)
         let profile = Primitives::similarity_profile(&recent_vec, &self.baseline_vec);
 
-        // Analyze dimension agreement
         let recent_data = recent_vec.data();
         let profile_data = profile.data();
 
-        let active_mask: Vec<bool> = recent_data.iter()
-            .map(|&v| v != 0)
-            .collect();
-        let active_dims = active_mask.iter().filter(|&&b| b).count();
+        let mut active_dims = 0usize;
+        let mut disagreeing = 0usize;
+
+        for (i, &v) in recent_data.iter().enumerate() {
+            if v != 0 {
+                active_dims += 1;
+                if (profile_data[i] as f64) < 0.0 {
+                    disagreeing += 1;
+                }
+            }
+        }
 
         if active_dims == 0 {
             return AnomalyDetails {
                 drift: 1.0,
                 anomalous_ratio: 0.0,
-                profile,
-                agreement_strength: 1.0,
-                disagreement_strength: 0.0,
             };
         }
 
-        // Count agreeing vs disagreeing dimensions
-        let mut agreeing = 0usize;
-        let mut disagreeing = 0usize;
-        let mut agree_sum = 0.0f64;
-        let mut disagree_sum = 0.0f64;
-
-        for (i, &active) in active_mask.iter().enumerate() {
-            if active {
-                let p = profile_data[i] as f64;
-                if p > 0.0 {
-                    agreeing += 1;
-                    agree_sum += p;
-                } else if p < 0.0 {
-                    disagreeing += 1;
-                    disagree_sum += p.abs();
-                }
-            }
-        }
-
-        let agreement_strength = if agreeing > 0 { agree_sum / agreeing as f64 } else { 0.5 };
-        let disagreement_strength = if disagreeing > 0 { disagree_sum / disagreeing as f64 } else { 0.0 };
         let anomalous_ratio = disagreeing as f64 / active_dims as f64;
 
         // Compute drift (cosine similarity)
@@ -709,9 +667,6 @@ impl FieldTracker {
         AnomalyDetails {
             drift,
             anomalous_ratio,
-            profile,
-            agreement_strength,
-            disagreement_strength,
         }
     }
 
@@ -998,8 +953,6 @@ struct PayloadTracker {
     warmup_payloads: Vec<Vec<u8>>,
     /// Whether to use rate-limit (vs drop) for derived rules
     use_rate_limit: bool,
-    /// Sample rate (for estimating pps in rate-limit rules)
-    sample_rate: u32,
     /// Active payload rules keyed by (offset, length, match_hex) -> rule_key
     /// Used for dedup: don't re-derive rules already in the tree
     active_rule_keys: HashMap<String, String>,
@@ -1011,7 +964,6 @@ impl PayloadTracker {
         threshold_override: Option<f64>,
         min_anomalies: usize,
         use_rate_limit: bool,
-        sample_rate: u32,
     ) -> Self {
         let dims = holon.dimensions();
         let accumulators = vec![vec![0.0; dims]; NUM_PAYLOAD_WINDOWS];
@@ -1029,7 +981,6 @@ impl PayloadTracker {
             min_anomalies_for_rules: min_anomalies,
             warmup_payloads: Vec::new(),
             use_rate_limit,
-            sample_rate,
             active_rule_keys: HashMap::new(),
         }
     }
@@ -1596,10 +1547,6 @@ struct PositionInfo {
 struct Detection {
     field: String,
     value: String,
-    concentration: f64,
-    drift: f64,
-    anomalous_ratio: f64,
-    attributed_pattern: Option<String>,
     /// Rate factor from magnitude ratio (1/magnitude_ratio, capped at 1.0)
     /// Purely vector-derived: if we're seeing 100x traffic, rate_factor = 0.01
     rate_factor: f64,
@@ -2629,7 +2576,6 @@ async fn main() -> Result<()> {
         args.payload_threshold,
         args.payload_min_anomalies,
         args.rate_limit,
-        args.sample_rate,
     )));
     info!("PayloadTracker initialized: {} windows ({}B), threshold={}, min_anomalies={}",
         NUM_PAYLOAD_WINDOWS, MAX_PAYLOAD_BYTES,
@@ -3128,10 +3074,6 @@ async fn main() -> Result<()> {
                         Detection {
                             field: field.clone(),
                             value: value.clone(),
-                            concentration: *conc,
-                            drift: anomaly.drift,
-                            anomalous_ratio: anomaly.anomalous_ratio,
-                            attributed_pattern: attribution.as_ref().map(|(p, _)| p.clone()),
                             rate_factor,
                         }
                     }).collect();
@@ -3275,14 +3217,10 @@ async fn main() -> Result<()> {
 
             let mut actions_taken = Vec::new();
 
-            let detections: Vec<Detection> = concentrated.iter().map(|(field, value, conc)| {
+            let detections: Vec<Detection> = concentrated.iter().map(|(field, value, _conc)| {
                 Detection {
                     field: field.clone(),
                     value: value.clone(),
-                    concentration: *conc,
-                    drift: anomaly.drift,
-                    anomalous_ratio: anomaly.anomalous_ratio,
-                    attributed_pattern: attribution.as_ref().map(|(p, _)| p.clone()),
                     rate_factor,
                 }
             }).collect();
