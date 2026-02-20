@@ -1597,21 +1597,10 @@ impl Detection {
         let constraint = self.to_constraint()?;
         let allowed_pps = (estimated_pps * self.rate_factor).max(100.0) as u32;
         
-        // Build a stable name from constraints so bucket_key() doesn't change
-        // when pps wobbles across detection windows. This preserves eBPF token
-        // bucket state across recompilations, preventing burst leaks.
-        let stable_name = RuleSpec {
-            constraints: vec![constraint.clone()],
-            actions: vec![],
-            priority: 0,
-            comment: None,
-            label: None,
-        }.constraints_to_edn();
-        
         let action = if use_rate_limit { 
-            RuleAction::RateLimit { pps: allowed_pps, name: Some(("system".into(), stable_name)) }
+            RuleAction::RateLimit { pps: allowed_pps, name: None }
         } else { 
-            RuleAction::Drop { name: Some(("system".into(), stable_name)) }
+            RuleAction::Drop { name: None }
         };
         
         Some(RuleSpec { 
@@ -2267,21 +2256,10 @@ fn compile_compound_rule(
     let rate_factor = detections[0].rate_factor;
     let allowed_pps = (estimated_pps * rate_factor).max(100.0) as u32;
     
-    // Build a stable name from constraints so bucket_key() doesn't change
-    // when pps wobbles across detection windows. This preserves eBPF token
-    // bucket state across recompilations, preventing burst leaks.
-    let stable_name = RuleSpec {
-        constraints: constraints.clone(),
-        actions: vec![],
-        priority: 0,
-        comment: None,
-        label: None,
-    }.constraints_to_edn();
-    
     let action = if use_rate_limit { 
-        RuleAction::RateLimit { pps: allowed_pps, name: Some(("system".into(), stable_name)) }
+        RuleAction::RateLimit { pps: allowed_pps, name: None }
     } else { 
-        RuleAction::Drop { name: Some(("system".into(), stable_name)) }
+        RuleAction::Drop { name: None }
     };
 
     Some(RuleSpec {

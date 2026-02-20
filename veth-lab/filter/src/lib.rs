@@ -809,8 +809,8 @@ impl RuleSpec {
     /// Compute the bucket key for this rule (for rate limiters, counters, and drops).
     /// 
     /// Named actions (drop, rate-limit, or count with :name ["ns" "name"]) share a bucket/counter
-    /// across all rules with the same namespace and name. Unnamed actions get a per-rule key
-    /// based on the rule's canonical hash.
+    /// across all rules with the same namespace and name. Unnamed actions get a stable key
+    /// derived from constraints only, so bucket state persists across pps changes.
     /// 
     /// Returns the key (u32) for the first drop, rate-limit, or count action, or None if neither.
     pub fn bucket_key(&self) -> Option<u32> {
@@ -829,13 +829,26 @@ impl RuleSpec {
                         let h = hasher.finish() as u32;
                         return Some(if h == 0 { 1 } else { h });
                     } else {
-                        // Unnamed bucket: use rule's canonical hash (default behavior)
-                        return Some(self.canonical_hash());
+                        // Unnamed bucket: hash constraints only for stability
+                        // across pps changes (preserves eBPF token bucket state)
+                        return Some(self.constraints_key());
                     }
                 }
             }
         }
         None
+    }
+
+    /// Stable key derived from constraints only (ignores actions/priority).
+    /// Used for unnamed bucket keys so token bucket state persists when pps changes.
+    fn constraints_key(&self) -> u32 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        let edn = self.constraints_to_edn();
+        edn.hash(&mut hasher);
+        let h = hasher.finish() as u32;
+        if h == 0 { 1 } else { h }
     }
 
     /// Generate a canonical EDN string representation of constraints for logging/metrics.
