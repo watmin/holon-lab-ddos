@@ -27,23 +27,24 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{info, warn, error};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use veth_filter::{
-    PacketSample, RuleAction, RuleSpec, VethFilter,
+    PacketSample, Predicate, RuleAction, RuleSpec, VethFilter,
 };
 
 use crate::detection::{Detection, compile_compound_rule, rule_identity_key};
 use crate::field_tracker::FieldTracker;
-use crate::payload_tracker::{PayloadTracker, NUM_PAYLOAD_WINDOWS, MAX_PAYLOAD_BYTES};
+use crate::payload_tracker::{PayloadTracker, PayloadEngramEvent, NUM_PAYLOAD_WINDOWS, MAX_PAYLOAD_BYTES};
 use crate::rule_manager::{
     ActiveRule, validate_byte_match_density, rule_is_redundant,
     upsert_rules, recompile_tree_and_broadcast,
 };
-use crate::rules_parser::parse_rules_file;
+use crate::rules_parser::{parse_rules_file, parse_edn_rule};
 
 #[derive(Parser, Debug)]
 #[command(name = "veth-sidecar")]
@@ -845,31 +846,61 @@ async fn main() -> Result<()> {
             let mut tw = tracker.write().await;
             tw.subspace.anomaly_streak += 1;
 
-            let normalized = {
-                let norm = tw.recent_acc.iter().map(|x| x * x).sum::<f64>().sqrt();
-                if norm > 1e-10 {
-                    tw.recent_acc.iter().map(|x| x / norm).collect::<Vec<f64>>()
-                } else {
-                    vec![0.0; tw.holon.dimensions()]
-                }
-            };
+            if let Some(raw_vec) = tw.take_tick_subspace_vec() {
+                if let Some((engram_name, engram_res)) = tw.subspace.check_library(&raw_vec) {
+                    if tw.subspace.anomaly_streak == 1 {
+                        let stored_rules: Vec<String> = tw.subspace.library.get(&engram_name)
+                            .and_then(|e| e.metadata().get("rules").cloned())
+                            .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+                            .unwrap_or_default();
 
-            if let Some((engram_name, engram_res)) = tw.subspace.check_library(&normalized) {
-                if tw.subspace.anomaly_streak == 1 {
-                    warn!(">>> ENGRAM HIT: '{}' (residual={:.2}) — deploying stored rule", engram_name, engram_res);
-                    if let Some(engram) = tw.subspace.library.get(&engram_name) {
-                        if let Some(rule_val) = engram.metadata().get("rule") {
-                            if let Some(rule_str) = rule_val.as_str() {
-                                info!("  Engram rule: {}", rule_str);
+                        if stored_rules.is_empty() {
+                            warn!(">>> ENGRAM HIT: '{}' (residual={:.2}) — known attack (no stored rules)", engram_name, engram_res);
+                        } else {
+                            warn!(">>> ENGRAM HIT: '{}' (residual={:.2}) — deploying {} stored rule(s)", engram_name, engram_res, stored_rules.len());
+                            drop(tw);
+
+                            let mut deployed = Vec::new();
+                            for edn_str in &stored_rules {
+                                match edn_rs::Edn::from_str(edn_str) {
+                                    Ok(edn) => match parse_edn_rule(&edn) {
+                                        Ok(spec) => deployed.push(spec),
+                                        Err(e) => warn!("  Failed to parse stored rule: {}", e),
+                                    },
+                                    Err(e) => warn!("  Failed to parse stored rule EDN: {}", e),
+                                }
+                            }
+
+                            if !deployed.is_empty() {
+                                let mut rules = active_rules.write().await;
+                                let newly_added = upsert_rules(
+                                    &deployed, &mut rules, &bucket_key_to_spec,
+                                    &tree_dirty, &metrics_state, "ENGRAM-RULE",
+                                ).await;
+
+                                if !newly_added.is_empty() {
+                                    for spec in &deployed {
+                                        warn!("    ENGRAM RULE:\n{}", spec.to_edn_pretty());
+                                    }
+                                }
+
+                                if tree_dirty.load(std::sync::atomic::Ordering::SeqCst) && args.enforce {
+                                    if let Err(e) = recompile_tree_and_broadcast(
+                                        &filter, &rules, &tree_counter_labels,
+                                        &tree_dirty, &metrics_state, "engram hit",
+                                    ).await {
+                                        warn!("  Failed to compile tree: {}", e);
+                                    }
+                                }
                             }
                         }
                     }
-                }
-            } else {
-                tw.subspace.learn_attack(&normalized);
-                if tw.subspace.anomaly_streak == 1 {
-                    warn!(">>> SUBSPACE ANOMALY (residual={:.2}, threshold={:.2}) — no engram match, learning attack manifold",
-                          subspace_residual, subspace_threshold);
+                } else {
+                    tw.subspace.learn_attack(&raw_vec);
+                    if tw.subspace.anomaly_streak == 1 {
+                        warn!(">>> SUBSPACE ANOMALY (residual={:.2}, threshold={:.2}) — no engram match, learning attack manifold",
+                              subspace_residual, subspace_threshold);
+                    }
                 }
             }
         } else {
@@ -884,26 +915,28 @@ async fn main() -> Result<()> {
                     "src_ip", "dst_ip", "src_port", "dst_port", "protocol",
                     "ttl", "df_bit", "pkt_len", "direction", "size_class",
                 ];
-                let normalized = {
-                    let norm = tw.recent_acc.iter().map(|x| x * x).sum::<f64>().sqrt();
-                    if norm > 1e-10 {
-                        tw.recent_acc.iter().map(|x| x / norm).collect::<Vec<f64>>()
-                    } else {
-                        vec![0.0; tw.holon.dimensions()]
-                    }
-                };
                 let holon_ref = tw.holon.clone();
-                let fingerprint = tw.subspace.surprise_fingerprint(&normalized, &holon_ref, &fields);
+                let acc_snapshot = tw.recent_acc.clone();
+                let fingerprint = tw.subspace.surprise_fingerprint(&acc_snapshot, &holon_ref, &fields);
                 let surprise: HashMap<String, f64> = fingerprint.into_iter().collect();
+
+                let rules_snapshot: Vec<String> = active_rules.read().await
+                    .values()
+                    .filter(|r| !r.preloaded)
+                    .map(|r| r.spec.to_edn())
+                    .collect();
 
                 let mut metadata = HashMap::new();
                 metadata.insert("minted_at_tick".to_string(), serde_json::Value::from(ticks_processed));
                 metadata.insert("anomaly_streak".to_string(), serde_json::Value::from(streak));
+                if !rules_snapshot.is_empty() {
+                    metadata.insert("rules".to_string(), serde_json::json!(rules_snapshot));
+                }
 
                 tw.subspace.mint_engram(&tick_name, surprise, metadata);
 
-                warn!(">>> ENGRAM MINTED: '{}' after {} anomalous ticks (library size: {})",
-                      tick_name, streak, tw.subspace.library.len());
+                warn!(">>> ENGRAM MINTED: '{}' after {} anomalous ticks (library size: {}, stored {} rules)",
+                      tick_name, streak, tw.subspace.library.len(), rules_snapshot.len());
             } else if had_attack {
                 tw.subspace.cancel_attack();
                 info!("Attack subspace cancelled (streak {} < 5 minimum)", streak);
@@ -1038,8 +1071,68 @@ async fn main() -> Result<()> {
 
             payload_tracker_write.expire_old_dsts(Duration::from_secs(600));
 
-            let payload_rules = payload_tracker_write.check_and_derive_rules(estimated_pps, ft_rate_factor);
-            drop(payload_tracker_write);
+            let engram_event = payload_tracker_write.tick_engram_lifecycle(ticks_processed);
+
+            let engram_hit = matches!(engram_event, PayloadEngramEvent::Hit { .. });
+
+            match engram_event {
+                PayloadEngramEvent::Hit { stored_rules, .. } if !stored_rules.is_empty() => {
+                    drop(payload_tracker_write);
+                    let mut deployed = Vec::new();
+                    for edn_str in &stored_rules {
+                        match edn_rs::Edn::from_str(edn_str) {
+                            Ok(edn) => match parse_edn_rule(&edn) {
+                                Ok(spec) => deployed.push(spec),
+                                Err(e) => warn!("  Failed to parse stored payload rule: {}", e),
+                            },
+                            Err(e) => warn!("  Failed to parse stored payload rule EDN: {}", e),
+                        }
+                    }
+                    if !deployed.is_empty() {
+                        let mut rules = active_rules.write().await;
+                        let newly_added = upsert_rules(
+                            &deployed, &mut rules, &bucket_key_to_spec,
+                            &tree_dirty, &metrics_state, "PAYLOAD-ENGRAM-RULE",
+                        ).await;
+                        if !newly_added.is_empty() {
+                            for spec in &deployed {
+                                warn!("    PAYLOAD ENGRAM RULE:\n{}", spec.to_edn_pretty());
+                            }
+                        }
+                        if tree_dirty.load(std::sync::atomic::Ordering::SeqCst) && args.enforce {
+                            if let Err(e) = recompile_tree_and_broadcast(
+                                &filter, &rules, &tree_counter_labels,
+                                &tree_dirty, &metrics_state, "payload engram hit",
+                            ).await {
+                                warn!("  Failed to compile tree: {}", e);
+                            }
+                        }
+                    }
+                }
+                PayloadEngramEvent::Minted { ref name } => {
+                    let rules_snapshot: Vec<String> = active_rules.read().await
+                        .values()
+                        .filter(|r| !r.preloaded)
+                        .filter(|r| r.spec.constraints.iter().any(|p| matches!(p, Predicate::RawByteMatch(_))))
+                        .map(|r| r.spec.to_edn())
+                        .collect();
+
+                    if !rules_snapshot.is_empty() {
+                        payload_tracker_write.update_engram_metadata(
+                            name, "rules", serde_json::json!(rules_snapshot),
+                        );
+                        warn!("    Stored {} payload rule(s) in engram '{}'", rules_snapshot.len(), name);
+                    }
+                    drop(payload_tracker_write);
+                }
+                _ => { drop(payload_tracker_write); }
+            }
+
+            let payload_rules = if !engram_hit {
+                payload_tracker.write().await.check_and_derive_rules(estimated_pps, ft_rate_factor)
+            } else {
+                Vec::new()
+            };
 
             if !payload_rules.is_empty() {
                 info!(">>> PAYLOAD ANOMALIES DETECTED: {} rule(s) derived", payload_rules.len());

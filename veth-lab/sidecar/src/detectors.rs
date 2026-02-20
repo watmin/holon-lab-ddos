@@ -218,7 +218,6 @@ impl SubspaceDetector {
 
 /// Payload-level subspace detector with per-window OnlineSubspaces
 /// and an engram library for known payload attack patterns.
-#[allow(dead_code)]
 pub(crate) struct PayloadSubspaceDetector {
     /// Per-window subspaces (one per payload window)
     pub(crate) window_subspaces: Vec<OnlineSubspace>,
@@ -236,7 +235,6 @@ pub(crate) struct PayloadSubspaceDetector {
     k: usize,
 }
 
-#[allow(dead_code)]
 impl PayloadSubspaceDetector {
     pub(crate) fn new(dim: usize, k: usize, num_windows: usize) -> Self {
         let window_subspaces = (0..num_windows)

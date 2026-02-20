@@ -278,7 +278,7 @@ impl FieldDim {
         match self {
             FieldDim::SrcIp | FieldDim::DstIp => {
                 let bytes = value.to_ne_bytes();
-                format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3])
+                format!("\"{}.{}.{}.{}\"", bytes[0], bytes[1], bytes[2], bytes[3])
             }
             d if d.is_custom() => format!("0x{:x}", value),
             _ => format!("{}", value),
@@ -941,7 +941,7 @@ impl RuleSpec {
 
     /// Emit rule as an s-expression in Clara-style LHS => RHS form.
     ///
-    /// Single constraint:  `((= src-addr 10.0.0.100) => (drop))`
+    /// Single constraint:  `((= src-addr "10.0.0.100") => (drop))`
     /// Compound:           `((and (= proto 17) (= src-port 53)) => (rate-limit 1906))`
     /// With priority != 100: appends `:priority N`
     pub fn to_sexpr(&self) -> String {
@@ -1740,7 +1740,7 @@ mod tests {
         );
         assert_eq!(
             spec.to_sexpr(),
-            "((and (= src-addr 10.0.0.100) (= dst-port 9999)) => (rate-limit 1906))"
+            "((and (= src-addr \"10.0.0.100\") (= dst-port 9999)) => (rate-limit 1906))"
         );
     }
 
@@ -1779,7 +1779,7 @@ mod tests {
         let pretty = spec.to_sexpr_pretty();
         assert_eq!(pretty,
             "((and (= proto 17)\n\
-             \x20     (= src-addr 10.0.0.100)\n\
+             \x20     (= src-addr \"10.0.0.100\")\n\
              \x20     (= dst-port 9999))\n\
              \x20=>\n\
              \x20(rate-limit 1906))");

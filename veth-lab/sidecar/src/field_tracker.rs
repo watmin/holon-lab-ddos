@@ -62,6 +62,10 @@ pub(crate) struct FieldTracker {
     baseline_rate_magnitude: f64,
     /// Subspace-based anomaly detector with engram library
     pub(crate) subspace: SubspaceDetector,
+    /// Per-tick maximum subspace residual from raw per-packet scoring
+    tick_max_residual: f64,
+    /// The raw encoded vector that produced the max residual this tick
+    tick_max_vec: Option<Vec<f64>>,
 }
 
 impl FieldTracker {
@@ -99,6 +103,8 @@ impl FieldTracker {
             rate_lambda,
             baseline_rate_magnitude: 0.0,
             subspace,
+            tick_max_residual: 0.0,
+            tick_max_vec: None,
         }
     }
 
@@ -207,6 +213,13 @@ impl FieldTracker {
 
         if !self.baseline_frozen {
             self.subspace.learn(&vec.to_f64());
+        } else {
+            let vec_f64 = vec.to_f64();
+            let residual = self.subspace.score(&vec_f64);
+            if residual > self.tick_max_residual {
+                self.tick_max_residual = residual;
+                self.tick_max_vec = Some(vec_f64);
+            }
         }
 
         for (i, v) in vec.data().iter().enumerate() {
@@ -345,17 +358,14 @@ impl FieldTracker {
         }
     }
 
-    /// Compute subspace residual from the current recent accumulator.
+    /// Per-tick maximum subspace residual from raw per-packet scoring.
     pub(crate) fn compute_subspace_residual(&self) -> f64 {
-        if self.total_effective < 1.0 || !self.baseline_frozen {
-            return 0.0;
-        }
-        let norm = self.recent_acc.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if norm < 1e-10 {
-            return 0.0;
-        }
-        let normalized: Vec<f64> = self.recent_acc.iter().map(|x| x / norm).collect();
-        self.subspace.score(&normalized)
+        self.tick_max_residual
+    }
+
+    /// Take the raw encoded vector that produced the max subspace residual this tick.
+    pub(crate) fn take_tick_subspace_vec(&mut self) -> Option<Vec<f64>> {
+        self.tick_max_vec.take()
     }
 
     /// Detect phase changes using segment()
@@ -482,7 +492,11 @@ impl FieldTracker {
     }
 
     /// Snapshot the current accumulator state into window_history for segment() detection.
+    /// Also resets per-tick subspace tracking for the next tick.
     pub(crate) fn snapshot_history(&mut self) {
+        self.tick_max_residual = 0.0;
+        self.tick_max_vec = None;
+
         if self.total_effective < 1.0 { return; }
 
         let norm = self.recent_acc.iter().map(|x| x * x).sum::<f64>().sqrt();

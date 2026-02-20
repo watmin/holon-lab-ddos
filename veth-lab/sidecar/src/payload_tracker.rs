@@ -3,10 +3,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use holon::{Holon, ScalarValue, Vector, WalkableValue};
-use tracing::info;
+use tracing::{info, warn};
 use veth_filter::{FieldDim, PacketSample, Predicate, RuleAction, RuleSpec};
 
 use crate::detectors::PayloadSubspaceDetector;
+
+pub(crate) enum PayloadEngramEvent {
+    Nothing,
+    Hit { #[allow(dead_code)] name: String, stored_rules: Vec<String> },
+    Minted { name: String },
+}
 
 pub(crate) const PAYLOAD_WINDOW_SIZE: usize = 64;
 pub(crate) const MAX_PAYLOAD_BYTES: usize = veth_filter::SAMPLE_DATA_SIZE;
@@ -97,6 +103,10 @@ pub(crate) struct PayloadTracker {
     active_rule_keys: HashMap<String, String>,
     /// Subspace-based payload anomaly detector with engram library
     pub(crate) payload_subspace: PayloadSubspaceDetector,
+    /// Whether any subspace anomaly was seen during the current tick
+    subspace_anomaly_this_tick: bool,
+    /// Bundled window vector from the first subspace-anomalous packet this tick (for library check)
+    last_anomalous_bundle: Option<Vec<f64>>,
 }
 
 struct PositionInfo {
@@ -133,6 +143,8 @@ impl PayloadTracker {
             use_rate_limit,
             active_rule_keys: HashMap::new(),
             payload_subspace: PayloadSubspaceDetector::new(dims, subspace_k, NUM_PAYLOAD_WINDOWS),
+            subspace_anomaly_this_tick: false,
+            last_anomalous_bundle: None,
         }
     }
 
@@ -262,6 +274,7 @@ impl PayloadTracker {
     }
 
     /// Score and classify a single sample against baseline, storing in per-dst state.
+    /// Scores via both cosine similarity (for drill-down) and subspace residual (for engrams).
     pub(crate) fn process_single_sample(&mut self, sample: &PacketSample) {
         if !self.baseline_frozen { return; }
 
@@ -271,27 +284,58 @@ impl PayloadTracker {
 
         let truncated = &l4_payload[..std::cmp::min(l4_payload.len(), MAX_PAYLOAD_BYTES)];
         let n_windows = Self::active_windows(truncated.len());
+        let dims = self.holon.dimensions();
 
-        let mut is_anomalous = false;
+        let mut is_cosine_anomalous = false;
+        let mut is_subspace_anomalous = false;
+        let mut bundled = vec![0.0f64; dims];
+        let mut windows_encoded = 0usize;
+
         for w in 0..n_windows {
-            if let Some(sim) = self.score_window(truncated, w) {
-                if sim < self.anomaly_threshold {
-                    is_anomalous = true;
-                    break;
+            if let Some(wv) = Self::window_walkable(truncated, w) {
+                let vec = self.holon.encode_walkable_value(&wv);
+                let vec_f64 = vec.to_f64();
+
+                if let Some(baseline) = self.baselines[w].as_ref() {
+                    let sim = self.holon.similarity(&vec, baseline);
+                    if sim < self.anomaly_threshold {
+                        is_cosine_anomalous = true;
+                    }
                 }
+
+                if let Some(residual) = self.payload_subspace.score_window(w, &vec_f64) {
+                    if residual > self.payload_subspace.window_subspaces[w].threshold() {
+                        is_subspace_anomalous = true;
+                    }
+                }
+
+                for (i, &v) in vec_f64.iter().enumerate() {
+                    bundled[i] += v;
+                }
+                windows_encoded += 1;
             }
         }
 
         let dst_state = self.dst_states
             .entry(sample.dst_ip)
             .or_insert_with(|| DstPayloadState::new(l4_hdr_len));
-
         dst_state.l4_header_len = l4_hdr_len;
-
-        if is_anomalous {
+        if is_cosine_anomalous {
             dst_state.add_anomalous(l4_payload);
         } else {
             dst_state.add_normal(l4_payload);
+        }
+
+        if is_subspace_anomalous && windows_encoded > 0 {
+            let norm = bundled.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if norm > 1e-10 {
+                for v in &mut bundled { *v /= norm; }
+            }
+            self.payload_subspace.learn_attack(&bundled, truncated);
+            if !self.subspace_anomaly_this_tick {
+                self.last_anomalous_bundle = Some(bundled);
+            }
+            self.subspace_anomaly_this_tick = true;
         }
     }
 
@@ -382,6 +426,74 @@ impl PayloadTracker {
         }
 
         rules
+    }
+
+    /// Per-tick payload engram lifecycle.
+    ///
+    /// Manages the payload subspace anomaly streak, library lookups,
+    /// attack subspace learning, and engram minting.
+    /// Returns `true` if a known engram was matched (drill-down should be skipped).
+    pub(crate) fn tick_engram_lifecycle(&mut self, tick: u64) -> PayloadEngramEvent {
+        let was_anomalous = self.subspace_anomaly_this_tick;
+        self.subspace_anomaly_this_tick = false;
+
+        if was_anomalous {
+            self.payload_subspace.anomaly_streak += 1;
+
+            if self.payload_subspace.anomaly_streak == 1 {
+                if let Some(bundled) = self.last_anomalous_bundle.take() {
+                    if let Some((name, res)) = self.payload_subspace.check_library(&bundled) {
+                        let stored_rules: Vec<String> = self.payload_subspace.library.get(&name)
+                            .and_then(|e| e.metadata().get("rules").cloned())
+                            .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+                            .unwrap_or_default();
+
+                        if stored_rules.is_empty() {
+                            warn!(">>> PAYLOAD ENGRAM HIT: '{}' (residual={:.2}) — known attack (no stored rules)", name, res);
+                        } else {
+                            warn!(">>> PAYLOAD ENGRAM HIT: '{}' (residual={:.2}) — deploying {} stored rule(s)", name, res, stored_rules.len());
+                        }
+                        return PayloadEngramEvent::Hit { name: name.clone(), stored_rules };
+                    }
+                }
+            } else {
+                self.last_anomalous_bundle = None;
+            }
+
+            if self.payload_subspace.anomaly_streak == 1 {
+                warn!(">>> PAYLOAD SUBSPACE ANOMALY — no engram match, learning attack manifold");
+            }
+
+            PayloadEngramEvent::Nothing
+        } else {
+            self.last_anomalous_bundle = None;
+            let had_attack = self.payload_subspace.has_active_attack();
+            let streak = self.payload_subspace.anomaly_streak;
+
+            if had_attack && streak >= 5 {
+                let name = format!("payload_attack_t{}", tick);
+                let mut metadata = std::collections::HashMap::new();
+                metadata.insert("minted_at_tick".to_string(), serde_json::Value::from(tick));
+                metadata.insert("anomaly_streak".to_string(), serde_json::Value::from(streak));
+                self.payload_subspace.mint_engram(&name, metadata);
+                warn!(">>> PAYLOAD ENGRAM MINTED: '{}' after {} anomalous ticks (library size: {})",
+                      name, streak, self.payload_subspace.library.len());
+                PayloadEngramEvent::Minted { name }
+            } else {
+                if had_attack {
+                    self.payload_subspace.cancel_attack();
+                    info!("Payload attack subspace cancelled (streak {} < 5 minimum)", streak);
+                }
+                self.payload_subspace.anomaly_streak = 0;
+                PayloadEngramEvent::Nothing
+            }
+        }
+    }
+
+    pub(crate) fn update_engram_metadata(&mut self, name: &str, key: &str, value: serde_json::Value) {
+        if let Some(engram) = self.payload_subspace.library.get_mut(name) {
+            engram.metadata_mut().insert(key.to_string(), value);
+        }
     }
 
     /// Derive l4-match rules for a specific destination using multi-byte patterns.

@@ -71,7 +71,7 @@ pub(crate) fn parse_rules_file(path: &std::path::Path) -> Result<Vec<RuleSpec>> 
 }
 
 /// Parse a single EDN rule
-fn parse_edn_rule(edn: &Edn) -> Result<RuleSpec> {
+pub(crate) fn parse_edn_rule(edn: &Edn) -> Result<RuleSpec> {
     let constraints_edn = edn.get(":constraints")
         .ok_or_else(|| anyhow::anyhow!("Missing :constraints"))?;
     let actions_edn = edn.get(":actions")
