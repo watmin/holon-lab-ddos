@@ -63,9 +63,6 @@ pub struct TokenBucket {
 // Tree Rete Engine Types
 // =============================================================================
 
-/// Number of static field dimensions (Proto..FragOffset = 0..14)
-const NUM_DIMS: u8 = 15;
-
 /// Maximum dimension index (0-31, includes 7 custom slots at 16-22)
 /// eBPF walker masks with `& 0x1F` to prove index bounds for the verifier.
 const MAX_DIM: u8 = 32;

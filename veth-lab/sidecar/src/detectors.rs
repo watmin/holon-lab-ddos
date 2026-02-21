@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use holon::{EngramLibrary, Holon, OnlineSubspace, Primitives, Vector};
+use holon::kernel::{Encoder, Primitives, Vector};
+use holon::memory::{EngramLibrary, OnlineSubspace};
 use tracing::{error, info};
 
 /// Known attack patterns for attribution
@@ -168,11 +169,11 @@ impl SubspaceDetector {
     }
 
     /// Compute per-field surprise fingerprint via anomalous component unbinding.
-    pub(crate) fn surprise_fingerprint(&self, vec_f64: &[f64], holon: &Holon, fields: &[&str]) -> Vec<(String, f64)> {
+    pub(crate) fn surprise_fingerprint(&self, vec_f64: &[f64], encoder: &Encoder, fields: &[&str]) -> Vec<(String, f64)> {
         let anomaly = self.baseline.anomalous_component(vec_f64);
         let anomaly_vec = Vector::from_f64(&anomaly);
         let mut scores: Vec<(String, f64)> = fields.iter().map(|&field| {
-            let role = holon.get_vector(field);
+            let role = encoder.get_vector(field);
             let unbound = Primitives::bind(&anomaly_vec, &role);
             let norm = unbound.data().iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
             (field.to_string(), norm)

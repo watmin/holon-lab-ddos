@@ -1,8 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 use std::time::Instant;
 
-use holon::{Holon, Primitives, SegmentMethod, Vector};
+use holon::kernel::{Encoder, Primitives, SegmentMethod, Similarity, Vector};
 use tracing::info;
 use veth_filter::PacketSample;
 
@@ -10,12 +9,12 @@ use crate::detectors::{
     AnomalyDetails, AttackCodebook, SubspaceDetector, ValueStats, VariantDetector,
 };
 
-/// Enhanced field tracker using Holon primitives with per-packet decay.
+/// Enhanced field tracker using Holon kernel primitives with per-packet decay.
 ///
 /// Instead of fixed 2-second windows with hard resets, the accumulator decays
 /// exponentially after each packet so recent traffic naturally dominates.
 pub(crate) struct FieldTracker {
-    pub(crate) holon: Arc<Holon>,
+    pub(crate) encoder: Encoder,
     /// Baseline accumulator (float, averaged during warmup)
     baseline_acc: Vec<f64>,
     /// Baseline vector (frozen after warmup, used for comparison)
@@ -69,8 +68,8 @@ pub(crate) struct FieldTracker {
 }
 
 impl FieldTracker {
-    pub(crate) fn new(holon: Arc<Holon>, decay_half_life: usize, rate_half_life_ms: u64, subspace_k: usize) -> Self {
-        let dims = holon.dimensions();
+    pub(crate) fn new(encoder: Encoder, decay_half_life: usize, rate_half_life_ms: u64, subspace_k: usize) -> Self {
+        let dims = encoder.dimensions();
         let decay_factor = if decay_half_life > 0 {
             0.5_f64.powf(1.0 / decay_half_life as f64)
         } else {
@@ -79,7 +78,7 @@ impl FieldTracker {
         let rate_lambda = (2.0_f64).ln() / (rate_half_life_ms as f64 / 1000.0);
         let subspace = SubspaceDetector::new(dims, subspace_k);
         Self {
-            holon,
+            encoder,
             baseline_acc: vec![0.0; dims],
             baseline_vec: Vector::zeros(dims),
             recent_acc: vec![0.0; dims],
@@ -189,7 +188,7 @@ impl FieldTracker {
         self.codebook.add_pattern(name, vector.clone());
 
         if !self.variant_detector.is_trained() {
-            let port_vec = self.holon.get_vector("port_53");
+            let port_vec = self.encoder.get_vector("port_53");
             self.variant_detector.train(name, vector, port_vec);
         }
     }
@@ -209,7 +208,7 @@ impl FieldTracker {
             self.total_effective += 1.0;
         }
 
-        let vec = self.holon.encode_walkable(sample);
+        let vec = self.encoder.encode_walkable(sample);
 
         if !self.baseline_frozen {
             self.subspace.learn(&vec.to_f64());
@@ -311,7 +310,7 @@ impl FieldTracker {
                 .collect();
             Vector::from_data(data)
         } else {
-            Vector::zeros(self.holon.dimensions())
+            Vector::zeros(self.encoder.dimensions())
         };
 
         let profile = Primitives::similarity_profile(&recent_vec, &self.baseline_vec);
@@ -340,7 +339,7 @@ impl FieldTracker {
         }
 
         let anomalous_ratio = disagreeing as f64 / active_dims as f64;
-        let drift = self.holon.similarity(&recent_vec, &self.baseline_vec);
+        let drift = Similarity::cosine(&recent_vec, &self.baseline_vec);
 
         let recent_nnz = recent_vec.data().iter().filter(|&&x| x != 0).count();
         let baseline_nnz = self.baseline_vec.data().iter().filter(|&&x| x != 0).count();

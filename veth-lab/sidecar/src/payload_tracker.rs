@@ -1,8 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use holon::{Holon, ScalarValue, Vector, WalkableValue};
+use holon::kernel::{Encoder, Primitives, ScalarValue, Similarity, Vector, WalkableValue};
 use tracing::{info, warn};
 use veth_filter::{FieldDim, PacketSample, Predicate, RuleAction, RuleSpec};
 
@@ -78,7 +77,7 @@ const MAX_PAYLOAD_RULES_TOTAL: usize = 64;
 ///   - When enough anomalies accumulate, drill-down + gap-probe + greedy
 ///     selection derive `l4-match` rules scoped to that destination.
 pub(crate) struct PayloadTracker {
-    holon: Arc<Holon>,
+    encoder: Encoder,
     /// One f64 accumulator per window (NUM_PAYLOAD_WINDOWS x dims)
     accumulators: Vec<Vec<f64>>,
     /// Frozen baselines after warmup
@@ -119,18 +118,18 @@ struct PositionInfo {
 
 impl PayloadTracker {
     pub(crate) fn new(
-        holon: Arc<Holon>,
+        encoder: Encoder,
         threshold_override: Option<f64>,
         min_anomalies: usize,
         use_rate_limit: bool,
         subspace_k: usize,
     ) -> Self {
-        let dims = holon.dimensions();
+        let dims = encoder.dimensions();
         let accumulators = vec![vec![0.0; dims]; NUM_PAYLOAD_WINDOWS];
         let baselines = vec![None; NUM_PAYLOAD_WINDOWS];
 
         Self {
-            holon,
+            encoder,
             accumulators,
             baselines,
             packet_count: 0,
@@ -184,7 +183,7 @@ impl PayloadTracker {
 
         for w in 0..n_windows {
             if let Some(wv) = Self::window_walkable(truncated, w) {
-                let vec = self.holon.encode_walkable_value(&wv);
+                let vec = self.encoder.encode_walkable_value(&wv);
                 for (i, &v) in vec.data().iter().enumerate() {
                     self.accumulators[w][i] += v as f64;
                 }
@@ -204,7 +203,7 @@ impl PayloadTracker {
         if self.packet_count == 0 { return; }
 
         for w in 0..NUM_PAYLOAD_WINDOWS {
-            let mut baseline = vec![0i8; self.holon.dimensions()];
+            let mut baseline = vec![0i8; self.encoder.dimensions()];
             for (i, &sum) in self.accumulators[w].iter().enumerate() {
                 let avg = sum / self.packet_count as f64;
                 baseline[i] = if avg > 0.01 { 1 }
@@ -269,8 +268,8 @@ impl PayloadTracker {
     fn score_window(&self, payload: &[u8], window_idx: usize) -> Option<f64> {
         let baseline = self.baselines[window_idx].as_ref()?;
         let wv = Self::window_walkable(payload, window_idx)?;
-        let vec = self.holon.encode_walkable_value(&wv);
-        Some(self.holon.similarity(&vec, baseline))
+        let vec = self.encoder.encode_walkable_value(&wv);
+        Some(Similarity::cosine(&vec, baseline))
     }
 
     /// Score and classify a single sample against baseline, storing in per-dst state.
@@ -284,7 +283,7 @@ impl PayloadTracker {
 
         let truncated = &l4_payload[..std::cmp::min(l4_payload.len(), MAX_PAYLOAD_BYTES)];
         let n_windows = Self::active_windows(truncated.len());
-        let dims = self.holon.dimensions();
+        let dims = self.encoder.dimensions();
 
         let mut is_cosine_anomalous = false;
         let mut is_subspace_anomalous = false;
@@ -293,11 +292,11 @@ impl PayloadTracker {
 
         for w in 0..n_windows {
             if let Some(wv) = Self::window_walkable(truncated, w) {
-                let vec = self.holon.encode_walkable_value(&wv);
+                let vec = self.encoder.encode_walkable_value(&wv);
                 let vec_f64 = vec.to_f64();
 
                 if let Some(baseline) = self.baselines[w].as_ref() {
-                    let sim = self.holon.similarity(&vec, baseline);
+                    let sim = Similarity::cosine(&vec, baseline);
                     if sim < self.anomaly_threshold {
                         is_cosine_anomalous = true;
                     }
@@ -396,7 +395,7 @@ impl PayloadTracker {
             }
 
             if let Some(derived) = Self::derive_rules_for_dst(
-                &self.holon,
+                &self.encoder,
                 &self.baselines,
                 self.anomaly_threshold,
                 dst_ip,
@@ -498,7 +497,7 @@ impl PayloadTracker {
 
     /// Derive l4-match rules for a specific destination using multi-byte patterns.
     fn derive_rules_for_dst(
-        holon: &Holon,
+        encoder: &Encoder,
         baselines: &[Option<Vector>],
         threshold: f64,
         dst_ip: u32,
@@ -520,18 +519,18 @@ impl PayloadTracker {
                     None => continue,
                 };
                 if let Some(wv) = Self::window_walkable(truncated, w) {
-                    let vec = holon.encode_walkable_value(&wv);
-                    let sim = holon.similarity(&vec, baseline);
+                    let vec = encoder.encode_walkable_value(&wv);
+                    let sim = Similarity::cosine(&vec, baseline);
                     if sim < threshold {
                         let start = w * PAYLOAD_WINDOW_SIZE;
                         let end = std::cmp::min(start + PAYLOAD_WINDOW_SIZE, truncated.len());
                         for i in start..end {
                             let field = format!("p{}", i - start);
                             let value = format!("0x{:02x}", truncated[i]);
-                            let role = holon.get_vector(&field);
-                            let val = holon.get_vector(&value);
-                            let bound = holon.bind(&role, &val);
-                            let pos_sim = holon.similarity(&bound, baseline);
+                            let role = encoder.get_vector(&field);
+                            let val = encoder.get_vector(&value);
+                            let bound = Primitives::bind(&role, &val);
+                            let pos_sim = Similarity::cosine(&bound, baseline);
                             if pos_sim < 0.005 {
                                 all_unfamiliar.insert(i);
                             }

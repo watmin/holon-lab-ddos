@@ -22,7 +22,7 @@ mod rules_parser;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 use clap::Parser;
-use holon::{Holon, Vector};
+use holon::kernel::{Encoder, Vector, VectorManager};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -243,16 +243,17 @@ async fn main() -> Result<()> {
     filter.set_sample_rate(args.sample_rate).await?;
     filter.set_enforce_mode(args.enforce).await?;
 
-    // Initialize Holon
-    let holon = Arc::new(Holon::new(args.dimensions));
-    info!("Holon initialized with {} dimensions", args.dimensions);
+    // Initialize Holon encoder
+    let vm = VectorManager::new(args.dimensions);
+    let encoder = Encoder::new(vm);
+    info!("Holon encoder initialized with {} dimensions", args.dimensions);
 
     // Create enhanced field tracker with decay
-    let tracker = Arc::new(RwLock::new(FieldTracker::new(holon.clone(), args.decay_half_life, args.rate_half_life_ms, args.subspace_k)));
+    let tracker = Arc::new(RwLock::new(FieldTracker::new(encoder.clone(), args.decay_half_life, args.rate_half_life_ms, args.subspace_k)));
     
     // Create payload tracker
     let payload_tracker = Arc::new(RwLock::new(PayloadTracker::new(
-        holon.clone(),
+        encoder.clone(),
         args.payload_threshold,
         args.payload_min_anomalies,
         args.rate_limit,
@@ -915,9 +916,8 @@ async fn main() -> Result<()> {
                     "src_ip", "dst_ip", "src_port", "dst_port", "protocol",
                     "ttl", "df_bit", "pkt_len", "direction", "size_class",
                 ];
-                let holon_ref = tw.holon.clone();
                 let acc_snapshot = tw.recent_acc.clone();
-                let fingerprint = tw.subspace.surprise_fingerprint(&acc_snapshot, &holon_ref, &fields);
+                let fingerprint = tw.subspace.surprise_fingerprint(&acc_snapshot, &tw.encoder, &fields);
                 let surprise: HashMap<String, f64> = fingerprint.into_iter().collect();
 
                 let rules_snapshot: Vec<String> = active_rules.read().await
