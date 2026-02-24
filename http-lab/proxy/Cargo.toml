@@ -1,0 +1,38 @@
+[package]
+name = "http-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "http_proxy"
+path = "src/lib.rs"
+
+[dependencies]
+# Core async runtime
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# TLS
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+
+# HTTP
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-legacy"] }
+http-body-util = "0.1"
+bytes = "1"
+
+# Shared rule tree swap
+arc-swap = "1"
+
+# Holon VSA
+holon = { path = "../../../holon-rs" }
+
+[dev-dependencies]

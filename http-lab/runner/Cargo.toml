@@ -1,0 +1,39 @@
+[package]
+name = "http-runner"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "http-proxy"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+clap = { workspace = true }
+chrono = "0.4"
+
+# Proxy lib (types, TLS, HTTP, tree, enforcer)
+http-proxy = { path = "../proxy" }
+
+# Sidecar lib (detection, rule manager, metrics)
+http-sidecar = { path = "../sidecar" }
+
+# Holon VSA
+holon = { path = "../../../holon-rs" }
+
+# TLS for config loading
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+arc-swap = "1"
+
+[dev-dependencies]
+rcgen = "0.13"
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }

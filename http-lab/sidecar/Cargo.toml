@@ -1,0 +1,31 @@
+[package]
+name = "http-sidecar"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "http_sidecar"
+path = "src/lib.rs"
+
+[dependencies]
+# Core async runtime
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Shared types from proxy lib
+http-proxy = { path = "../proxy" }
+
+# Holon VSA
+holon = { path = "../../../holon-rs" }
+
+# Rule tree swap
+arc-swap = "1"
+
+# Metrics server
+axum = { workspace = true }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+futures = "0.3"

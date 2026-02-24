@@ -10,6 +10,11 @@ members = [
     "veth-lab/filter",
     "veth-lab/generator",
     "veth-lab/sidecar",
+    # HTTP lab components
+    "http-lab/proxy",
+    "http-lab/sidecar",
+    "http-lab/runner",
+    "http-lab/generator",
 ]
 # Note: veth-lab/filter-ebpf is built separately with BPF target
 
@@ -25,6 +30,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 clap = { version = "4", features = ["derive"] }
+# HTTP lab
+bytes = "1"
+arc-swap = "1"
+hyper = { version = "1", features = ["http1", "client", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1"] }
+http-body-util = "0.1"
 
 [profile.release]
 lto = "thin"

@@ -1,0 +1,26 @@
+{
+  "phases": [
+    {
+      "name": "warmup",
+      "duration_s": 30,
+      "rps": 50,
+      "pattern": "browse",
+      "tls_profiles": ["chrome_120", "firefox_121"]
+    },
+    {
+      "name": "ddos-flood",
+      "duration_s": 60,
+      "rps": 2000,
+      "pattern": "get_flood",
+      "path": "/api/search",
+      "tls_profiles": ["curl_800"]
+    },
+    {
+      "name": "calm",
+      "duration_s": 30,
+      "rps": 50,
+      "pattern": "browse",
+      "tls_profiles": ["chrome_120", "firefox_121"]
+    }
+  ]
+}
