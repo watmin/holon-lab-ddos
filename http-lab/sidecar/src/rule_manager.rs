@@ -42,8 +42,7 @@ impl RuleManager {
             if let Some(existing) = self.rules.get_mut(&key) {
                 existing.last_seen = Instant::now();
             } else {
-                let action_str = spec.action.describe();
-                info!("Rule added [{}]: {}", action_str, spec.display_label());
+                info!("Rule added:\n{}", spec.to_edn_pretty());
                 self.rules.insert(key.clone(), ActiveRule {
                     last_seen: Instant::now(),
                     spec: spec.clone(),
@@ -111,6 +110,14 @@ impl RuleManager {
     pub fn all_specs(&self) -> Vec<RuleSpec> {
         self.rules.values().map(|r| r.spec.clone()).collect()
     }
+
+    /// Return only non-preloaded (auto-generated) rule specs for engram storage.
+    pub fn active_rule_specs(&self) -> Vec<RuleSpec> {
+        self.rules.values()
+            .filter(|r| !r.preloaded)
+            .map(|r| r.spec.clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -118,14 +125,14 @@ mod tests {
     use super::*;
     use http_proxy::types::{FieldDim, Predicate, RuleAction};
 
-    fn make_rule(dim: FieldDim, val: u32, action: RuleAction) -> RuleSpec {
+    fn make_rule(dim: FieldDim, val: &str, action: RuleAction) -> RuleSpec {
         RuleSpec::new(vec![Predicate::eq(dim, val)], action)
     }
 
     #[test]
     fn upsert_adds_new_rules() {
         let mut mgr = RuleManager::new(300);
-        let rule = make_rule(FieldDim::SrcIp, 1, RuleAction::block());
+        let rule = make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block());
         let added = mgr.upsert(&[rule]);
         assert_eq!(added.len(), 1);
         assert_eq!(mgr.rule_count(), 1);
@@ -134,18 +141,18 @@ mod tests {
     #[test]
     fn upsert_deduplicates() {
         let mut mgr = RuleManager::new(300);
-        let rule = make_rule(FieldDim::SrcIp, 1, RuleAction::block());
+        let rule = make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block());
         let added1 = mgr.upsert(&[rule.clone()]);
         let added2 = mgr.upsert(&[rule]);
         assert_eq!(added1.len(), 1);
-        assert_eq!(added2.len(), 0); // same rule, not newly added
+        assert_eq!(added2.len(), 0);
         assert_eq!(mgr.rule_count(), 1);
     }
 
     #[test]
     fn expire_removes_old_rules() {
-        let mut mgr = RuleManager::new(0); // TTL = 0 seconds
-        let rule = make_rule(FieldDim::SrcIp, 1, RuleAction::block());
+        let mut mgr = RuleManager::new(0);
+        let rule = make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block());
         mgr.upsert(&[rule]);
         std::thread::sleep(std::time::Duration::from_millis(10));
         let removed = mgr.expire();
@@ -156,9 +163,8 @@ mod tests {
     #[test]
     fn expire_preserves_preloaded() {
         let mut mgr = RuleManager::new(0);
-        let rule = make_rule(FieldDim::SrcIp, 1, RuleAction::block());
+        let rule = make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block());
         mgr.upsert(&[rule]);
-        // Manually mark as preloaded
         for active in mgr.rules.values_mut() {
             active.preloaded = true;
         }
@@ -171,14 +177,13 @@ mod tests {
     #[test]
     fn is_redundant_detects_subsumed() {
         let mut mgr = RuleManager::new(300);
-        let broad = make_rule(FieldDim::SrcIp, 1, RuleAction::block());
+        let broad = make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block());
         mgr.upsert(&[broad]);
 
-        // A more specific rule (IP + Method) is subsumed by the existing IP-only rule
         let specific = RuleSpec::new(
             vec![
-                Predicate::eq(FieldDim::SrcIp, 1),
-                Predicate::eq(FieldDim::Method, 42),
+                Predicate::eq(FieldDim::SrcIp, "10.0.0.1"),
+                Predicate::eq(FieldDim::Method, "GET"),
             ],
             RuleAction::block(),
         );
@@ -188,10 +193,10 @@ mod tests {
     #[test]
     fn is_redundant_allows_unrelated() {
         let mut mgr = RuleManager::new(300);
-        let rule1 = make_rule(FieldDim::SrcIp, 1, RuleAction::block());
+        let rule1 = make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block());
         mgr.upsert(&[rule1]);
 
-        let rule2 = make_rule(FieldDim::SrcIp, 2, RuleAction::block());
+        let rule2 = make_rule(FieldDim::SrcIp, "10.0.0.2", RuleAction::block());
         assert!(mgr.is_redundant(&rule2).is_none());
     }
 
@@ -205,8 +210,8 @@ mod tests {
     #[test]
     fn recompile_and_deploy_updates_tree() {
         let mgr_rules = vec![
-            make_rule(FieldDim::SrcIp, 1, RuleAction::block()),
-            make_rule(FieldDim::SrcIp, 2, RuleAction::CloseConnection),
+            make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block()),
+            make_rule(FieldDim::SrcIp, "10.0.0.2", RuleAction::CloseConnection),
         ];
         let mut mgr = RuleManager::new(300);
         mgr.upsert(&mgr_rules);

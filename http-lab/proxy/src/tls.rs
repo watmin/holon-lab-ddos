@@ -62,8 +62,8 @@ pub fn parse_client_hello(buf: &[u8]) -> Result<TlsContext> {
     r.skip(32)?; // random
 
     // Session ID
-    let session_id_len = r.read_u8()? as usize;
-    r.skip(session_id_len)?;
+    let session_id_len = r.read_u8()?;
+    r.skip(session_id_len as usize)?;
 
     // Cipher suites
     let cs_len = r.read_u16_be()? as usize;
@@ -75,7 +75,10 @@ pub fn parse_client_hello(buf: &[u8]) -> Result<TlsContext> {
 
     // Compression methods
     let comp_len = r.read_u8()? as usize;
-    r.skip(comp_len)?;
+    let mut compression_methods = Vec::with_capacity(comp_len);
+    for _ in 0..comp_len {
+        compression_methods.push(r.read_u8()?);
+    }
 
     // Extensions (optional — may not be present in very old clients)
     let mut extensions: Vec<(u16, Vec<u8>)> = Vec::new();
@@ -87,6 +90,8 @@ pub fn parse_client_hello(buf: &[u8]) -> Result<TlsContext> {
     let mut session_ticket = false;
     let mut psk_modes: Vec<u8> = Vec::new();
     let mut key_share_groups: Vec<u16> = Vec::new();
+    let mut supported_versions: Vec<u16> = Vec::new();
+    let mut compress_certificate: Vec<u16> = Vec::new();
 
     if r.remaining() >= 2 {
         let exts_total_len = r.read_u16_be()? as usize;
@@ -97,14 +102,15 @@ pub fn parse_client_hello(buf: &[u8]) -> Result<TlsContext> {
             let ext_len = r.read_u16_be()? as usize;
             let ext_data = r.read_bytes(ext_len)?;
 
-            // Pre-parse named extensions for convenience fields
             match ext_type {
                 0x0000 => sni = parse_sni(ext_data),
                 0x000a => supported_groups = parse_u16_list_prefixed(ext_data),
                 0x000b => ec_point_formats = parse_u8_list_prefixed(ext_data),
                 0x000d => sig_algs = parse_u16_list_prefixed(ext_data),
                 0x0010 => alpn = parse_alpn(ext_data),
+                0x001b => compress_certificate = parse_compress_certificate(ext_data),
                 0x0023 => session_ticket = true,
+                0x002b => supported_versions = parse_u8_prefixed_u16_list(ext_data),
                 0x002d => psk_modes = parse_u8_list_prefixed(ext_data),
                 0x0033 => key_share_groups = parse_key_share_groups(ext_data),
                 _ => {}
@@ -117,7 +123,9 @@ pub fn parse_client_hello(buf: &[u8]) -> Result<TlsContext> {
     Ok(TlsContext {
         record_version,
         handshake_version,
+        session_id_len,
         cipher_suites,
+        compression_methods,
         extensions,
         supported_groups,
         ec_point_formats,
@@ -127,6 +135,8 @@ pub fn parse_client_hello(buf: &[u8]) -> Result<TlsContext> {
         session_ticket,
         psk_modes,
         key_share_groups,
+        supported_versions,
+        compress_certificate,
     })
 }
 
@@ -175,6 +185,33 @@ fn parse_alpn(data: &[u8]) -> Vec<String> {
             out.push(s.to_string());
         }
         i += proto_len;
+    }
+    out
+}
+
+/// supported_versions (ext 0x002b) in ClientHello: 1-byte length prefix, then u16 list
+fn parse_u8_prefixed_u16_list(data: &[u8]) -> Vec<u16> {
+    if data.is_empty() { return Vec::new(); }
+    let list_len = data[0] as usize;
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i + 1 < 1 + list_len && i + 1 < data.len() {
+        out.push(u16::from_be_bytes([data[i], data[i + 1]]));
+        i += 2;
+    }
+    out
+}
+
+/// compress_certificate (ext 0x001b): 1-byte length (in bytes) of algorithms list,
+/// then u16 CertificateCompressionAlgorithm values (RFC 8879).
+fn parse_compress_certificate(data: &[u8]) -> Vec<u16> {
+    if data.is_empty() { return Vec::new(); }
+    let list_len = data[0] as usize;
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i + 1 < 1 + list_len && i + 1 < data.len() {
+        out.push(u16::from_be_bytes([data[i], data[i + 1]]));
+        i += 2;
     }
     out
 }
@@ -311,7 +348,9 @@ impl Default for TlsContext {
         TlsContext {
             record_version: 0,
             handshake_version: 0,
+            session_id_len: 0,
             cipher_suites: Vec::new(),
+            compression_methods: vec![0x00],
             extensions: Vec::new(),
             supported_groups: Vec::new(),
             ec_point_formats: Vec::new(),
@@ -321,6 +360,8 @@ impl Default for TlsContext {
             session_ticket: false,
             psk_modes: Vec::new(),
             key_share_groups: Vec::new(),
+            supported_versions: Vec::new(),
+            compress_certificate: Vec::new(),
         }
     }
 }

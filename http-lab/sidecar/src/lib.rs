@@ -4,6 +4,13 @@
 //!   - TLS loop: one SubspaceDetector over TLS context vectors (one sample per connection)
 //!   - Request loop: one SubspaceDetector over full RequestSample vectors (one per request)
 //!
+//! Detection approach (matching veth-lab):
+//!   - Each sample is individually scored against the subspace (no bundling/averaging)
+//!   - Per-tick max residual drives anomaly decisions
+//!   - Hybrid tick trigger: fires on sample count OR elapsed time, whichever first
+//!   - Per-sample exponential decay on accumulation buffers
+//!   - Two-tier detection: subspace anomaly detection + engram-based fast mitigation
+//!
 //! Both loops share one RuleManager and write to the shared ArcSwap<CompiledTree>.
 //! The proxy tasks read the tree via ArcSwap::load() — wait-free.
 
@@ -22,7 +29,7 @@ use anyhow::Result;
 use arc_swap::ArcSwap;
 use holon::kernel::{Encoder, VectorManager};
 use tokio::sync::{mpsc, Mutex};
-use tracing::info;
+use tracing::{info, warn};
 
 use http_proxy::types::{CompiledTree, RequestSample, SampleMessage, TlsSample};
 use crate::detection::{compile_compound_rule, Detection};
@@ -52,12 +59,23 @@ const TLS_FIELDS: &[&str] = &[
 ];
 
 const VSA_DIM: usize = 4096;
-const VSA_K: usize = 8;
-const TICK_INTERVAL: Duration = Duration::from_secs(2);
-const WARMUP_TICKS: usize = 15;        // 30 seconds
+const VSA_K: usize = 64;
+
+/// Hybrid tick trigger: fire after this many REQ samples OR ANALYSIS_MAX_MS, whichever first.
+const ANALYSIS_INTERVAL: usize = 200;
+/// Maximum time between ticks (ms). Ensures ticks fire even at low request volume.
+const ANALYSIS_MAX_MS: u64 = 500;
+
+/// Warmup requires this many individual samples (not ticks).
+const WARMUP_SAMPLES_TLS: usize = 30;
+const WARMUP_SAMPLES_REQ: usize = 500;
+
 const ANOMALY_STREAK_THRESHOLD: usize = 3;
 const RULE_TTL_SECS: u64 = 300;
-const DECAY_ALPHA: f64 = 0.9999;
+
+/// Per-sample exponential decay factor: 0.5^(1/DECAY_HALF_LIFE).
+/// At half_life=500 requests, a sample's influence halves every 500 new requests.
+const DECAY_HALF_LIFE: usize = 500;
 
 // =============================================================================
 // Entry point — called by proxy main.rs
@@ -87,42 +105,71 @@ pub async fn run(
     // Sidecar state
     let mut tls_detector = SubspaceDetector::new(VSA_DIM, VSA_K);
     let mut req_detector = SubspaceDetector::new(VSA_DIM, VSA_K);
-    let mut req_tracker = FieldTracker::new(DECAY_ALPHA);
+    let mut req_tracker = FieldTracker::new(decay_factor(DECAY_HALF_LIFE));
 
     // Load persisted engrams
     tls_detector.load_library(&format!("{}.tls", engram_path));
     req_detector.load_library(&format!("{}.req", engram_path));
 
-    let mut tls_warmup_ticks = 0usize;
-    let mut req_warmup_ticks = 0usize;
+    let decay_alpha = decay_factor(DECAY_HALF_LIFE);
+
+    let mut tls_warmup_count = 0usize;
+    let mut req_warmup_count = 0usize;
+    let mut tls_warmup_done = false;
+    let mut req_warmup_done = false;
+
+    // Per-tick max-residual tracking
+    let mut tls_tick_max_residual = 0.0f64;
+    let mut tls_tick_max_vec: Option<Vec<f64>> = None;
+    let mut req_tick_max_residual = 0.0f64;
+    let mut req_tick_max_vec: Option<Vec<f64>> = None;
+
     let mut last_tick = Instant::now();
-    let mut tick_tls_vecs: Vec<Vec<f64>> = Vec::new();
-    let mut tick_req_vecs: Vec<Vec<f64>> = Vec::new();
+    let mut req_since_tick = 0usize;
+    let mut tls_since_tick = 0usize;
     #[allow(unused_assignments)]
     let mut estimated_rps = 0f64;
     let mut req_count_tick = 0u64;
+    let mut tick_count = 0u64;
 
-    // Accumulation buffers (collect samples between ticks)
-    let mut tls_buf: Vec<TlsSample> = Vec::new();
-    let mut req_buf: Vec<RequestSample> = Vec::new();
+    let analysis_max_dur = Duration::from_millis(ANALYSIS_MAX_MS);
+
+    info!("  Analysis trigger: every {} REQ samples or {}ms (hybrid)", ANALYSIS_INTERVAL, ANALYSIS_MAX_MS);
+    info!("  Decay half-life: {} requests (factor={:.6})", DECAY_HALF_LIFE, decay_alpha);
+    info!("  Warmup: {} TLS samples, {} REQ samples", WARMUP_SAMPLES_TLS, WARMUP_SAMPLES_REQ);
 
     loop {
-        // Drain available samples (non-blocking)
+        // =====================================================================
+        // Per-sample processing: drain channel, encode, score individually
+        // =====================================================================
+        let mut got_sample = false;
+
         loop {
             match sample_rx.try_recv() {
                 Ok(SampleMessage::TlsSample(s)) => {
                     stats.write().await.tls_samples_received += 1;
-                    tls_buf.push(s);
+                    got_sample = true;
+                    tls_since_tick += 1;
+                    process_tls_sample(
+                        &s, &mut tls_detector,
+                        &mut tls_warmup_count, tls_warmup_done,
+                        &mut tls_tick_max_residual, &mut tls_tick_max_vec,
+                    );
                 }
                 Ok(SampleMessage::RequestSample(s)) => {
                     stats.write().await.req_samples_received += 1;
+                    got_sample = true;
+                    req_since_tick += 1;
                     req_count_tick += 1;
-                    req_buf.push(s);
+                    process_req_sample(
+                        &s, &encoder, &mut req_detector, &mut req_tracker,
+                        &mut req_warmup_count, req_warmup_done, decay_alpha,
+                        &mut req_tick_max_residual, &mut req_tick_max_vec,
+                    );
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     info!("Sample channel closed — sidecar shutting down");
-                    // Save engrams on shutdown
                     tls_detector.save_library(&format!("{}.tls", engram_path));
                     req_detector.save_library(&format!("{}.req", engram_path));
                     return Ok(());
@@ -130,110 +177,94 @@ pub async fn run(
             }
         }
 
-        // Wait a short time before next poll to avoid busy-spinning
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // =====================================================================
+        // Hybrid tick trigger: sample count OR elapsed time
+        // =====================================================================
+        let tick_elapsed = last_tick.elapsed();
+        let should_tick = req_since_tick >= ANALYSIS_INTERVAL
+            || tick_elapsed >= analysis_max_dur;
 
-        // Check if it's time for a detection tick
-        if last_tick.elapsed() < TICK_INTERVAL {
+        if !should_tick {
+            if !got_sample {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
             continue;
         }
 
-        // -----------------------------------------------------------------------
+        // =====================================================================
         // Detection tick
-        // -----------------------------------------------------------------------
-        let elapsed_secs = last_tick.elapsed().as_secs_f64();
+        // =====================================================================
+        let elapsed_secs = tick_elapsed.as_secs_f64().max(0.001);
         last_tick = Instant::now();
         estimated_rps = req_count_tick as f64 / elapsed_secs;
         req_count_tick = 0;
+        tick_count += 1;
 
-        let tls_tick_count = tls_buf.len();
-        let req_tick_count = req_buf.len();
+        let tls_tick_count = tls_since_tick;
+        let req_tick_count = req_since_tick;
+        tls_since_tick = 0;
+        req_since_tick = 0;
 
         info!(
+            tick = tick_count,
             tls = tls_tick_count,
             req = req_tick_count,
             rps = format!("{:.0}", estimated_rps),
             "tick"
         );
 
-        // Encode TLS samples (use the pre-computed VSA vector from ConnectionContext)
-        for sample in tls_buf.drain(..) {
-            let vec_f64: Vec<f64> = sample.tls_vec.data().iter()
-                .map(|&b| b as f64)
-                .collect();
-            tick_tls_vecs.push(vec_f64);
+        // Check if warmup just completed
+        if !tls_warmup_done && tls_warmup_count >= WARMUP_SAMPLES_TLS {
+            tls_warmup_done = true;
+            info!("[TLS] Warmup complete ({} samples, threshold={:.2})",
+                  tls_warmup_count, tls_detector.baseline.threshold());
+        }
+        if !req_warmup_done && req_warmup_count >= WARMUP_SAMPLES_REQ {
+            req_warmup_done = true;
+            info!("[REQ] Warmup complete ({} samples, threshold={:.2})",
+                  req_warmup_count, req_detector.baseline.threshold());
         }
 
-        // Encode request samples + update field tracker
-        for sample in req_buf.drain(..) {
-            let req_vec = encoder.encode_walkable(&sample);
-            let vec_f64: Vec<f64> = req_vec.data().iter()
-                .map(|&b| b as f64)
-                .collect();
-            tick_req_vecs.push(vec_f64);
+        // -------------------------------------------------------------------
+        // TLS detection
+        // -------------------------------------------------------------------
+        if tls_warmup_done && tls_tick_max_residual > 0.0 {
+            let score = tls_tick_max_residual;
+            let threshold = tls_detector.baseline.threshold();
+            let is_anomalous = score > threshold;
 
-            // Track field values for attribution
-            let pairs: Vec<(&str, String)> = vec![
-                ("method", sample.method.clone()),
-                ("path", sample.path.clone()),
-                ("src_ip", sample.src_ip.to_string()),
-                ("user_agent", sample.user_agent.clone().unwrap_or_default()),
-                ("host", sample.host.clone().unwrap_or_default()),
-                ("tls_group_hash", sample.tls_ctx.tls_group_hash().to_string()),
-            ];
-            req_tracker.observe(&pairs);
-        }
+            info!("[TLS] score={:.4} threshold={:.4} anomalous={}", score, threshold, is_anomalous);
 
-        // -----------------------------------------------------------------------
-        // TLS detection loop
-        // -----------------------------------------------------------------------
-        if !tick_tls_vecs.is_empty() {
-            let bundle = bundle_vecs(&tick_tls_vecs);
-            tick_tls_vecs.clear();
+            {
+                let mut s = stats.write().await;
+                s.tls_score = score;
+                s.tls_threshold = threshold;
+                s.tls_samples_per_tick = tls_tick_count;
+            }
 
-            if tls_warmup_ticks < WARMUP_TICKS {
-                tls_detector.learn(&bundle);
-                tls_warmup_ticks += 1;
-                info!("[TLS] warmup {}/{}", tls_warmup_ticks, WARMUP_TICKS);
-            } else {
-                // Check engram library first
-                if let Some((engram_name, residual)) = tls_detector.check_library(&bundle) {
-                    info!("[TLS] Known attack pattern matched: '{}' (residual={:.3})", engram_name, residual);
-                    // Known attack — keep rule alive via rule_manager refresh
-                } else {
-                    let score = tls_detector.score(&bundle);
-                    let threshold = tls_detector.baseline.threshold();
-                    let is_anomalous = score > threshold;
+            if is_anomalous {
+                if let Some(ref max_vec) = tls_tick_max_vec {
+                    tls_detector.anomaly_streak += 1;
 
-                    info!("[TLS] score={:.4} threshold={:.4} anomalous={}", score, threshold, is_anomalous);
-
-                    // Update metrics
-                    {
-                        let mut s = stats.write().await;
-                        s.tls_score = score;
-                        s.tls_threshold = threshold;
-                        s.tls_samples_per_tick = tls_tick_count;
-                    }
-
-                    if is_anomalous {
-                        tls_detector.anomaly_streak += 1;
-                        tls_detector.learn_attack(&bundle);
+                    if let Some((engram_name, engram_res)) = tls_detector.check_library(max_vec) {
+                        if tls_detector.anomaly_streak == 1 {
+                            warn!("[TLS] ENGRAM HIT: '{}' (residual={:.2}) — deploying stored rules",
+                                  engram_name, engram_res);
+                            deploy_engram_rules(&tls_detector, &engram_name, &rule_mgr, &tree).await;
+                        }
+                    } else {
+                        tls_detector.learn_attack(max_vec);
 
                         if tls_detector.anomaly_streak >= ANOMALY_STREAK_THRESHOLD {
-                            info!(
-                                "[TLS] Anomaly confirmed (streak={}, score={:.3})",
-                                tls_detector.anomaly_streak, score
-                            );
+                            warn!("[TLS] Anomaly confirmed (streak={}, score={:.3})",
+                                  tls_detector.anomaly_streak, score);
 
-                            // Attribute to top field values
-                            let surprise = tls_detector.surprise_fingerprint(&bundle, &encoder, TLS_FIELDS);
-                            let top_fields: Vec<Detection> = surprise.iter().take(3).map(|(f, _score)| {
+                            let surprise = tls_detector.surprise_fingerprint(max_vec, &encoder, TLS_FIELDS);
+                            let top_fields: Vec<Detection> = surprise.iter().take(3).map(|(f, _s)| {
                                 let val = get_tls_field_top_value(&req_tracker, f);
-                                Detection {
-                                    field: f.clone(),
-                                    value: val,
-                                    rate_factor: 0.01,
-                                }
+                                Detection { field: f.clone(), value: val, rate_factor: 0.01 }
                             }).collect();
 
                             if let Some(rule) = compile_compound_rule(&top_fields, false, estimated_rps, true) {
@@ -243,72 +274,66 @@ pub async fn run(
                                     mgr.recompile_and_deploy(&tree);
                                 }
                             }
-
-                            // Mint engram after enough samples
-                            if tls_detector.anomaly_streak >= ANOMALY_STREAK_THRESHOLD * 3 {
-                                let name = format!("tls-attack-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
-                                let surprise_map: HashMap<String, f64> = surprise.into_iter().collect();
-                                let metadata = serde_json::json!({ "rps": estimated_rps }).as_object().unwrap().iter()
-                                    .map(|(k, v)| (k.clone(), v.clone())).collect();
-                                tls_detector.mint_engram(&name, surprise_map, metadata);
-                            }
                         }
-                    } else {
-                        if tls_detector.has_active_attack() {
-                            tls_detector.cancel_attack();
-                        }
-                        tls_detector.anomaly_streak = 0;
-                        tls_detector.learn(&bundle);
                     }
                 }
+            } else {
+                if tls_detector.has_active_attack() {
+                    let streak = tls_detector.anomaly_streak;
+                    if streak >= ANOMALY_STREAK_THRESHOLD {
+                        if let Some(ref max_vec) = tls_tick_max_vec {
+                            let surprise = tls_detector.surprise_fingerprint(max_vec, &encoder, TLS_FIELDS);
+                            mint_engram_with_rules(&mut tls_detector, "tls", &surprise, estimated_rps, &rule_mgr).await;
+                        }
+                    } else {
+                        tls_detector.cancel_attack();
+                    }
+                }
+                tls_detector.anomaly_streak = 0;
+                if let Some(ref max_vec) = tls_tick_max_vec {
+                    tls_detector.learn(max_vec);
+                }
             }
+        } else if !tls_warmup_done && tls_tick_count > 0 {
+            info!("[TLS] warmup {}/{}", tls_warmup_count, WARMUP_SAMPLES_TLS);
         }
 
-        // -----------------------------------------------------------------------
-        // Request detection loop
-        // -----------------------------------------------------------------------
-        if !tick_req_vecs.is_empty() {
-            let bundle = bundle_vecs(&tick_req_vecs);
-            tick_req_vecs.clear();
+        // -------------------------------------------------------------------
+        // Request detection
+        // -------------------------------------------------------------------
+        if req_warmup_done && req_tick_max_residual > 0.0 {
+            let score = req_tick_max_residual;
+            let threshold = req_detector.baseline.threshold();
+            let is_anomalous = score > threshold;
 
-            if req_warmup_ticks < WARMUP_TICKS {
-                req_detector.learn(&bundle);
-                req_warmup_ticks += 1;
-                info!("[REQ] warmup {}/{}", req_warmup_ticks, WARMUP_TICKS);
-            } else {
-                if let Some((engram_name, residual)) = req_detector.check_library(&bundle) {
-                    info!("[REQ] Known attack pattern matched: '{}' (residual={:.3})", engram_name, residual);
-                } else {
-                    let score = req_detector.score(&bundle);
-                    let threshold = req_detector.baseline.threshold();
-                    let is_anomalous = score > threshold;
+            info!("[REQ] score={:.4} threshold={:.4} anomalous={}", score, threshold, is_anomalous);
 
-                    info!("[REQ] score={:.4} threshold={:.4} anomalous={}", score, threshold, is_anomalous);
+            {
+                let mut s = stats.write().await;
+                s.req_score = score;
+                s.req_threshold = threshold;
+                s.req_samples_per_tick = req_tick_count;
+                s.estimated_rps = estimated_rps;
+            }
 
-                    // Update metrics
-                    {
-                        let mut s = stats.write().await;
-                        s.req_score = score;
-                        s.req_threshold = threshold;
-                        s.req_samples_per_tick = req_tick_count;
-                        s.estimated_rps = estimated_rps;
-                    }
+            if is_anomalous {
+                if let Some(ref max_vec) = req_tick_max_vec {
+                    req_detector.anomaly_streak += 1;
 
-                    if is_anomalous {
-                        req_detector.anomaly_streak += 1;
-                        req_detector.learn_attack(&bundle);
+                    if let Some((engram_name, engram_res)) = req_detector.check_library(max_vec) {
+                        if req_detector.anomaly_streak == 1 {
+                            warn!("[REQ] ENGRAM HIT: '{}' (residual={:.2}) — deploying stored rules",
+                                  engram_name, engram_res);
+                            deploy_engram_rules(&req_detector, &engram_name, &rule_mgr, &tree).await;
+                        }
+                    } else {
+                        req_detector.learn_attack(max_vec);
 
                         if req_detector.anomaly_streak >= ANOMALY_STREAK_THRESHOLD {
-                            info!(
-                                "[REQ] Anomaly confirmed (streak={}, score={:.3}, rps={:.0})",
-                                req_detector.anomaly_streak, score, estimated_rps
-                            );
+                            warn!("[REQ] Anomaly confirmed (streak={}, score={:.3}, rps={:.0})",
+                                  req_detector.anomaly_streak, score, estimated_rps);
 
-                            let surprise = req_detector.surprise_fingerprint(
-                                &bundle, &encoder, REQ_FIELDS,
-                            );
-
-                            // Build detections from top anomalous fields + their top values
+                            let surprise = req_detector.surprise_fingerprint(max_vec, &encoder, REQ_FIELDS);
                             let top_fields: Vec<Detection> = surprise.iter().take(3).filter_map(|(f, _)| {
                                 let top = req_tracker.top_values(f, 1);
                                 top.into_iter().next().map(|(val, _)| Detection {
@@ -325,25 +350,35 @@ pub async fn run(
                                     mgr.recompile_and_deploy(&tree);
                                 }
                             }
-
-                            if req_detector.anomaly_streak >= ANOMALY_STREAK_THRESHOLD * 3 {
-                                let name = format!("req-attack-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
-                                let surprise_map: HashMap<String, f64> = surprise.into_iter().collect();
-                                let metadata = serde_json::json!({ "rps": estimated_rps }).as_object().unwrap().iter()
-                                    .map(|(k, v)| (k.clone(), v.clone())).collect();
-                                req_detector.mint_engram(&name, surprise_map, metadata);
-                            }
                         }
-                    } else {
-                        if req_detector.has_active_attack() {
-                            req_detector.cancel_attack();
-                        }
-                        req_detector.anomaly_streak = 0;
-                        req_detector.learn(&bundle);
                     }
                 }
+            } else {
+                if req_detector.has_active_attack() {
+                    let streak = req_detector.anomaly_streak;
+                    if streak >= ANOMALY_STREAK_THRESHOLD {
+                        if let Some(ref max_vec) = req_tick_max_vec {
+                            let surprise = req_detector.surprise_fingerprint(max_vec, &encoder, REQ_FIELDS);
+                            mint_engram_with_rules(&mut req_detector, "req", &surprise, estimated_rps, &rule_mgr).await;
+                        }
+                    } else {
+                        req_detector.cancel_attack();
+                    }
+                }
+                req_detector.anomaly_streak = 0;
+                if let Some(ref max_vec) = req_tick_max_vec {
+                    req_detector.learn(max_vec);
+                }
             }
+        } else if !req_warmup_done && req_tick_count > 0 {
+            info!("[REQ] warmup {}/{}", req_warmup_count, WARMUP_SAMPLES_REQ);
         }
+
+        // Reset per-tick max tracking
+        tls_tick_max_residual = 0.0;
+        tls_tick_max_vec = None;
+        req_tick_max_residual = 0.0;
+        req_tick_max_vec = None;
 
         // Expire old rules periodically
         {
@@ -355,42 +390,199 @@ pub async fn run(
         }
 
         // Update metrics
+        let rules_count;
         {
             let mgr = rule_mgr.lock().await;
+            rules_count = mgr.rule_count();
             let mut s = stats.write().await;
-            s.warmup_tls = tls_warmup_ticks < WARMUP_TICKS;
-            s.warmup_req = req_warmup_ticks < WARMUP_TICKS;
+            s.warmup_tls = !tls_warmup_done;
+            s.warmup_req = !req_warmup_done;
+            s.warmup_samples_tls = tls_warmup_count;
+            s.warmup_samples_req = req_warmup_count;
             s.anomaly_streak_tls = tls_detector.anomaly_streak;
             s.anomaly_streak_req = req_detector.anomaly_streak;
             s.engrams_tls = tls_detector.library.len();
             s.engrams_req = req_detector.library.len();
-            s.active_rules = mgr.rule_count();
+            s.active_rules = rules_count;
+            s.tick_count = tick_count;
+            let (pass, blocks, rate_limits, close_conn) = http_proxy::enforcement_counts();
+            s.enforced_pass = pass;
+            s.enforced_blocks = blocks;
+            s.enforced_rate_limits = rate_limits;
+            s.enforced_close_conn = close_conn;
+        }
+
+        // Periodic metrics snapshot (every 10 ticks)
+        if tick_count % 10 == 0 {
+            let s = stats.read().await;
+            info!(
+                "[METRICS] tick={} samples(tls={},req={}) rps={:.0} \
+                 tls[score={:.2},thr={:.2},streak={}] \
+                 req[score={:.2},thr={:.2},streak={}] \
+                 rules={} engrams(tls={},req={}) warmup(tls={},req={}) \
+                 enforced(pass={},block={},rate_limit={},close={})",
+                s.tick_count,
+                s.tls_samples_received, s.req_samples_received,
+                s.estimated_rps,
+                s.tls_score, s.tls_threshold, s.anomaly_streak_tls,
+                s.req_score, s.req_threshold, s.anomaly_streak_req,
+                s.active_rules,
+                s.engrams_tls, s.engrams_req,
+                if s.warmup_tls { format!("{}/{}", s.warmup_samples_tls, WARMUP_SAMPLES_TLS) } else { "done".into() },
+                if s.warmup_req { format!("{}/{}", s.warmup_samples_req, WARMUP_SAMPLES_REQ) } else { "done".into() },
+                s.enforced_pass, s.enforced_blocks, s.enforced_rate_limits, s.enforced_close_conn,
+            );
         }
     }
+}
+
+// =============================================================================
+// Per-sample processing (called for each sample, not per tick)
+// =============================================================================
+
+/// Process a single TLS sample: learn during warmup, score individually after.
+fn process_tls_sample(
+    sample: &TlsSample,
+    detector: &mut SubspaceDetector,
+    warmup_count: &mut usize,
+    warmup_done: bool,
+    tick_max_residual: &mut f64,
+    tick_max_vec: &mut Option<Vec<f64>>,
+) {
+    let vec_f64: Vec<f64> = sample.tls_vec.data().iter()
+        .map(|&b| b as f64)
+        .collect();
+
+    if !warmup_done {
+        detector.learn(&vec_f64);
+        *warmup_count += 1;
+    } else {
+        let residual = detector.score(&vec_f64);
+        if residual > *tick_max_residual {
+            *tick_max_residual = residual;
+            *tick_max_vec = Some(vec_f64);
+        }
+    }
+}
+
+/// Process a single REQ sample: encode, decay accumulator, learn/score, track fields.
+fn process_req_sample(
+    sample: &RequestSample,
+    encoder: &Encoder,
+    detector: &mut SubspaceDetector,
+    tracker: &mut FieldTracker,
+    warmup_count: &mut usize,
+    warmup_done: bool,
+    decay_alpha: f64,
+    tick_max_residual: &mut f64,
+    tick_max_vec: &mut Option<Vec<f64>>,
+) {
+    let req_vec = encoder.encode_walkable(sample);
+    let vec_f64: Vec<f64> = req_vec.data().iter()
+        .map(|&b| b as f64)
+        .collect();
+
+    if !warmup_done {
+        detector.learn(&vec_f64);
+        *warmup_count += 1;
+    } else {
+        let residual = detector.score(&vec_f64);
+        if residual > *tick_max_residual {
+            *tick_max_residual = residual;
+            *tick_max_vec = Some(vec_f64);
+        }
+    }
+
+    // Track field values for attribution (with per-request decay)
+    let pairs: Vec<(&str, String)> = vec![
+        ("method", sample.method.clone()),
+        ("path", sample.path.clone()),
+        ("src_ip", sample.src_ip.to_string()),
+        ("user_agent", sample.user_agent.clone().unwrap_or_default()),
+        ("host", sample.host.clone().unwrap_or_default()),
+        ("tls_group_hash", sample.tls_ctx.group_string()),
+    ];
+    tracker.observe_with_decay(&pairs, decay_alpha);
+}
+
+// =============================================================================
+// Engram helpers
+// =============================================================================
+
+/// Deploy rules stored in an engram's metadata.
+async fn deploy_engram_rules(
+    detector: &SubspaceDetector,
+    engram_name: &str,
+    rule_mgr: &Arc<Mutex<RuleManager>>,
+    tree: &Arc<ArcSwap<CompiledTree>>,
+) {
+    let stored_rules: Vec<serde_json::Value> = detector.library.get(engram_name)
+        .and_then(|e| e.metadata().get("rules").cloned())
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+
+    if stored_rules.is_empty() {
+        warn!("  Engram '{}' has no stored rules", engram_name);
+        return;
+    }
+
+    let rules: Vec<_> = stored_rules.iter().filter_map(|v| {
+        serde_json::from_value::<crate::detection::StoredRule>(v.clone()).ok()
+    }).collect();
+
+    if !rules.is_empty() {
+        let specs: Vec<_> = rules.iter().filter_map(|r| r.to_rule_spec()).collect();
+        if !specs.is_empty() {
+            let mut mgr = rule_mgr.lock().await;
+            mgr.upsert(&specs);
+            mgr.recompile_and_deploy(tree);
+            warn!("  Deployed {} rules from engram '{}'", specs.len(), engram_name);
+        }
+    }
+}
+
+/// Mint an engram, storing current active rules in its metadata.
+async fn mint_engram_with_rules(
+    detector: &mut SubspaceDetector,
+    prefix: &str,
+    surprise: &[(String, f64)],
+    estimated_rps: f64,
+    rule_mgr: &Arc<Mutex<RuleManager>>,
+) {
+    let name = format!("{}-attack-{}", prefix, chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+    let surprise_map: HashMap<String, f64> = surprise.iter().cloned().collect();
+
+    let mgr = rule_mgr.lock().await;
+    let active_rules_json: Vec<serde_json::Value> = mgr.active_rule_specs().iter()
+        .filter_map(|spec| serde_json::to_value(spec).ok())
+        .collect();
+
+    let mut metadata: HashMap<String, serde_json::Value> = HashMap::new();
+    metadata.insert("rps".into(), serde_json::json!(estimated_rps));
+    metadata.insert("streak".into(), serde_json::json!(detector.anomaly_streak));
+    if !active_rules_json.is_empty() {
+        metadata.insert("rules".into(), serde_json::json!(active_rules_json));
+    }
+
+    detector.mint_engram(&name, surprise_map, metadata);
+    warn!("[{}] Engram minted: '{}' (library size: {}, {} rules stored)",
+          prefix.to_uppercase(), name, detector.library.len(), active_rules_json.len());
 }
 
 // =============================================================================
 // Helpers
 // =============================================================================
 
-/// Bundle a set of per-sample f64 vectors into a single window vector via
-/// element-wise sum, then normalize. Equivalent to bundling in VSA terms.
-fn bundle_vecs(vecs: &[Vec<f64>]) -> Vec<f64> {
-    if vecs.is_empty() { return Vec::new(); }
-    let dim = vecs[0].len();
-    let mut sum = vec![0.0f64; dim];
-    for v in vecs {
-        for (i, &x) in v.iter().enumerate() {
-            sum[i] += x;
-        }
+/// Compute per-sample decay factor from half-life.
+fn decay_factor(half_life: usize) -> f64 {
+    if half_life > 0 {
+        0.5_f64.powf(1.0 / half_life as f64)
+    } else {
+        1.0
     }
-    let n = vecs.len() as f64;
-    sum.iter_mut().for_each(|x| *x /= n);
-    sum
 }
 
 /// Get the top value for a TLS-level field from the field tracker.
-/// TLS fields store their values under request-level tracking using the same names.
 fn get_tls_field_top_value(tracker: &FieldTracker, field: &str) -> String {
     tracker.top_values(field, 1)
         .into_iter()

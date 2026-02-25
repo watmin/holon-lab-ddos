@@ -3,6 +3,8 @@
 //! Adapted from veth-lab/sidecar/src/detection.rs for HTTP field dimensions.
 //! Takes a list of anomalous fields and compiles them into RuleSpecs.
 
+use serde::{Deserialize, Serialize};
+
 use http_proxy::types::{FieldDim, Predicate, RuleAction, RuleSpec};
 
 /// A single field-level anomaly detection result.
@@ -16,27 +18,19 @@ pub struct Detection {
 impl Detection {
     /// Convert field/value into a Predicate for the rule tree.
     fn to_predicate(&self) -> Option<Predicate> {
-        match self.field.as_str() {
-            "src_ip" => self.value.parse::<std::net::IpAddr>().ok()
-                .map(|ip| Predicate::eq(FieldDim::SrcIp, ip_to_u32(ip))),
-
-            "tls_group_hash" => self.value.parse::<u32>().ok()
-                .map(|v| Predicate::eq(FieldDim::TlsGroupHash, v)),
-
-            "tls_cipher_hash" => self.value.parse::<u32>().ok()
-                .map(|v| Predicate::eq(FieldDim::TlsCipherHash, v)),
-
-            "tls_ext_order_hash" => self.value.parse::<u32>().ok()
-                .map(|v| Predicate::eq(FieldDim::TlsExtOrderHash, v)),
-
-            "method" => Some(Predicate::eq(FieldDim::Method, fnv1a(&self.value))),
-            "path" => Some(Predicate::eq(FieldDim::PathPrefix, fnv1a(&self.value))),
-            "host" => Some(Predicate::eq(FieldDim::Host, fnv1a(&self.value))),
-            "user_agent" => Some(Predicate::eq(FieldDim::UserAgent, fnv1a(&self.value))),
-            "content_type" => Some(Predicate::eq(FieldDim::ContentType, fnv1a(&self.value))),
-
-            _ => None,
-        }
+        let dim = match self.field.as_str() {
+            "src_ip" => FieldDim::SrcIp,
+            "tls_group_hash" => FieldDim::TlsGroupHash,
+            "tls_cipher_hash" => FieldDim::TlsCipherHash,
+            "tls_ext_order_hash" => FieldDim::TlsExtOrderHash,
+            "method" => FieldDim::Method,
+            "path" => FieldDim::PathPrefix,
+            "host" => FieldDim::Host,
+            "user_agent" => FieldDim::UserAgent,
+            "content_type" => FieldDim::ContentType,
+            _ => return None,
+        };
+        Some(Predicate::eq(dim, &self.value))
     }
 
     #[allow(dead_code)]
@@ -81,20 +75,50 @@ pub fn compile_compound_rule(
     Some(RuleSpec::new(constraints, action))
 }
 
-fn ip_to_u32(ip: std::net::IpAddr) -> u32 {
-    match ip {
-        std::net::IpAddr::V4(v4) => u32::from_ne_bytes(v4.octets()),
-        _ => 0,
-    }
+/// Serializable representation of a rule for engram storage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredRule {
+    pub constraints: Vec<StoredPredicate>,
+    pub action: String,
+    pub action_rps: Option<u32>,
 }
 
-fn fnv1a(s: &str) -> u32 {
-    let mut h: u32 = 0x811c9dc5;
-    for b in s.bytes() {
-        h ^= b as u32;
-        h = h.wrapping_mul(0x01000193);
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredPredicate {
+    pub field: String,
+    pub op: String,
+    pub value: String,
+}
+
+impl StoredRule {
+    pub fn to_rule_spec(&self) -> Option<RuleSpec> {
+        let constraints: Vec<Predicate> = self.constraints.iter()
+            .filter_map(|p| {
+                let dim = match p.field.as_str() {
+                    "SrcIp" => FieldDim::SrcIp,
+                    "Method" => FieldDim::Method,
+                    "PathPrefix" => FieldDim::PathPrefix,
+                    "Host" => FieldDim::Host,
+                    "UserAgent" => FieldDim::UserAgent,
+                    "ContentType" => FieldDim::ContentType,
+                    "TlsGroupHash" => FieldDim::TlsGroupHash,
+                    "TlsCipherHash" => FieldDim::TlsCipherHash,
+                    "TlsExtOrderHash" => FieldDim::TlsExtOrderHash,
+                    _ => return None,
+                };
+                Some(Predicate::eq(dim, &p.value))
+            })
+            .collect();
+        if constraints.is_empty() { return None; }
+
+        let action = match self.action.as_str() {
+            "CloseConnection" => RuleAction::CloseConnection,
+            "RateLimit" => RuleAction::RateLimit { rps: self.action_rps.unwrap_or(100) },
+            _ => RuleAction::block(),
+        };
+
+        Some(RuleSpec::new(constraints, action))
     }
-    h
 }
 
 #[cfg(test)]
@@ -113,22 +137,21 @@ mod tests {
     fn to_predicate_src_ip() {
         let d = det("src_ip", "10.0.0.1");
         let pred = d.to_predicate().unwrap();
-        let expected_ip = u32::from_ne_bytes([10, 0, 0, 1]);
-        assert!(matches!(pred, Predicate::Eq(FieldDim::SrcIp, v) if v == expected_ip));
+        assert_eq!(pred, Predicate::Eq(FieldDim::SrcIp, "10.0.0.1".to_string()));
     }
 
     #[test]
     fn to_predicate_method() {
         let d = det("method", "GET");
         let pred = d.to_predicate().unwrap();
-        assert!(matches!(pred, Predicate::Eq(FieldDim::Method, _)));
+        assert_eq!(pred, Predicate::Eq(FieldDim::Method, "GET".to_string()));
     }
 
     #[test]
     fn to_predicate_tls_group_hash() {
-        let d = det("tls_group_hash", "12345");
+        let d = det("tls_group_hash", "0x001d,0x0017");
         let pred = d.to_predicate().unwrap();
-        assert!(matches!(pred, Predicate::Eq(FieldDim::TlsGroupHash, 12345)));
+        assert_eq!(pred, Predicate::Eq(FieldDim::TlsGroupHash, "0x001d,0x0017".to_string()));
     }
 
     #[test]
@@ -138,9 +161,10 @@ mod tests {
     }
 
     #[test]
-    fn to_predicate_invalid_ip_returns_none() {
+    fn to_predicate_any_string_is_valid() {
         let d = det("src_ip", "not-an-ip");
-        assert!(d.to_predicate().is_none());
+        let pred = d.to_predicate().unwrap();
+        assert_eq!(pred, Predicate::Eq(FieldDim::SrcIp, "not-an-ip".to_string()));
     }
 
     #[test]

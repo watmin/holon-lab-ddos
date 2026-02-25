@@ -28,7 +28,7 @@ struct ShadowNode {
     dim_index: usize,
     action: Option<(RuleAction, u32)>, // (action, rule_id)
     /// Specific-value children: field_value → subtree
-    children: HashMap<u32, Rc<ShadowNode>>,
+    children: HashMap<String, Rc<ShadowNode>>,
     /// Wildcard child (rules that don't constrain this dimension)
     wildcard: Option<Rc<ShadowNode>>,
 }
@@ -100,7 +100,7 @@ fn compile_recursive(rules: &[RuleSpec], dim_idx: usize) -> Rc<ShadowNode> {
     }
 
     // Partition: rules with an Eq constraint on this dim vs. those without
-    let mut grouped: HashMap<u32, Vec<&RuleSpec>> = HashMap::new();
+    let mut grouped: HashMap<String, Vec<&RuleSpec>> = HashMap::new();
     let mut wildcard_rules: Vec<&RuleSpec> = Vec::new();
 
     for rule in rules {
@@ -137,9 +137,9 @@ fn rule_constrains_eq(rule: &RuleSpec, dim: FieldDim) -> bool {
     rule.constraints.iter().any(|p| matches!(p, Predicate::Eq(d, _) if *d == dim))
 }
 
-fn rule_eq_value(rule: &RuleSpec, dim: FieldDim) -> Option<u32> {
+fn rule_eq_value(rule: &RuleSpec, dim: FieldDim) -> Option<String> {
     rule.constraints.iter().find_map(|p| match p {
-        Predicate::Eq(d, v) if *d == dim => Some(*v),
+        Predicate::Eq(d, v) if *d == dim => Some(v.clone()),
         _ => None,
     })
 }
@@ -159,9 +159,9 @@ fn flatten(node: &Rc<ShadowNode>, nodes: &mut Vec<TreeNode>) -> usize {
     });
 
     // Recurse children — must push after reserving our slot
-    for (&val, child) in &node.children {
+    for (val, child) in &node.children {
         let child_idx = flatten(child, nodes);
-        nodes[idx].children.insert(val, child_idx);
+        nodes[idx].children.insert(val.clone(), child_idx);
     }
 
     if let Some(ref wc) = node.wildcard {
@@ -204,7 +204,7 @@ mod tests {
     use std::sync::Arc;
     use crate::types::{FieldDim, Predicate, RuleAction, RuleSpec};
 
-    fn make_rule(dim: FieldDim, val: u32, action: RuleAction) -> RuleSpec {
+    fn make_rule(dim: FieldDim, val: &str, action: RuleAction) -> RuleSpec {
         RuleSpec::new(vec![Predicate::eq(dim, val)], action)
     }
 
@@ -222,12 +222,8 @@ mod tests {
         use holon::kernel::{Encoder, VectorManager};
 
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
-        let ip_u32 = match ip {
-            IpAddr::V4(v4) => u32::from_ne_bytes(v4.octets()),
-            _ => 0,
-        };
 
-        let rules = vec![make_rule(FieldDim::SrcIp, ip_u32, RuleAction::block())];
+        let rules = vec![make_rule(FieldDim::SrcIp, "1.2.3.4", RuleAction::block())];
         let tree = compile(&rules);
 
         let tls_ctx = Arc::new(TlsContext::default());
@@ -268,19 +264,11 @@ mod tests {
         test_request_sample(method, path, ip, vec![], tls_ctx, tls_vec)
     }
 
-    fn ip_u32(s: &str) -> u32 {
-        let ip: std::net::IpAddr = s.parse().unwrap();
-        match ip {
-            std::net::IpAddr::V4(v4) => u32::from_ne_bytes(v4.octets()),
-            _ => 0,
-        }
-    }
-
     #[test]
     fn multiple_rules_different_dims() {
         let rules = vec![
-            make_rule(FieldDim::SrcIp, ip_u32("10.0.0.1"), RuleAction::block()),
-            make_rule(FieldDim::SrcIp, ip_u32("10.0.0.2"), RuleAction::CloseConnection),
+            make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block()),
+            make_rule(FieldDim::SrcIp, "10.0.0.2", RuleAction::CloseConnection),
         ];
         let tree = compile(&rules);
 
@@ -295,7 +283,6 @@ mod tests {
 
     #[test]
     fn wildcard_rule_matches_all() {
-        // A rule with no constraints matches everything via wildcard path
         let rule = RuleSpec::new(vec![], RuleAction::count("test"));
         let tree = compile(&[rule]);
 
@@ -306,25 +293,21 @@ mod tests {
 
     #[test]
     fn specific_rule_takes_precedence_over_wildcard() {
-        let ip = ip_u32("10.0.0.1");
         let block_rule = RuleSpec::new(
-            vec![Predicate::eq(FieldDim::SrcIp, ip)],
+            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
             RuleAction::block(),
         );
-        // default priority is 100 for both
 
         let mut pass_rule = RuleSpec::new(vec![], RuleAction::pass());
-        pass_rule.priority = 50; // lower priority than the block rule
+        pass_rule.priority = 50;
 
         let rules = vec![pass_rule, block_rule];
         let tree = compile(&rules);
 
-        // 10.0.0.1 should match the specific (block) rule since it has higher priority
         let req_blocked = make_test_req("GET", "/", "10.0.0.1");
         let action = tree.evaluate_req(&req_blocked);
         assert!(matches!(action, Some(RuleAction::Block { .. })));
 
-        // Other IPs should fall through to wildcard (pass)
         let req_other = make_test_req("GET", "/", "10.0.0.2");
         let action = tree.evaluate_req(&req_other);
         assert!(matches!(action, Some(RuleAction::Pass)));
@@ -332,27 +315,21 @@ mod tests {
 
     #[test]
     fn multi_constraint_rule() {
-        use crate::types::fnv1a_str;
-        let ip = ip_u32("10.0.0.1");
-        let method_hash = fnv1a_str("POST");
         let rule = RuleSpec::new(
             vec![
-                Predicate::eq(FieldDim::SrcIp, ip),
-                Predicate::eq(FieldDim::Method, method_hash),
+                Predicate::eq(FieldDim::SrcIp, "10.0.0.1"),
+                Predicate::eq(FieldDim::Method, "POST"),
             ],
             RuleAction::block(),
         );
         let tree = compile(&[rule]);
 
-        // Both constraints match
         let req_match = make_test_req("POST", "/api", "10.0.0.1");
         assert!(matches!(tree.evaluate_req(&req_match), Some(RuleAction::Block { .. })));
 
-        // IP matches but method doesn't
         let req_wrong_method = make_test_req("GET", "/api", "10.0.0.1");
         assert!(tree.evaluate_req(&req_wrong_method).is_none());
 
-        // Method matches but IP doesn't
         let req_wrong_ip = make_test_req("POST", "/api", "10.0.0.2");
         assert!(tree.evaluate_req(&req_wrong_ip).is_none());
     }
@@ -360,8 +337,8 @@ mod tests {
     #[test]
     fn compile_idempotent() {
         let rules = vec![
-            make_rule(FieldDim::SrcIp, ip_u32("10.0.0.1"), RuleAction::block()),
-            make_rule(FieldDim::SrcIp, ip_u32("10.0.0.2"), RuleAction::CloseConnection),
+            make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block()),
+            make_rule(FieldDim::SrcIp, "10.0.0.2", RuleAction::CloseConnection),
         ];
         let tree1 = compile(&rules);
         let tree2 = compile(&rules);
@@ -371,8 +348,8 @@ mod tests {
 
     #[test]
     fn fingerprint_changes_with_rules() {
-        let rules1 = vec![make_rule(FieldDim::SrcIp, 1, RuleAction::block())];
-        let rules2 = vec![make_rule(FieldDim::SrcIp, 2, RuleAction::block())];
+        let rules1 = vec![make_rule(FieldDim::SrcIp, "1.2.3.4", RuleAction::block())];
+        let rules2 = vec![make_rule(FieldDim::SrcIp, "5.6.7.8", RuleAction::block())];
         let tree1 = compile(&rules1);
         let tree2 = compile(&rules2);
         assert_ne!(tree1.rule_fingerprint, tree2.rule_fingerprint);

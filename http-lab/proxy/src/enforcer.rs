@@ -64,14 +64,6 @@ mod tests {
         test_request_sample("GET", "/", ip_str.parse().unwrap(), vec![], tls_ctx, tls_vec)
     }
 
-    fn ip_u32(s: &str) -> u32 {
-        let ip: std::net::IpAddr = s.parse().unwrap();
-        match ip {
-            std::net::IpAddr::V4(v4) => u32::from_ne_bytes(v4.octets()),
-            _ => 0,
-        }
-    }
-
     #[test]
     fn evaluate_empty_tree_is_pass() {
         let tree = CompiledTree::empty();
@@ -82,7 +74,7 @@ mod tests {
     #[test]
     fn evaluate_block_verdict() {
         let rules = vec![RuleSpec::new(
-            vec![Predicate::eq(FieldDim::SrcIp, ip_u32("10.0.0.1"))],
+            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
             RuleAction::Block { status: 403 },
         )];
         let tree = compile(&rules);
@@ -93,7 +85,7 @@ mod tests {
     #[test]
     fn evaluate_rate_limit_verdict() {
         let rules = vec![RuleSpec::new(
-            vec![Predicate::eq(FieldDim::SrcIp, ip_u32("10.0.0.1"))],
+            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
             RuleAction::RateLimit { rps: 100 },
         )];
         let tree = compile(&rules);
@@ -104,7 +96,7 @@ mod tests {
     #[test]
     fn evaluate_close_connection_verdict() {
         let rules = vec![RuleSpec::new(
-            vec![Predicate::eq(FieldDim::SrcIp, ip_u32("10.0.0.1"))],
+            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
             RuleAction::CloseConnection,
         )];
         let tree = compile(&rules);
@@ -115,7 +107,7 @@ mod tests {
     #[test]
     fn evaluate_count_verdict() {
         let rules = vec![RuleSpec::new(
-            vec![Predicate::eq(FieldDim::SrcIp, ip_u32("10.0.0.1"))],
+            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
             RuleAction::count("test-counter"),
         )];
         let tree = compile(&rules);
@@ -126,7 +118,7 @@ mod tests {
     #[test]
     fn evaluate_pass_verdict() {
         let rules = vec![RuleSpec::new(
-            vec![Predicate::eq(FieldDim::SrcIp, ip_u32("10.0.0.1"))],
+            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
             RuleAction::Pass,
         )];
         let tree = compile(&rules);
@@ -137,7 +129,7 @@ mod tests {
     #[test]
     fn evaluate_non_matching_is_pass() {
         let rules = vec![RuleSpec::new(
-            vec![Predicate::eq(FieldDim::SrcIp, ip_u32("10.0.0.1"))],
+            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
             RuleAction::block(),
         )];
         let tree = compile(&rules);

@@ -90,39 +90,22 @@ async fn handle_request(
 
     match verdict {
         Verdict::CloseConnection => {
-            // We can't RST from here without access to the raw socket; return
-            // a minimal response and let the connection drop.
-            warn!(
-                conn_id = conn_ctx.conn_id,
-                src_ip = %conn_ctx.src_ip,
-                "rule CLOSE: dropping connection"
-            );
+            crate::ENFORCED_CLOSE_CONN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
                 .body(Full::new(Bytes::new()))
                 .unwrap());
         }
         Verdict::Block(status) => {
-            debug!(
-                conn_id = conn_ctx.conn_id,
-                src_ip = %conn_ctx.src_ip,
-                method = %sample.method,
-                path = %sample.path,
-                status,
-                "rule BLOCK"
-            );
+            crate::ENFORCED_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ = sample_tx.try_send(SampleMessage::RequestSample(sample));
             return Ok(Response::builder()
                 .status(status)
                 .body(Full::new(Bytes::from("Blocked\n")))
                 .unwrap());
         }
-        Verdict::RateLimit(rps) => {
-            debug!(
-                conn_id = conn_ctx.conn_id,
-                rps,
-                "rule RATE-LIMIT (returning 429)"
-            );
+        Verdict::RateLimit(_rps) => {
+            crate::ENFORCED_RATE_LIMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ = sample_tx.try_send(SampleMessage::RequestSample(sample));
             return Ok(Response::builder()
                 .status(StatusCode::TOO_MANY_REQUESTS)
@@ -130,7 +113,7 @@ async fn handle_request(
                 .unwrap());
         }
         Verdict::Pass | Verdict::Count => {
-            // Best-effort enqueue then forward
+            crate::ENFORCED_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ = sample_tx.try_send(SampleMessage::RequestSample(sample.clone()));
         }
     }

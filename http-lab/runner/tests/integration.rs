@@ -391,7 +391,7 @@ async fn request_sample_captures_headers() {
                         assert_eq!(r.query.as_deref(), Some("q=1"));
                         assert_eq!(r.host.as_deref(), Some("example.com"));
                         assert_eq!(r.user_agent.as_deref(), Some("test-agent/1.0"));
-                        assert_eq!(r.header("x-custom"), Some("custom-value"));
+                        assert_eq!(r.header("x-custom"), vec!["custom-value"]);
                         assert!(!r.tls_ctx.cipher_suites.is_empty());
                         break;
                     }

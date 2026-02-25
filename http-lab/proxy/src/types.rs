@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use holon::kernel::{Encoder, Vector};
-use holon::{ScalarRef, ScalarValue, WalkType, Walkable, WalkableRef, WalkableValue};
+use holon::{ScalarValue, WalkType, Walkable, WalkableValue};
 
 // =============================================================================
 // TLS ClientHello Context (lossless, ordered)
@@ -34,8 +34,14 @@ pub struct TlsContext {
     /// ClientHello.client_version field
     pub handshake_version: u16,
 
+    /// Length of the session ID field (0 = none, 32 = TLS 1.3 compat mode).
+    pub session_id_len: u8,
+
     /// Cipher suites in wire order. GREASE values (0xXaXa) included.
     pub cipher_suites: Vec<u16>,
+
+    /// Compression methods advertised by the client. TLS 1.3 always [0x00].
+    pub compression_methods: Vec<u8>,
 
     /// All extensions in wire order: (extension_type, raw_extension_data).
     /// Raw bytes are preserved exactly as received — no lossy projection.
@@ -62,6 +68,10 @@ pub struct TlsContext {
     pub psk_modes: Vec<u8>,
     /// Key share groups (ext 0x0033), wire order.
     pub key_share_groups: Vec<u16>,
+    /// Supported TLS versions (ext 0x002b). The *real* version negotiation in TLS 1.3.
+    pub supported_versions: Vec<u16>,
+    /// Certificate compression algorithms (ext 0x001b), e.g. brotli=2, zlib=1.
+    pub compress_certificate: Vec<u16>,
 }
 
 impl TlsContext {
@@ -70,41 +80,28 @@ impl TlsContext {
         encoder.encode_walkable(self)
     }
 
-    /// Compute a stable u32 hash of the supported_groups list for use as a
-    /// tree dimension value. Same tool → same groups → same hash.
-    pub fn tls_group_hash(&self) -> u32 {
-        let mut h: u32 = 0x811c9dc5;
-        for &g in &self.supported_groups {
-            h ^= (g & 0xff) as u32;
-            h = h.wrapping_mul(0x01000193);
-            h ^= (g >> 8) as u32;
-            h = h.wrapping_mul(0x01000193);
-        }
-        h
+    /// Canonical string of the supported_groups list (wire order, hex codes).
+    pub fn group_string(&self) -> String {
+        self.supported_groups.iter()
+            .map(|g| format!("0x{:04x}", g))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
-    /// Compute a stable u32 hash of the cipher suite list (wire order preserved).
-    pub fn cipher_hash(&self) -> u32 {
-        let mut h: u32 = 0x811c9dc5;
-        for &c in &self.cipher_suites {
-            h ^= (c & 0xff) as u32;
-            h = h.wrapping_mul(0x01000193);
-            h ^= (c >> 8) as u32;
-            h = h.wrapping_mul(0x01000193);
-        }
-        h
+    /// Canonical string of the cipher suite list (wire order, hex codes).
+    pub fn cipher_string(&self) -> String {
+        self.cipher_suites.iter()
+            .map(|c| format!("0x{:04x}", c))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
-    /// Compute a stable u32 hash of the extension type list (wire order preserved).
-    pub fn ext_order_hash(&self) -> u32 {
-        let mut h: u32 = 0x811c9dc5;
-        for &(t, _) in &self.extensions {
-            h ^= (t & 0xff) as u32;
-            h = h.wrapping_mul(0x01000193);
-            h ^= (t >> 8) as u32;
-            h = h.wrapping_mul(0x01000193);
-        }
-        h
+    /// Canonical string of the extension type list (wire order, hex codes).
+    pub fn ext_order_string(&self) -> String {
+        self.extensions.iter()
+            .map(|(t, _)| format!("0x{:04x}", t))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     /// Compute the classical JA4 fingerprint string for logging and external tool
@@ -181,44 +178,145 @@ fn truncated_sha256_hex(input: &str) -> String {
     format!("{:012x}", h.finish())
 }
 
+// =============================================================================
+// Walkable encoding helpers
+// =============================================================================
+
+use crate::tls_names;
+
+fn scalar_s(s: String) -> WalkableValue {
+    WalkableValue::Scalar(ScalarValue::String(s))
+}
+
+fn scalar_str(s: &str) -> WalkableValue {
+    WalkableValue::Scalar(ScalarValue::String(s.to_string()))
+}
+
+fn named_list<F: Fn(u16) -> &'static str>(vals: &[u16], namer: F) -> WalkableValue {
+    WalkableValue::List(vals.iter().map(|&v| scalar_str(namer(v))).collect())
+}
+
+fn named_set<F: Fn(u16) -> &'static str>(vals: &[u16], namer: F) -> WalkableValue {
+    WalkableValue::Set(vals.iter().map(|&v| scalar_str(namer(v))).collect())
+}
+
+fn string_list(vals: &[String]) -> WalkableValue {
+    WalkableValue::List(vals.iter().map(|s| scalar_s(s.clone())).collect())
+}
+
 impl Walkable for TlsContext {
     fn walk_type(&self) -> WalkType {
         WalkType::Map
     }
 
     fn walk_map_items(&self) -> Vec<(&str, WalkableValue)> {
-        let mut items = vec![
-            ("tls_version", WalkableValue::Scalar(ScalarValue::Int(self.handshake_version as i64))),
-            ("cipher_count", WalkableValue::Scalar(ScalarValue::Int(self.cipher_suites.len() as i64))),
-            ("ext_count", WalkableValue::Scalar(ScalarValue::Int(self.extensions.len() as i64))),
-            ("group_count", WalkableValue::Scalar(ScalarValue::Int(self.supported_groups.len() as i64))),
-            ("sig_alg_count", WalkableValue::Scalar(ScalarValue::Int(self.sig_algs.len() as i64))),
-            ("has_sni", WalkableValue::Scalar(ScalarValue::Int(if self.sni.is_some() { 1 } else { 0 }))),
-            ("session_ticket", WalkableValue::Scalar(ScalarValue::Int(if self.session_ticket { 1 } else { 0 }))),
-            ("cipher_hash", WalkableValue::Scalar(ScalarValue::Int(self.cipher_hash() as i64))),
-            ("ext_order_hash", WalkableValue::Scalar(ScalarValue::Int(self.ext_order_hash() as i64))),
-            ("group_hash", WalkableValue::Scalar(ScalarValue::Int(self.tls_group_hash() as i64))),
-        ];
-        if let Some(ref alpn) = self.alpn.first() {
-            items.push(("alpn_first", WalkableValue::Scalar(ScalarValue::String((*alpn).clone()))));
-        }
-        items
-    }
+        let mut items: Vec<(&str, WalkableValue)> = Vec::with_capacity(20);
 
-    fn walk_map_visitor(&self, visitor: &mut dyn FnMut(&str, WalkableRef<'_>)) {
-        visitor("tls_version", WalkableRef::int(self.handshake_version as i64));
-        visitor("cipher_count", WalkableRef::int(self.cipher_suites.len() as i64));
-        visitor("ext_count", WalkableRef::int(self.extensions.len() as i64));
-        visitor("group_count", WalkableRef::int(self.supported_groups.len() as i64));
-        visitor("sig_alg_count", WalkableRef::int(self.sig_algs.len() as i64));
-        visitor("has_sni", WalkableRef::int(if self.sni.is_some() { 1 } else { 0 }));
-        visitor("session_ticket", WalkableRef::int(if self.session_ticket { 1 } else { 0 }));
-        visitor("cipher_hash", WalkableRef::int(self.cipher_hash() as i64));
-        visitor("ext_order_hash", WalkableRef::int(self.ext_order_hash() as i64));
-        visitor("group_hash", WalkableRef::int(self.tls_group_hash() as i64));
-        if let Some(alpn) = self.alpn.first() {
-            visitor("alpn_first", WalkableRef::string(alpn));
+        // Record-layer version (usually TLS1.0 compat) + handshake version
+        items.push(("record_version", scalar_str(tls_names::tls_version_name(self.record_version))));
+        items.push(("version", scalar_str(tls_names::tls_version_name(self.handshake_version))));
+
+        // Session ID length — 0 vs 32 distinguishes TLS 1.3 compat mode
+        items.push(("session_id_len", WalkableValue::Scalar(ScalarValue::Int(self.session_id_len as i64))));
+
+        // Cipher suites: Set (which ciphers) + List (exact ordering)
+        items.push(("ciphers", named_set(&self.cipher_suites, tls_names::cipher_suite_name)));
+        items.push(("cipher_order", named_list(&self.cipher_suites, tls_names::cipher_suite_name)));
+
+        // Compression methods
+        items.push(("compression", WalkableValue::List(
+            self.compression_methods.iter()
+                .map(|&m| scalar_str(tls_names::compression_method_name(m)))
+                .collect()
+        )));
+
+        // Extension types: Set (which extensions) + List (exact ordering — fingerprint gold)
+        let ext_types: Vec<u16> = self.extensions.iter().map(|&(t, _)| t).collect();
+        items.push(("ext_types", named_set(&ext_types, tls_names::extension_name)));
+        items.push(("ext_order", named_list(&ext_types, tls_names::extension_name)));
+
+        // Extensions map: name → parsed value for known types, "present" otherwise
+        let mut ext_map: Vec<(String, WalkableValue)> = Vec::new();
+        for &(ext_type, _) in &self.extensions {
+            let key = tls_names::extension_name(ext_type).to_string();
+            let value = match ext_type {
+                0x0000 => match self.sni {
+                    Some(ref sni) => scalar_s(sni.clone()),
+                    None => scalar_str("present"),
+                },
+                0x0010 => string_list(&self.alpn),
+                0x002b => named_list(&self.supported_versions, tls_names::tls_version_name),
+                0x002d => WalkableValue::List(
+                    self.psk_modes.iter()
+                        .map(|&m| scalar_str(tls_names::psk_mode_name(m)))
+                        .collect()
+                ),
+                0x0033 => named_set(&self.key_share_groups, tls_names::named_group_name),
+                0x001b => WalkableValue::List(
+                    self.compress_certificate.iter()
+                        .map(|&a| scalar_str(tls_names::compress_cert_name(a)))
+                        .collect()
+                ),
+                _ => scalar_str("present"),
+            };
+            ext_map.push((key, value));
         }
+        items.push(("extensions", WalkableValue::Map(ext_map)));
+
+        // Supported groups as Set
+        items.push(("groups", named_set(&self.supported_groups, tls_names::named_group_name)));
+
+        // Signature algorithms as Set
+        items.push(("sig_algs", named_set(&self.sig_algs, tls_names::sig_alg_name)));
+
+        // Supported versions (the real TLS version negotiation)
+        if !self.supported_versions.is_empty() {
+            items.push(("supported_versions", named_list(&self.supported_versions, tls_names::tls_version_name)));
+        }
+
+        // ALPN protocols as ordered List
+        if !self.alpn.is_empty() {
+            items.push(("alpn", string_list(&self.alpn)));
+        }
+
+        // SNI
+        if let Some(ref sni) = self.sni {
+            items.push(("sni", scalar_s(sni.clone())));
+        }
+
+        // EC point formats
+        if !self.ec_point_formats.is_empty() {
+            items.push(("ec_point_formats", WalkableValue::List(
+                self.ec_point_formats.iter()
+                    .map(|&f| scalar_str(tls_names::ec_point_format_name(f)))
+                    .collect()
+            )));
+        }
+
+        // PSK modes
+        if !self.psk_modes.is_empty() {
+            items.push(("psk_modes", WalkableValue::List(
+                self.psk_modes.iter()
+                    .map(|&m| scalar_str(tls_names::psk_mode_name(m)))
+                    .collect()
+            )));
+        }
+
+        // Key share groups as Set
+        if !self.key_share_groups.is_empty() {
+            items.push(("key_shares", named_set(&self.key_share_groups, tls_names::named_group_name)));
+        }
+
+        // Certificate compression algorithms
+        if !self.compress_certificate.is_empty() {
+            items.push(("compress_certificate", WalkableValue::List(
+                self.compress_certificate.iter()
+                    .map(|&a| scalar_str(tls_names::compress_cert_name(a)))
+                    .collect()
+            )));
+        }
+
+        items
     }
 }
 
@@ -286,6 +384,25 @@ pub enum HttpVersion {
     Http11,
 }
 
+// =============================================================================
+// Query string segments
+// =============================================================================
+
+/// A parsed segment from a query string, distinguishing three forms:
+///
+/// - `foo=bar` → `Pair("foo", "bar")` — key bound to a value
+/// - `foo=`    → `Pair("foo", "")`    — key explicitly bound to empty string
+/// - `foo`     → `Flag("foo")`        — key with no assignment (not the same as `foo=`)
+/// - ``        → `Empty`              — empty segment from `&&`, trailing `&`, etc.
+///
+/// Malformed input (like `?` appearing inside a segment) is kept raw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryPart<'a> {
+    Pair(&'a str, &'a str),
+    Flag(&'a str),
+    Empty,
+}
+
 impl std::fmt::Display for HttpVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -338,22 +455,25 @@ pub struct RequestSample {
 }
 
 impl RequestSample {
-    /// First value for a header name (case-insensitive). Returns None if absent.
-    pub fn header(&self, name: &str) -> Option<&str> {
-        let name_lower = name.to_ascii_lowercase();
-        self.headers.iter()
-            .find(|(k, _)| k.to_ascii_lowercase() == name_lower)
-            .map(|(_, v)| v.as_str())
-    }
-
     /// All values for a header name (case-insensitive), in wire order.
-    /// Duplicates are included.
-    pub fn header_all(&self, name: &str) -> Vec<&str> {
+    ///
+    /// Returns an empty vec if the header is absent. Duplicate header
+    /// expressions return N values; most headers return one.
+    pub fn header(&self, name: &str) -> Vec<&str> {
         let name_lower = name.to_ascii_lowercase();
         self.headers.iter()
             .filter(|(k, _)| k.to_ascii_lowercase() == name_lower)
             .map(|(_, v)| v.as_str())
             .collect()
+    }
+
+    /// First value for a header name (case-insensitive), or None if absent.
+    /// Convenience for the common single-valued case.
+    pub fn header_first(&self, name: &str) -> Option<&str> {
+        let name_lower = name.to_ascii_lowercase();
+        self.headers.iter()
+            .find(|(k, _)| k.to_ascii_lowercase() == name_lower)
+            .map(|(_, v)| v.as_str())
     }
 
     /// Whether a header is present (case-insensitive).
@@ -362,14 +482,48 @@ impl RequestSample {
         self.headers.iter().any(|(k, _)| k.to_ascii_lowercase() == name_lower)
     }
 
-    /// Iterate all headers in wire order.
+    /// Iterate all headers in wire order as (name, value) pairs.
     pub fn headers_iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.headers.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
 
-    /// Extract path prefix up to first '?' (same as `path` since query is separate).
-    pub fn path_prefix(&self) -> &str {
-        &self.path
+    /// Header names in wire order (duplicates included, as expressed).
+    pub fn header_names(&self) -> Vec<&str> {
+        self.headers.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    /// Path split by '/' preserving leading/trailing slashes as empty strings.
+    /// e.g. "/api/v2/users/" → ["", "api", "v2", "users", ""]
+    pub fn path_parts(&self) -> Vec<&str> {
+        self.path.split('/').collect()
+    }
+
+    /// Parse query string into ordered segments.
+    ///
+    /// Each segment is one of:
+    /// - `QueryPart::Pair(key, value)` — `foo=bar` or `foo=` (explicit empty value)
+    /// - `QueryPart::Flag(name)` — `baz` (no `=` at all, semantically different from `baz=`)
+    /// - `QueryPart::Empty` — from `&&`, trailing `&`, or leading `&`
+    ///
+    /// Order and duplicates preserved. Handles malformed input like `?a=1&b?c=2&`
+    /// by keeping `?` in the key raw.
+    pub fn query_parts(&self) -> Vec<QueryPart<'_>> {
+        match self.query {
+            Some(ref q) if !q.is_empty() => {
+                q.split('&')
+                    .map(|segment| {
+                        if segment.is_empty() {
+                            QueryPart::Empty
+                        } else if let Some(eq) = segment.find('=') {
+                            QueryPart::Pair(&segment[..eq], &segment[eq + 1..])
+                        } else {
+                            QueryPart::Flag(segment)
+                        }
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// src_ip as a compact string for use as a rule dimension value.
@@ -384,53 +538,93 @@ impl Walkable for RequestSample {
     }
 
     fn walk_map_items(&self) -> Vec<(&str, WalkableValue)> {
-        let mut items = vec![
-            ("method", WalkableValue::Scalar(ScalarValue::String(self.method.clone()))),
-            ("path", WalkableValue::Scalar(ScalarValue::String(self.path.clone()))),
-            ("src_ip", WalkableValue::Scalar(ScalarValue::String(self.src_ip_str()))),
-            ("header_count", WalkableValue::Scalar(ScalarValue::Int(self.headers.len() as i64))),
-            ("has_cookie", WalkableValue::Scalar(ScalarValue::Int(if self.cookies.is_empty() { 0 } else { 1 }))),
-            ("tls_group_hash", WalkableValue::Scalar(ScalarValue::Int(self.tls_ctx.tls_group_hash() as i64))),
-            ("tls_cipher_hash", WalkableValue::Scalar(ScalarValue::Int(self.tls_ctx.cipher_hash() as i64))),
-            ("tls_ext_order_hash", WalkableValue::Scalar(ScalarValue::Int(self.tls_ctx.ext_order_hash() as i64))),
-        ];
-        if let Some(ref ua) = self.user_agent {
-            items.push(("user_agent", WalkableValue::Scalar(ScalarValue::String(ua.clone()))));
+        let mut items: Vec<(&str, WalkableValue)> = Vec::with_capacity(16);
+
+        // --- Request line ---
+        items.push(("method", scalar_s(self.method.clone())));
+        items.push(("path", scalar_s(self.path.clone())));
+
+        // Path split by '/' — positional encoding captures directory structure
+        items.push(("path_parts", WalkableValue::List(
+            self.path.split('/').map(|p| scalar_s(p.to_string())).collect()
+        )));
+
+        items.push(("version", scalar_s(self.version.to_string())));
+
+        // Raw query string (exact bytes as received — captures encoding oddities)
+        if let Some(ref q) = self.query {
+            items.push(("query", scalar_s(q.clone())));
+
+            // Structured query decomposition. Each segment encodes differently:
+            //   "foo=bar" → List["foo", "bar"]  (pair: key bound to value)
+            //   "foo="    → List["foo", ""]      (pair: key bound to empty string)
+            //   "foo"     → Scalar "foo"         (flag: no assignment — structurally distinct)
+            //   ""        → Scalar ""            (empty segment from && or trailing &)
+            //
+            // Malformed input like "baz?bur=qax" keeps the ? in the key raw.
+            let parts: Vec<WalkableValue> = q.split('&')
+                .map(|segment| {
+                    if segment.is_empty() {
+                        scalar_s(String::new())
+                    } else if let Some(eq) = segment.find('=') {
+                        WalkableValue::List(vec![
+                            scalar_s(segment[..eq].to_string()),
+                            scalar_s(segment[eq + 1..].to_string()),
+                        ])
+                    } else {
+                        scalar_s(segment.to_string())
+                    }
+                })
+                .collect();
+            items.push(("query_parts", WalkableValue::List(parts)));
         }
-        if let Some(ref ct) = self.content_type {
-            items.push(("content_type", WalkableValue::Scalar(ScalarValue::String(ct.clone()))));
+
+        // --- Headers ---
+        // Header names in wire order (hyper lowercases names; order is preserved)
+        items.push(("header_order", WalkableValue::List(
+            self.headers.iter()
+                .map(|(k, _)| scalar_s(k.clone()))
+                .collect()
+        )));
+
+        // Full headers as List of [name, value] pairs — lossless, ordered, duplicates preserved
+        items.push(("headers", WalkableValue::List(
+            self.headers.iter()
+                .map(|(k, v)| WalkableValue::List(vec![
+                    scalar_s(k.clone()),
+                    scalar_s(v.clone()),
+                ]))
+                .collect()
+        )));
+
+        items.push(("header_count", WalkableValue::Scalar(ScalarValue::linear(
+            self.headers.len() as f64
+        ))));
+
+        // Cookies as List of [key, value] pairs
+        if !self.cookies.is_empty() {
+            items.push(("cookies", WalkableValue::List(
+                self.cookies.iter()
+                    .map(|(k, v)| WalkableValue::List(vec![
+                        scalar_s(k.clone()),
+                        scalar_s(v.clone()),
+                    ]))
+                    .collect()
+            )));
         }
-        if let Some(ref host) = self.host {
-            items.push(("host", WalkableValue::Scalar(ScalarValue::String(host.clone()))));
-        }
+
+        // --- Body ---
         if self.body_len > 0 {
             items.push(("body_len", WalkableValue::Scalar(ScalarValue::log(self.body_len as f64))));
         }
-        items
-    }
 
-    fn walk_map_visitor(&self, visitor: &mut dyn FnMut(&str, WalkableRef<'_>)) {
-        visitor("method", WalkableRef::string(&self.method));
-        visitor("path", WalkableRef::string(&self.path));
-        let src_ip_str = self.src_ip_str();
-        visitor("src_ip", WalkableRef::string(&src_ip_str));
-        visitor("header_count", WalkableRef::int(self.headers.len() as i64));
-        visitor("has_cookie", WalkableRef::int(if self.cookies.is_empty() { 0 } else { 1 }));
-        visitor("tls_group_hash", WalkableRef::int(self.tls_ctx.tls_group_hash() as i64));
-        visitor("tls_cipher_hash", WalkableRef::int(self.tls_ctx.cipher_hash() as i64));
-        visitor("tls_ext_order_hash", WalkableRef::int(self.tls_ctx.ext_order_hash() as i64));
-        if let Some(ref ua) = self.user_agent {
-            visitor("user_agent", WalkableRef::string(ua));
-        }
-        if let Some(ref ct) = self.content_type {
-            visitor("content_type", WalkableRef::string(ct));
-        }
-        if let Some(ref host) = self.host {
-            visitor("host", WalkableRef::string(host));
-        }
-        if self.body_len > 0 {
-            visitor("body_len", WalkableRef::Scalar(ScalarRef::log(self.body_len as f64)));
-        }
+        // --- Connection context ---
+        items.push(("src_ip", scalar_s(self.src_ip_str())));
+
+        // Full nested TLS context — encoder handles deep nesting via role-filler binding
+        items.push(("tls", self.tls_ctx.to_walkable_value()));
+
+        items
     }
 }
 
@@ -480,48 +674,31 @@ impl FieldDim {
         }
     }
 
-    /// Extract the u32-comparable value from a RequestSample for this dimension.
-    /// String fields use FNV-1a hash so they can be compared in the tree.
-    pub fn extract_u32(&self, req: &RequestSample) -> u32 {
+    /// Extract the string value from a RequestSample for this dimension.
+    pub fn extract_value(&self, req: &RequestSample) -> String {
         match self {
-            FieldDim::SrcIp => ip_to_u32(req.src_ip),
-            FieldDim::TlsGroupHash => req.tls_ctx.tls_group_hash(),
-            FieldDim::TlsCipherHash => req.tls_ctx.cipher_hash(),
-            FieldDim::TlsExtOrderHash => req.tls_ctx.ext_order_hash(),
-            FieldDim::Method => fnv1a_str(&req.method),
-            FieldDim::PathPrefix => fnv1a_str(&req.path),
-            FieldDim::Host => fnv1a_str(req.host.as_deref().unwrap_or("")),
-            FieldDim::UserAgent => fnv1a_str(req.user_agent.as_deref().unwrap_or("")),
-            FieldDim::ContentType => fnv1a_str(req.content_type.as_deref().unwrap_or("")),
+            FieldDim::SrcIp => req.src_ip.to_string(),
+            FieldDim::TlsGroupHash => req.tls_ctx.group_string(),
+            FieldDim::TlsCipherHash => req.tls_ctx.cipher_string(),
+            FieldDim::TlsExtOrderHash => req.tls_ctx.ext_order_string(),
+            FieldDim::Method => req.method.clone(),
+            FieldDim::PathPrefix => req.path.clone(),
+            FieldDim::Host => req.host.clone().unwrap_or_default(),
+            FieldDim::UserAgent => req.user_agent.clone().unwrap_or_default(),
+            FieldDim::ContentType => req.content_type.clone().unwrap_or_default(),
         }
     }
 
-    /// Extract the u32-comparable value from a TlsSample for TLS-level dims.
-    pub fn extract_u32_tls(&self, sample: &TlsSample) -> u32 {
+    /// Extract the string value from a TlsSample for TLS-level dims.
+    pub fn extract_value_tls(&self, sample: &TlsSample) -> String {
         match self {
-            FieldDim::SrcIp => ip_to_u32(sample.src_ip),
-            FieldDim::TlsGroupHash => sample.tls_ctx.tls_group_hash(),
-            FieldDim::TlsCipherHash => sample.tls_ctx.cipher_hash(),
-            FieldDim::TlsExtOrderHash => sample.tls_ctx.ext_order_hash(),
-            _ => 0,
+            FieldDim::SrcIp => sample.src_ip.to_string(),
+            FieldDim::TlsGroupHash => sample.tls_ctx.group_string(),
+            FieldDim::TlsCipherHash => sample.tls_ctx.cipher_string(),
+            FieldDim::TlsExtOrderHash => sample.tls_ctx.ext_order_string(),
+            _ => String::new(),
         }
     }
-}
-
-fn ip_to_u32(ip: IpAddr) -> u32 {
-    match ip {
-        IpAddr::V4(v4) => u32::from_ne_bytes(v4.octets()),
-        IpAddr::V6(_) => 0, // IPv6 not in scope for phase 1
-    }
-}
-
-pub fn fnv1a_str(s: &str) -> u32 {
-    let mut h: u32 = 0x811c9dc5;
-    for b in s.bytes() {
-        h ^= b as u32;
-        h = h.wrapping_mul(0x01000193);
-    }
-    h
 }
 
 /// The traversal order for the Rete-spirit DAG.
@@ -540,45 +717,54 @@ pub const DIM_ORDER: &[FieldDim] = &[
 /// A matching predicate for one field dimension.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Predicate {
-    /// field == value (u32 comparison)
-    Eq(FieldDim, u32),
-    /// field > value
-    Gt(FieldDim, u32),
-    /// field < value
-    Lt(FieldDim, u32),
+    /// field == value (string equality)
+    Eq(FieldDim, String),
+    /// field > value (lexicographic; reserved for future numeric WAF expressions)
+    Gt(FieldDim, String),
+    /// field < value (lexicographic; reserved for future numeric WAF expressions)
+    Lt(FieldDim, String),
 }
 
 impl Predicate {
-    pub fn eq(dim: FieldDim, val: u32) -> Self { Predicate::Eq(dim, val) }
+    pub fn eq(dim: FieldDim, val: impl Into<String>) -> Self { Predicate::Eq(dim, val.into()) }
 
     pub fn dim(&self) -> FieldDim {
         match self { Predicate::Eq(d, _) | Predicate::Gt(d, _) | Predicate::Lt(d, _) => *d }
     }
 
+    pub fn value(&self) -> &str {
+        match self { Predicate::Eq(_, v) | Predicate::Gt(_, v) | Predicate::Lt(_, v) => v }
+    }
+
     pub fn matches_req(&self, req: &RequestSample) -> bool {
-        let v = self.dim().extract_u32(req);
-        self.matches_value(v)
+        let v = self.dim().extract_value(req);
+        self.matches_value(&v)
     }
 
     pub fn matches_tls(&self, sample: &TlsSample) -> bool {
-        let v = self.dim().extract_u32_tls(sample);
-        self.matches_value(v)
+        let v = self.dim().extract_value_tls(sample);
+        self.matches_value(&v)
     }
 
-    fn matches_value(&self, v: u32) -> bool {
+    fn matches_value(&self, v: &str) -> bool {
         match self {
-            Predicate::Eq(_, expected) => v == *expected,
-            Predicate::Gt(_, threshold) => v > *threshold,
-            Predicate::Lt(_, threshold) => v < *threshold,
+            Predicate::Eq(_, expected) => v == expected,
+            Predicate::Gt(_, threshold) => v > threshold.as_str(),
+            Predicate::Lt(_, threshold) => v < threshold.as_str(),
+        }
+    }
+
+    /// Render as an s-expression clause: `(= method "GET")`
+    pub fn to_sexpr_clause(&self) -> String {
+        match self {
+            Predicate::Eq(d, v) => format!("(= {} \"{}\")", d.name(), v),
+            Predicate::Gt(d, v) => format!("(> {} \"{}\")", d.name(), v),
+            Predicate::Lt(d, v) => format!("(< {} \"{}\")", d.name(), v),
         }
     }
 
     pub fn describe(&self) -> String {
-        match self {
-            Predicate::Eq(d, v) => format!("({} = {})", d.name(), v),
-            Predicate::Gt(d, v) => format!("({} > {})", d.name(), v),
-            Predicate::Lt(d, v) => format!("({} < {})", d.name(), v),
-        }
+        self.to_sexpr_clause()
     }
 }
 
@@ -637,14 +823,14 @@ impl RuleSpec {
         if let Some(ref l) = self.label {
             return l.clone();
         }
-        let c: Vec<_> = self.constraints.iter().map(|p| p.describe()).collect();
+        let c: Vec<_> = self.constraints.iter().map(|p| p.to_sexpr_clause()).collect();
         format!("[{}] → {}", c.join(" "), self.action.describe())
     }
 
     /// Canonical identity key for deduplication in the rule manager.
     pub fn identity_key(&self) -> String {
         let mut parts: Vec<String> = self.constraints.iter()
-            .map(|p| p.describe())
+            .map(|p| p.to_sexpr_clause())
             .collect();
         parts.sort();
         format!("{}::{}", parts.join(","), self.action.describe())
@@ -659,6 +845,84 @@ impl RuleSpec {
     pub fn matches_tls(&self, sample: &TlsSample) -> bool {
         self.constraints.iter().all(|p| p.matches_tls(sample))
     }
+
+    fn action_to_sexpr(action: &RuleAction) -> String {
+        match action {
+            RuleAction::Block { status } => format!("(block {})", status),
+            RuleAction::RateLimit { rps } => format!("(rate-limit {})", rps),
+            RuleAction::CloseConnection => "(close-connection)".to_string(),
+            RuleAction::Count { label } => format!("(count \"{}\")", label),
+            RuleAction::Pass => "(pass)".to_string(),
+        }
+    }
+
+    /// Emit rule as EDN (compact, single-line).
+    pub fn to_edn(&self) -> String {
+        let mut sorted: Vec<&Predicate> = self.constraints.iter().collect();
+        sorted.sort_by_key(|p| p.dim() as u8);
+
+        let constraints_str = if sorted.is_empty() {
+            "[]".to_string()
+        } else {
+            let clauses: Vec<String> = sorted.iter().map(|p| p.to_sexpr_clause()).collect();
+            format!("[{}]", clauses.join(" "))
+        };
+
+        let action_str = Self::action_to_sexpr(&self.action);
+        let priority_str = if self.priority != 100 {
+            format!(" :priority {}", self.priority)
+        } else {
+            String::new()
+        };
+        let comment_str = if let Some(ref c) = self.comment {
+            format!(" :comment \"{}\"", c.replace('"', "\\\""))
+        } else {
+            String::new()
+        };
+
+        format!("{{:constraints {} :actions [{}]{}{}}}", constraints_str, action_str, priority_str, comment_str)
+    }
+
+    /// Emit rule as EDN (pretty, multi-line format for logs).
+    pub fn to_edn_pretty(&self) -> String {
+        let indent = "               ";
+
+        let mut sorted: Vec<&Predicate> = self.constraints.iter().collect();
+        sorted.sort_by_key(|p| p.dim() as u8);
+
+        let constraints_str = if sorted.is_empty() {
+            "[]".to_string()
+        } else if sorted.len() == 1 {
+            format!("[{}]", sorted[0].to_sexpr_clause())
+        } else {
+            let clauses: Vec<String> = sorted.iter().map(|p| p.to_sexpr_clause()).collect();
+            let mut s = format!("[{}", clauses[0]);
+            for clause in &clauses[1..] {
+                s.push_str(&format!("\n{}{}", indent, clause));
+            }
+            s.push(']');
+            s
+        };
+
+        let action_str = Self::action_to_sexpr(&self.action);
+
+        if self.priority != 100 || self.comment.is_some() {
+            let mut parts = vec![
+                format!("{{:constraints {}", constraints_str),
+                format!(" :actions     [{}]", action_str),
+            ];
+            if self.priority != 100 {
+                parts.push(format!(" :priority    {}", self.priority));
+            }
+            if let Some(ref comment) = self.comment {
+                parts.push(format!(" :comment     \"{}\"", comment.replace('"', "\\\"")));
+            }
+            parts.push("}".to_string());
+            parts.join("\n")
+        } else {
+            format!("{{:constraints {}\n :actions     [{}]}}", constraints_str, action_str)
+        }
+    }
 }
 
 // =============================================================================
@@ -671,7 +935,7 @@ pub struct TreeNode {
     /// Which dimension this node branches on.
     pub dim: FieldDim,
     /// Exact-match children: field_value → child_index
-    pub children: HashMap<u32, usize>,
+    pub children: HashMap<String, usize>,
     /// Wildcard child: for rules that don't constrain this dimension.
     pub wildcard: Option<usize>,
     /// Action at this node (from highest-priority terminating rule).
@@ -714,7 +978,7 @@ impl CompiledTree {
         let node = self.nodes.get(node_idx)?;
 
         // Check specific child first (higher priority than wildcard)
-        let field_val = node.dim.extract_u32(req);
+        let field_val = node.dim.extract_value(req);
         let specific = node.children.get(&field_val)
             .and_then(|&child| self.dfs_req(req, child));
 
@@ -730,7 +994,7 @@ impl CompiledTree {
 
     fn dfs_tls<'a>(&'a self, sample: &TlsSample, node_idx: usize) -> Option<&'a RuleAction> {
         let node = self.nodes.get(node_idx)?;
-        let field_val = node.dim.extract_u32_tls(sample);
+        let field_val = node.dim.extract_value_tls(sample);
         let specific = node.children.get(&field_val)
             .and_then(|&child| self.dfs_tls(sample, child));
         let wildcard = node.wildcard
@@ -817,7 +1081,9 @@ mod tests {
         TlsContext {
             record_version: 0x0301,
             handshake_version: 0x0303,
+            session_id_len: 32,
             cipher_suites: vec![0x1301, 0x1302, 0x1303, 0xc02c, 0xc02b],
+            compression_methods: vec![0x00],
             extensions: vec![
                 (0x0000, vec![0; 10]), // SNI
                 (0x000a, vec![0; 6]),  // supported_groups
@@ -831,33 +1097,35 @@ mod tests {
             session_ticket: false,
             psk_modes: vec![0x01],
             key_share_groups: vec![0x001d, 0x0017],
+            supported_versions: vec![0x0304, 0x0303],
+            compress_certificate: vec![],
         }
     }
 
-    // --- TlsContext hashing ---
+    // --- TlsContext canonical strings ---
 
     #[test]
-    fn tls_group_hash_deterministic() {
+    fn tls_group_string_deterministic() {
         let ctx = sample_tls_context();
-        assert_eq!(ctx.tls_group_hash(), ctx.tls_group_hash());
+        assert_eq!(ctx.group_string(), ctx.group_string());
     }
 
     #[test]
-    fn tls_group_hash_changes_with_groups() {
+    fn tls_group_string_changes_with_groups() {
         let ctx1 = sample_tls_context();
         let mut ctx2 = sample_tls_context();
-        ctx2.supported_groups = vec![0x0018, 0x0017, 0x001d]; // different order
-        assert_ne!(ctx1.tls_group_hash(), ctx2.tls_group_hash());
+        ctx2.supported_groups = vec![0x0018, 0x0017, 0x001d];
+        assert_ne!(ctx1.group_string(), ctx2.group_string());
     }
 
     #[test]
-    fn tls_cipher_hash_deterministic() {
+    fn tls_cipher_string_deterministic() {
         let ctx = sample_tls_context();
-        assert_eq!(ctx.cipher_hash(), ctx.cipher_hash());
+        assert_eq!(ctx.cipher_string(), ctx.cipher_string());
     }
 
     #[test]
-    fn tls_ext_order_hash_changes_with_order() {
+    fn tls_ext_order_string_changes_with_order() {
         let ctx1 = sample_tls_context();
         let mut ctx2 = sample_tls_context();
         ctx2.extensions = vec![
@@ -865,19 +1133,15 @@ mod tests {
             (0x000a, vec![0; 6]),
             (0x0000, vec![0; 10]),
         ];
-        assert_ne!(ctx1.ext_order_hash(), ctx2.ext_order_hash());
+        assert_ne!(ctx1.ext_order_string(), ctx2.ext_order_string());
     }
 
     #[test]
-    fn empty_tls_context_hashes_are_consistent() {
+    fn empty_tls_context_strings_are_empty() {
         let ctx = TlsContext::default();
-        let h1 = ctx.tls_group_hash();
-        let h2 = ctx.cipher_hash();
-        let h3 = ctx.ext_order_hash();
-        // All should return the FNV-1a offset basis since no data is mixed in
-        assert_eq!(h1, 0x811c9dc5);
-        assert_eq!(h2, 0x811c9dc5);
-        assert_eq!(h3, 0x811c9dc5);
+        assert_eq!(ctx.group_string(), "");
+        assert_eq!(ctx.cipher_string(), "");
+        assert_eq!(ctx.ext_order_string(), "");
     }
 
     // --- TlsContext Walkable + VSA encoding ---
@@ -930,19 +1194,14 @@ mod tests {
         let (tls_ctx, tls_vec) = default_tls();
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let req = test_request_sample("GET", "/", ip, vec![], tls_ctx, tls_vec);
-        let val = FieldDim::SrcIp.extract_u32(&req);
-        let expected = u32::from_ne_bytes([10, 0, 0, 1]);
-        assert_eq!(val, expected);
+        assert_eq!(FieldDim::SrcIp.extract_value(&req), "10.0.0.1");
     }
 
     #[test]
-    fn extract_method_hash_is_deterministic() {
+    fn extract_method_returns_string() {
         let (tls_ctx, tls_vec) = default_tls();
         let req = test_request_sample("POST", "/api", "1.2.3.4".parse().unwrap(), vec![], tls_ctx, tls_vec);
-        let v1 = FieldDim::Method.extract_u32(&req);
-        let v2 = FieldDim::Method.extract_u32(&req);
-        assert_eq!(v1, v2);
-        assert_ne!(v1, 0);
+        assert_eq!(FieldDim::Method.extract_value(&req), "POST");
     }
 
     #[test]
@@ -952,8 +1211,8 @@ mod tests {
         let req_get = test_request_sample("GET", "/", ip, vec![], tls_ctx.clone(), tls_vec.clone());
         let req_post = test_request_sample("POST", "/", ip, vec![], tls_ctx, tls_vec);
         assert_ne!(
-            FieldDim::Method.extract_u32(&req_get),
-            FieldDim::Method.extract_u32(&req_post)
+            FieldDim::Method.extract_value(&req_get),
+            FieldDim::Method.extract_value(&req_post)
         );
     }
 
@@ -964,8 +1223,7 @@ mod tests {
         let (tls_ctx, tls_vec) = default_tls();
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let req = test_request_sample("GET", "/", ip, vec![], tls_ctx, tls_vec);
-        let ip_u32 = u32::from_ne_bytes([10, 0, 0, 1]);
-        let pred = Predicate::eq(FieldDim::SrcIp, ip_u32);
+        let pred = Predicate::eq(FieldDim::SrcIp, "10.0.0.1");
         assert!(pred.matches_req(&req));
     }
 
@@ -974,20 +1232,19 @@ mod tests {
         let (tls_ctx, tls_vec) = default_tls();
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let req = test_request_sample("GET", "/", ip, vec![], tls_ctx, tls_vec);
-        let wrong_ip = u32::from_ne_bytes([192, 168, 1, 1]);
-        let pred = Predicate::eq(FieldDim::SrcIp, wrong_ip);
+        let pred = Predicate::eq(FieldDim::SrcIp, "192.168.1.1");
         assert!(!pred.matches_req(&req));
     }
 
     #[test]
     fn predicate_gt_lt() {
-        let pred_gt = Predicate::Gt(FieldDim::SrcIp, 100);
-        let pred_lt = Predicate::Lt(FieldDim::SrcIp, 100);
-        assert!(pred_gt.matches_value(101));
-        assert!(!pred_gt.matches_value(100));
-        assert!(!pred_gt.matches_value(99));
-        assert!(pred_lt.matches_value(99));
-        assert!(!pred_lt.matches_value(100));
+        let pred_gt = Predicate::Gt(FieldDim::Method, "GET".to_string());
+        let pred_lt = Predicate::Lt(FieldDim::Method, "GET".to_string());
+        assert!(pred_gt.matches_value("POST")); // P > G lexicographically
+        assert!(!pred_gt.matches_value("GET"));
+        assert!(!pred_gt.matches_value("DELETE")); // D < G
+        assert!(pred_lt.matches_value("DELETE"));
+        assert!(!pred_lt.matches_value("GET"));
     }
 
     // --- RuleSpec ---
@@ -995,11 +1252,11 @@ mod tests {
     #[test]
     fn rule_identity_key_is_order_independent() {
         let rule1 = RuleSpec::new(
-            vec![Predicate::eq(FieldDim::SrcIp, 1), Predicate::eq(FieldDim::Method, 2)],
+            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1"), Predicate::eq(FieldDim::Method, "GET")],
             RuleAction::block(),
         );
         let rule2 = RuleSpec::new(
-            vec![Predicate::eq(FieldDim::Method, 2), Predicate::eq(FieldDim::SrcIp, 1)],
+            vec![Predicate::eq(FieldDim::Method, "GET"), Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
             RuleAction::block(),
         );
         assert_eq!(rule1.identity_key(), rule2.identity_key());
@@ -1009,10 +1266,39 @@ mod tests {
     fn rule_spec_matches_req() {
         let (tls_ctx, tls_vec) = default_tls();
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let ip_u32 = u32::from_ne_bytes([10, 0, 0, 1]);
         let req = test_request_sample("GET", "/api", ip, vec![], tls_ctx, tls_vec);
-        let rule = RuleSpec::new(vec![Predicate::eq(FieldDim::SrcIp, ip_u32)], RuleAction::block());
+        let rule = RuleSpec::new(vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")], RuleAction::block());
         assert!(rule.matches_req(&req));
+    }
+
+    // --- EDN rendering ---
+
+    #[test]
+    fn predicate_sexpr_clause() {
+        let p = Predicate::eq(FieldDim::Method, "GET");
+        assert_eq!(p.to_sexpr_clause(), "(= method \"GET\")");
+    }
+
+    #[test]
+    fn rule_to_edn_pretty_single_constraint() {
+        let rule = RuleSpec::new(
+            vec![Predicate::eq(FieldDim::PathPrefix, "/api/search")],
+            RuleAction::RateLimit { rps: 100 },
+        );
+        let edn = rule.to_edn_pretty();
+        assert!(edn.contains("(= path-prefix \"/api/search\")"));
+        assert!(edn.contains("(rate-limit 100)"));
+    }
+
+    #[test]
+    fn rule_to_edn_compact() {
+        let rule = RuleSpec::new(
+            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
+            RuleAction::block(),
+        );
+        let edn = rule.to_edn();
+        assert!(edn.contains("(= src-ip \"10.0.0.1\")"));
+        assert!(edn.contains("(block 403)"));
     }
 
     // --- RequestSample accessors ---
@@ -1027,12 +1313,116 @@ mod tests {
             ("X-Custom".to_string(), "val2".to_string()),
         ];
         let req = test_request_sample("GET", "/", ip, hdrs, tls_ctx, tls_vec);
-        assert_eq!(req.header("host"), Some("example.com"));
-        assert_eq!(req.header("HOST"), Some("example.com"));
-        assert_eq!(req.header("x-custom"), Some("val1"));
-        assert_eq!(req.header_all("x-custom"), vec!["val1", "val2"]);
+
+        // header() returns all values as a list
+        assert_eq!(req.header("host"), vec!["example.com"]);
+        assert_eq!(req.header("HOST"), vec!["example.com"]);
+        assert_eq!(req.header("x-custom"), vec!["val1", "val2"]);
+        assert!(req.header("X-Missing").is_empty());
+
+        // header_first() returns first value
+        assert_eq!(req.header_first("host"), Some("example.com"));
+        assert_eq!(req.header_first("x-custom"), Some("val1"));
+        assert_eq!(req.header_first("X-Missing"), None);
+
         assert!(req.has_header("Host"));
         assert!(!req.has_header("X-Missing"));
+    }
+
+    #[test]
+    fn request_sample_header_names() {
+        let (tls_ctx, tls_vec) = default_tls();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let hdrs = vec![
+            ("Host".to_string(), "example.com".to_string()),
+            ("Accept".to_string(), "text/html".to_string()),
+            ("Host".to_string(), "other.com".to_string()),
+        ];
+        let req = test_request_sample("GET", "/", ip, hdrs, tls_ctx, tls_vec);
+        assert_eq!(req.header_names(), vec!["Host", "Accept", "Host"]);
+    }
+
+    #[test]
+    fn request_sample_path_parts() {
+        let (tls_ctx, tls_vec) = default_tls();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let req = test_request_sample("GET", "/api/v2/users/", ip, vec![], tls_ctx, tls_vec);
+        assert_eq!(req.path_parts(), vec!["", "api", "v2", "users", ""]);
+    }
+
+    #[test]
+    fn request_sample_path_parts_root() {
+        let (tls_ctx, tls_vec) = default_tls();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let req = test_request_sample("GET", "/", ip, vec![], tls_ctx, tls_vec);
+        assert_eq!(req.path_parts(), vec!["", ""]);
+    }
+
+    #[test]
+    fn query_parts_pair_and_flag() {
+        let (tls_ctx, tls_vec) = default_tls();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let mut req = test_request_sample("GET", "/search", ip, vec![], tls_ctx, tls_vec);
+        req.query = Some("foo=bar&page=2&debug".to_string());
+        let parts = req.query_parts();
+        assert_eq!(parts, vec![
+            QueryPart::Pair("foo", "bar"),
+            QueryPart::Pair("page", "2"),
+            QueryPart::Flag("debug"),
+        ]);
+    }
+
+    #[test]
+    fn query_parts_empty_value_vs_flag() {
+        let (tls_ctx, tls_vec) = default_tls();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let mut req = test_request_sample("GET", "/", ip, vec![], tls_ctx, tls_vec);
+        req.query = Some("foo=bar&baz=&qux".to_string());
+        let parts = req.query_parts();
+        assert_eq!(parts, vec![
+            QueryPart::Pair("foo", "bar"),
+            QueryPart::Pair("baz", ""),   // explicit empty value
+            QueryPart::Flag("qux"),        // flag, no assignment
+        ]);
+    }
+
+    #[test]
+    fn query_parts_malformed_double_question_mark() {
+        let (tls_ctx, tls_vec) = default_tls();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let mut req = test_request_sample("GET", "/", ip, vec![], tls_ctx, tls_vec);
+        // Simulates "?foo=bar&baz?bur=qax&" — hyper gives us everything after the first ?
+        req.query = Some("foo=bar&baz?bur=qax&".to_string());
+        let parts = req.query_parts();
+        assert_eq!(parts, vec![
+            QueryPart::Pair("foo", "bar"),
+            QueryPart::Pair("baz?bur", "qax"),  // ? stays in key raw
+            QueryPart::Empty,                     // trailing &
+        ]);
+    }
+
+    #[test]
+    fn query_parts_empty_segments() {
+        let (tls_ctx, tls_vec) = default_tls();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let mut req = test_request_sample("GET", "/", ip, vec![], tls_ctx, tls_vec);
+        req.query = Some("&foo=bar&&baz&".to_string());
+        let parts = req.query_parts();
+        assert_eq!(parts, vec![
+            QueryPart::Empty,                     // leading &
+            QueryPart::Pair("foo", "bar"),
+            QueryPart::Empty,                     // double &&
+            QueryPart::Flag("baz"),
+            QueryPart::Empty,                     // trailing &
+        ]);
+    }
+
+    #[test]
+    fn query_parts_none() {
+        let (tls_ctx, tls_vec) = default_tls();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let req = test_request_sample("GET", "/", ip, vec![], tls_ctx, tls_vec);
+        assert!(req.query_parts().is_empty());
     }
 
     // --- CompiledTree evaluation ---
@@ -1061,5 +1451,292 @@ mod tests {
         let vec = enc.encode_walkable(&req);
         assert_eq!(vec.data().len(), 4096);
         assert!(vec.data().iter().any(|&b| b != 0));
+    }
+
+    // --- Pretty-print walkable as pseudo-JSON ---
+
+    fn render_walkable_value(val: &WalkableValue, indent: usize) -> String {
+        let pad = "  ".repeat(indent);
+        let pad1 = "  ".repeat(indent + 1);
+        match val {
+            WalkableValue::Scalar(s) => match s {
+                ScalarValue::String(v) => format!("\"{}\"", v),
+                ScalarValue::Int(v) => format!("{}", v),
+                ScalarValue::Float(v) => format!("{}", v),
+                ScalarValue::Bool(v) => format!("{}", v),
+                ScalarValue::Null => "null".to_string(),
+                ScalarValue::LogFloat { value, .. } => format!("{{\"$log\": {}}}", value),
+                ScalarValue::LinearFloat { value, .. } => format!("{{\"$linear\": {}}}", value),
+                ScalarValue::TimeFloat { value, .. } => format!("{{\"$time\": {}}}", value),
+            },
+            WalkableValue::Map(items) => {
+                if items.is_empty() { return "{}".to_string(); }
+                let entries: Vec<String> = items.iter()
+                    .map(|(k, v)| format!("{}\"{}\": {}", pad1, k, render_walkable_value(v, indent + 1)))
+                    .collect();
+                format!("{{\n{}\n{}}}", entries.join(",\n"), pad)
+            }
+            WalkableValue::List(items) => {
+                if items.is_empty() { return "[]".to_string(); }
+                if items.len() <= 6 && items.iter().all(|i| matches!(i, WalkableValue::Scalar(_))) {
+                    let vals: Vec<String> = items.iter()
+                        .map(|i| render_walkable_value(i, 0))
+                        .collect();
+                    return format!("[{}]", vals.join(", "));
+                }
+                let entries: Vec<String> = items.iter()
+                    .map(|v| format!("{}{}", pad1, render_walkable_value(v, indent + 1)))
+                    .collect();
+                format!("[\n{}\n{}]", entries.join(",\n"), pad)
+            }
+            WalkableValue::Set(items) => {
+                if items.is_empty() { return "#{}".to_string(); }
+                let vals: Vec<String> = items.iter()
+                    .map(|i| render_walkable_value(i, 0))
+                    .collect();
+                format!("#{{{}}}", vals.join(", "))
+            }
+        }
+    }
+
+    fn render_walkable(w: &dyn Walkable) -> String {
+        let val = w.to_walkable_value();
+        render_walkable_value(&val, 0)
+    }
+
+    fn chrome_tls() -> TlsContext {
+        TlsContext {
+            record_version: 0x0301,
+            handshake_version: 0x0303,
+            session_id_len: 32,
+            cipher_suites: vec![
+                0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f,
+                0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013,
+                0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
+            ],
+            compression_methods: vec![0x00],
+            extensions: vec![
+                (0x0000, vec![0; 15]),  // SNI
+                (0x0017, vec![]),       // extended_master_secret
+                (0xff01, vec![0]),      // renegotiation_info
+                (0x000a, vec![0; 8]),   // supported_groups
+                (0x000b, vec![0x01, 0x00]), // ec_point_formats
+                (0x0023, vec![]),       // session_ticket
+                (0x0010, vec![0; 10]),  // ALPN
+                (0x0005, vec![0x01, 0x00, 0x00, 0x00, 0x00]), // status_request
+                (0x000d, vec![0; 18]),  // sig_algs
+                (0x002b, vec![0; 3]),   // supported_versions
+                (0x002d, vec![0x01]),   // psk_key_exchange_modes
+                (0x0033, vec![0; 37]),  // key_share
+                (0x001b, vec![0; 3]),   // compress_certificate
+            ],
+            supported_groups: vec![0x001d, 0x0017, 0x0018, 0x0019, 0x0100],
+            ec_point_formats: vec![0x00],
+            sig_algs: vec![0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601],
+            alpn: vec!["h2".to_string(), "http/1.1".to_string()],
+            sni: Some("shop.example.com".to_string()),
+            session_ticket: true,
+            psk_modes: vec![0x01],
+            key_share_groups: vec![0x001d, 0x0017],
+            supported_versions: vec![0x0304, 0x0303],
+            compress_certificate: vec![0x0002],
+        }
+    }
+
+    fn curl_tls() -> TlsContext {
+        TlsContext {
+            record_version: 0x0301,
+            handshake_version: 0x0303,
+            session_id_len: 32,
+            cipher_suites: vec![0x1301, 0x1302, 0x1303, 0xc02c, 0xc02b],
+            compression_methods: vec![0x00],
+            extensions: vec![
+                (0x0000, vec![0; 10]),  // SNI
+                (0x000a, vec![0; 4]),   // supported_groups
+                (0x000d, vec![0; 8]),   // sig_algs
+                (0x0010, vec![0; 6]),   // ALPN
+            ],
+            supported_groups: vec![0x001d, 0x0017],
+            ec_point_formats: vec![],
+            sig_algs: vec![0x0403, 0x0804],
+            alpn: vec!["http/1.1".to_string()],
+            sni: Some("shop.example.com".to_string()),
+            session_ticket: false,
+            psk_modes: vec![],
+            key_share_groups: vec![0x001d],
+            supported_versions: vec![0x0304, 0x0303],
+            compress_certificate: vec![],
+        }
+    }
+
+    #[test]
+    fn render_chrome_browser_request() {
+        let tls = chrome_tls();
+        let enc = make_encoder();
+        let tls_vec = enc.encode_walkable(&tls);
+        let tls_ctx = Arc::new(tls);
+
+        let req = RequestSample {
+            method: "GET".to_string(),
+            path: "/api/v2/products/search".to_string(),
+            query: Some("q=wireless+headphones&category=electronics&sort=price&page=2".to_string()),
+            version: HttpVersion::Http11,
+            headers: vec![
+                ("host".into(), "shop.example.com".into()),
+                ("user-agent".into(), "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".into()),
+                ("accept".into(), "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,*/*;q=0.8".into()),
+                ("accept-language".into(), "en-US,en;q=0.5".into()),
+                ("accept-encoding".into(), "gzip, deflate, br".into()),
+                ("connection".into(), "keep-alive".into()),
+                ("cookie".into(), "session=abc123def456; theme=dark; cart_id=98765".into()),
+                ("sec-fetch-dest".into(), "document".into()),
+                ("sec-fetch-mode".into(), "navigate".into()),
+                ("sec-fetch-site".into(), "same-origin".into()),
+            ],
+            host: Some("shop.example.com".into()),
+            user_agent: Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".into()),
+            content_type: None,
+            content_length: None,
+            cookies: vec![
+                ("session".into(), "abc123def456".into()),
+                ("theme".into(), "dark".into()),
+                ("cart_id".into(), "98765".into()),
+            ],
+            body: None,
+            body_len: 0,
+            src_ip: "203.0.113.42".parse().unwrap(),
+            conn_id: 1,
+            tls_ctx,
+            tls_vec,
+            timestamp_us: 0,
+        };
+
+        let output = render_walkable(&req);
+        println!("\n=== Chrome Browser GET with query ===\n{}\n", output);
+    }
+
+    #[test]
+    fn render_api_post_request() {
+        let tls = chrome_tls();
+        let enc = make_encoder();
+        let tls_vec = enc.encode_walkable(&tls);
+        let tls_ctx = Arc::new(tls);
+
+        let req = RequestSample {
+            method: "POST".to_string(),
+            path: "/api/v1/auth/login".to_string(),
+            query: None,
+            version: HttpVersion::Http11,
+            headers: vec![
+                ("host".into(), "shop.example.com".into()),
+                ("user-agent".into(), "MyApp/2.1.0 (Android 14)".into()),
+                ("content-type".into(), "application/json".into()),
+                ("content-length".into(), "84".into()),
+                ("accept".into(), "application/json".into()),
+                ("authorization".into(), "Bearer eyJhbGciOiJIUzI1NiJ9.xxxxx".into()),
+                ("x-request-id".into(), "f47ac10b-58cc-4372-a567-0e02b2c3d479".into()),
+            ],
+            host: Some("shop.example.com".into()),
+            user_agent: Some("MyApp/2.1.0 (Android 14)".into()),
+            content_type: Some("application/json".into()),
+            content_length: Some(84),
+            cookies: vec![],
+            body: None,
+            body_len: 84,
+            src_ip: "198.51.100.7".parse().unwrap(),
+            conn_id: 2,
+            tls_ctx,
+            tls_vec,
+            timestamp_us: 0,
+        };
+
+        let output = render_walkable(&req);
+        println!("\n=== API POST (JSON body, auth bearer) ===\n{}\n", output);
+    }
+
+    #[test]
+    fn render_curl_flood_request() {
+        let tls = curl_tls();
+        let enc = make_encoder();
+        let tls_vec = enc.encode_walkable(&tls);
+        let tls_ctx = Arc::new(tls);
+
+        let req = RequestSample {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: None,
+            version: HttpVersion::Http11,
+            headers: vec![
+                ("host".into(), "shop.example.com".into()),
+                ("user-agent".into(), "curl/8.0.0".into()),
+                ("accept".into(), "*/*".into()),
+            ],
+            host: Some("shop.example.com".into()),
+            user_agent: Some("curl/8.0.0".into()),
+            content_type: None,
+            content_length: None,
+            cookies: vec![],
+            body: None,
+            body_len: 0,
+            src_ip: "10.0.0.99".parse().unwrap(),
+            conn_id: 3,
+            tls_ctx,
+            tls_vec,
+            timestamp_us: 0,
+        };
+
+        let output = render_walkable(&req);
+        println!("\n=== curl flood (minimal headers, simple TLS) ===\n{}\n", output);
+    }
+
+    #[test]
+    fn render_malformed_query_request() {
+        let tls = curl_tls();
+        let enc = make_encoder();
+        let tls_vec = enc.encode_walkable(&tls);
+        let tls_ctx = Arc::new(tls);
+
+        let req = RequestSample {
+            method: "GET".to_string(),
+            path: "/search".to_string(),
+            query: Some("q=test&lang=en&debug&&tracker?id=evil&=nokey&trailflag&".to_string()),
+            version: HttpVersion::Http11,
+            headers: vec![
+                ("host".into(), "shop.example.com".into()),
+                ("user-agent".into(), "bot/1.0".into()),
+                ("accept".into(), "*/*".into()),
+                ("x-forwarded-for".into(), "1.2.3.4".into()),
+                ("x-forwarded-for".into(), "5.6.7.8".into()),
+            ],
+            host: Some("shop.example.com".into()),
+            user_agent: Some("bot/1.0".into()),
+            content_type: None,
+            content_length: None,
+            cookies: vec![],
+            body: None,
+            body_len: 0,
+            src_ip: "192.0.2.1".parse().unwrap(),
+            conn_id: 4,
+            tls_ctx,
+            tls_vec,
+            timestamp_us: 0,
+        };
+
+        let output = render_walkable(&req);
+        println!("\n=== Malformed query + duplicate headers ===\n{}\n", output);
+    }
+
+    #[test]
+    fn render_tls_context_chrome() {
+        let tls = chrome_tls();
+        let output = render_walkable(&tls);
+        println!("\n=== TLS Context (Chrome 120) ===\n{}\n", output);
+    }
+
+    #[test]
+    fn render_tls_context_curl() {
+        let tls = curl_tls();
+        let output = render_walkable(&tls);
+        println!("\n=== TLS Context (curl) ===\n{}\n", output);
     }
 }

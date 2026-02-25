@@ -174,8 +174,32 @@ fn build_request(pattern: &str, path_override: Option<&str>, rng: &mut impl Rng)
                 ("Content-Length", "0".to_string()),
             ],
         },
+        "credential_stuff" => RequestSpec {
+            method: "POST",
+            path: path_override.unwrap_or("/api/v1/auth/login").to_string(),
+            user_agent: "python-requests/2.31.0".to_string(),
+            extra_headers: vec![
+                ("Content-Type", "application/json".to_string()),
+                ("Content-Length", "0".to_string()),
+                ("X-Forwarded-For", format!("10.{}.{}.{}", rng.gen_range(0..255), rng.gen_range(0..255), rng.gen_range(0..255))),
+            ],
+        },
+        "scraper" => RequestSpec {
+            method: "GET",
+            path: format!("/products/{}", rng.gen_range(1..99999)),
+            user_agent: "Scrapy/2.11.0 (+https://scrapy.org)".to_string(),
+            extra_headers: vec![],
+        },
+        "slowloris" => RequestSpec {
+            method: "GET",
+            path: path_override.unwrap_or("/").to_string(),
+            user_agent: "Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.1)".to_string(),
+            extra_headers: vec![
+                ("Accept", "*/*".to_string()),
+                ("X-Custom-Header", "a]".to_string()),
+            ],
+        },
         _ => {
-            // Normal browsing
             RequestSpec {
                 method: "GET",
                 path: LEGIT_PATHS.choose(rng).unwrap().to_string(),

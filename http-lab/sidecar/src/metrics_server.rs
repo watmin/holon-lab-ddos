@@ -19,11 +19,12 @@ pub struct SidecarStats {
     pub active_rules: usize,
     pub warmup_tls: bool,
     pub warmup_req: bool,
+    pub warmup_samples_tls: usize,
+    pub warmup_samples_req: usize,
     pub anomaly_streak_tls: usize,
     pub anomaly_streak_req: usize,
     pub engrams_tls: usize,
     pub engrams_req: usize,
-    // Per-tick detection state
     pub tls_score: f64,
     pub tls_threshold: f64,
     pub req_score: f64,
@@ -31,6 +32,11 @@ pub struct SidecarStats {
     pub estimated_rps: f64,
     pub tls_samples_per_tick: usize,
     pub req_samples_per_tick: usize,
+    pub tick_count: u64,
+    pub enforced_pass: u64,
+    pub enforced_blocks: u64,
+    pub enforced_rate_limits: u64,
+    pub enforced_close_conn: u64,
 }
 
 pub type SharedStats = Arc<RwLock<SidecarStats>>;

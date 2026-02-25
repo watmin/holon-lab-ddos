@@ -55,7 +55,7 @@ impl SubspaceDetector {
         if let Some((name, _)) = matches.first() {
             if let Some(engram) = self.library.get_mut(name) {
                 let res = engram.residual(vec_f64);
-                if res < engram.subspace().threshold() * 2.0 {
+                if res < engram.subspace().threshold() {
                     return Some((name.clone(), res));
                 }
             }

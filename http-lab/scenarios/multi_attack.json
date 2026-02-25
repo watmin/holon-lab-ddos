@@ -1,0 +1,55 @@
+{
+  "phases": [
+    {
+      "name": "warmup",
+      "duration_s": 20,
+      "rps": 80,
+      "pattern": "browse",
+      "tls_profiles": ["chrome_120", "firefox_121"]
+    },
+    {
+      "name": "wave1-get-flood",
+      "duration_s": 30,
+      "rps": 2000,
+      "pattern": "get_flood",
+      "path": "/api/search",
+      "tls_profiles": ["curl_800"]
+    },
+    {
+      "name": "lull-1",
+      "duration_s": 15,
+      "rps": 60,
+      "pattern": "browse",
+      "tls_profiles": ["chrome_120", "firefox_121"]
+    },
+    {
+      "name": "wave2-credential-stuffing",
+      "duration_s": 30,
+      "rps": 1500,
+      "pattern": "credential_stuff",
+      "path": "/api/v1/auth/login",
+      "tls_profiles": ["python_requests"]
+    },
+    {
+      "name": "lull-2",
+      "duration_s": 15,
+      "rps": 60,
+      "pattern": "browse",
+      "tls_profiles": ["chrome_120", "firefox_121"]
+    },
+    {
+      "name": "wave3-scraper",
+      "duration_s": 30,
+      "rps": 1000,
+      "pattern": "scraper",
+      "tls_profiles": ["python_requests"]
+    },
+    {
+      "name": "cooldown",
+      "duration_s": 15,
+      "rps": 50,
+      "pattern": "browse",
+      "tls_profiles": ["chrome_120", "firefox_121"]
+    }
+  ]
+}

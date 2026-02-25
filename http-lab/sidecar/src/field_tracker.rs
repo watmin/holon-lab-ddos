@@ -32,9 +32,13 @@ impl FieldTracker {
 
     /// Record a set of (field, value) pairs for one HTTP request.
     pub fn observe(&mut self, pairs: &[(&str, String)]) {
+        self.observe_with_decay(pairs, self.alpha);
+    }
+
+    /// Record a set of (field, value) pairs using a specific decay factor.
+    pub fn observe_with_decay(&mut self, pairs: &[(&str, String)], alpha: f64) {
         self.req_count += 1;
         let req = self.req_count;
-        let alpha = self.alpha;
 
         for (field, value) in pairs {
             let field_map = self.fields.entry(field.to_string()).or_default();
@@ -42,7 +46,6 @@ impl FieldTracker {
                 .or_default()
                 .add_one(req, alpha);
 
-            // Evict low-count entries if over limit
             if field_map.len() > self.max_values_per_field {
                 let threshold = 0.5;
                 field_map.retain(|_, stats| stats.decayed_count(req, alpha) >= threshold);
