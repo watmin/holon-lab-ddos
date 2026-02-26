@@ -147,6 +147,33 @@ and philosophy at Layer 7. Built in three days of after-hours work.
 
 **Result**: consistent sub-second tick times, no stalls during rule deployment or high traffic.
 
+### Phase 1j — Dashboard UX: DAG Visualization, Legends, Tooltips COMPLETE
+
+- [x] Dashboard: 2/3 + 1/3 grid layout — charts on left, DAG panel spanning both chart rows on right
+- [x] Dashboard: uPlot timestamp x-axis and legend overlays with series names, colors, current values
+- [x] Dashboard: hover tooltips on chart data points with detailed values
+- [x] Dashboard: DAG canvas ported from veth-lab — tree layout, edge rendering, mouse interaction
+- [x] Dashboard: bottom row split 1/2 + 1/2 for Active Rules and Event Log panels
+- [x] `types.rs` — `CompiledTree::to_dag_nodes()` serializes rule tree into `DagNode`/`DagEdge` structs
+- [x] `metrics_server.rs` — `DagSnapshot` SSE event broadcasts tree state on every recompile
+- [x] `lib.rs` — `broadcast_dag()` helper + DAG JSON logging to disk for debugging
+
+**Result**: real-time rule tree visualization with interactive tooltips showing node details and ancestry.
+
+### Phase 1k — Tree Compiler Fix + DAG Polish COMPLETE
+
+- [x] `tree.rs` — Fixed combinatorial explosion: wildcard rules no longer duplicated into specific branches (pure DAG, matching veth-lab)
+- [x] `types.rs` — Terminal nodes labeled `"terminal"` instead of inheriting last dimension name
+- [x] Dashboard: two-pass pruning (dead-end leaf removal + wildcard chain collapse) with post-pruning connectivity check
+- [x] Dashboard: terminal nodes rendered as orange diamonds (distinct from circle branch nodes)
+- [x] Dashboard: canvas coordinate scaling fix — mouse-to-canvas transform accounts for CSS/buffer size mismatch
+- [x] Dashboard: bounding-box hit detection (consistent for all node shapes)
+- [x] Dashboard: `buildRuleExpression()` walks ancestry to reconstruct full EDN rule string on terminal tooltips
+- [x] Dashboard: pretty-printed Clojure-style EDN rule display in tooltips
+- [x] Dashboard: wildcard edges rendered with brighter dashed lines for visibility
+
+**Result**: clean, readable rule tree with proper branching. Terminal tooltips show the full rule in EDN format. Node count reduced from 107 to 42 raw nodes (22 after pruning) for a 6-rule tree.
+
 ## Key Decisions
 
 ### 2026-02-23
@@ -185,6 +212,15 @@ and philosophy at Layer 7. Built in three days of after-hours work.
 - TLS rules switched from CloseConnection to RateLimit — rate limiting is more proportional
 - TLS_FIELDS aligned with actual Walkable field names — surprise fingerprint was attributing to wrong fields
 
+### 2026-02-26 (continued)
+
+- Dashboard layout: single DAG panel spanning both chart rows (not per-chart) — gives tree more vertical space
+- Tree compiler pure DAG: specific branches only get their own rules, wildcard branches only get wildcard rules — no cross-product explosion
+- Terminal node labeling: action-bearing leaf nodes labeled "terminal" not "content-type" — prevents confusion in DAG visualization
+- Canvas coordinate scaling: mouse events must transform CSS→buffer space to handle panel resize drift
+- Rule expression reconstruction: walk from terminal to root collecting specific edge constraints — matches veth-lab's `buildRepresentativeConstraints`
+- Per-sample processing: ~0.4ms amortized (encode_walkable + CCIPCA score + field tracker), ~2,500 samples/s single-threaded throughput
+
 ## Performance Observations
 
 - Python mock backend is the throughput bottleneck — proxy serves 429s much faster than forwarding to origin (Rust vs Python, expected)
@@ -192,6 +228,8 @@ and philosophy at Layer 7. Built in three days of after-hours work.
 - Sample channel capacity of 512 balances sidecar responsiveness vs sample coverage during burst transitions
 - Tick time consistently <100ms even at 2000 rps attack load (after stall fixes)
 - Engram re-detection deploys rules in 1 tick vs 3+ ticks for first-time detection
+- Per-sample processing: ~0.4ms (encode_walkable ~0.2ms, CCIPCA score ~0.05ms, field tracking ~0.05ms, overhead ~0.1ms)
+- Theoretical inline WAF throughput: ~2,800 RPS/core, ~45K RPS on 16 cores (score + enforce are read-only, scale linearly)
 
 ## Resolved Questions
 

@@ -19,14 +19,14 @@
         #container {
             display: grid;
             grid-template-rows: 54px 1fr 1fr auto 1fr;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: 2fr 1fr;
             width: 100vw;
             height: 100vh;
             gap: 4px;
             padding: 4px;
         }
 
-        /* ── Header ─────────────────────────────────────── */
+        /* -- Header ------------------------------------------------- */
         #header {
             grid-column: 1 / -1;
             background: #111;
@@ -83,7 +83,7 @@
             font-weight: bold;
         }
 
-        /* ── Charts ─────────────────────────────────────── */
+        /* -- Charts ------------------------------------------------- */
         .chart-panel {
             background: #111;
             border: 1px solid #333;
@@ -91,14 +91,140 @@
             position: relative;
             overflow: hidden;
         }
-        #chart-enforcement { grid-column: 1 / -1; }
-        #chart-detection   { grid-column: 1 / -1; }
-        .chart-wrap {
+        #chart-enforcement { grid-column: 1; }
+        #chart-detection   { grid-column: 1; }
+
+        /* -- DAG panel (spans both chart rows) ---------------------- */
+        #dag-panel {
+            grid-column: 2;
+            grid-row: 2 / 4;
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 4px;
+            position: relative;
+            overflow: hidden;
+        }
+        .dag-header {
+            background: #181818;
+            padding: 6px 14px;
+            border-bottom: 1px solid #333;
+            font-size: 11px;
+            font-weight: bold;
+            color: #aaa;
+            text-transform: uppercase;
+        }
+        #dag-panel canvas {
             width: 100%;
-            height: 100%;
+            height: calc(100% - 30px);
+            cursor: pointer;
         }
 
-        /* ── Side panels ────────────────────────────────── */
+        /* -- Legend overlay ------------------------------------------ */
+        .chart-legend {
+            position: absolute;
+            bottom: 8px;
+            left: 70px;
+            background: rgba(0, 0, 0, 0.85);
+            padding: 8px 10px;
+            border-radius: 4px;
+            font-size: 11px;
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            border: 1px solid #333;
+            pointer-events: none;
+            z-index: 10;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-height: 16px;
+        }
+        .legend-color {
+            width: 18px;
+            height: 3px;
+            flex-shrink: 0;
+        }
+        .legend-name {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: #ccc;
+        }
+        .legend-value {
+            font-weight: bold;
+            color: #4af;
+            margin-left: auto;
+            white-space: nowrap;
+        }
+
+        /* -- Hover tooltip ------------------------------------------ */
+        .chart-tooltip {
+            position: absolute;
+            display: none;
+            background: rgba(10, 10, 20, 0.95);
+            border: 1px solid #4af;
+            border-radius: 5px;
+            padding: 8px 10px;
+            font-size: 11px;
+            color: #ddd;
+            pointer-events: none;
+            z-index: 20;
+            font-family: 'Consolas', monospace;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+            white-space: nowrap;
+        }
+
+        /* -- DAG tooltip -------------------------------------------- */
+        .dag-tooltip {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            display: none;
+            background: rgba(10, 10, 20, 0.98);
+            border: 1px solid #4af;
+            border-radius: 6px;
+            padding: 10px 12px;
+            font-size: 11px;
+            color: #ddd;
+            pointer-events: none;
+            z-index: 1000;
+            max-width: calc(100% - 20px);
+            min-width: 240px;
+            font-family: 'Consolas', monospace;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+        }
+        .dag-tooltip .tt-title {
+            font-weight: bold;
+            color: #4af;
+            margin-bottom: 4px;
+            font-size: 12px;
+        }
+        .dag-tooltip .tt-row {
+            margin: 2px 0;
+            color: #aaa;
+        }
+        .dag-tooltip .tt-label {
+            color: #8af;
+            font-weight: bold;
+            margin-right: 4px;
+        }
+        .dag-tooltip .tt-rule {
+            margin: 4px 0 0;
+            padding: 6px 8px;
+            background: rgba(255, 170, 68, 0.08);
+            border-left: 2px solid #fa4;
+            border-radius: 3px;
+            color: #fa4;
+            font-size: 10px;
+            white-space: pre;
+            overflow-x: auto;
+        }
+
+        /* -- Side panels -------------------------------------------- */
         .panel {
             background: #111;
             border: 1px solid #333;
@@ -127,7 +253,16 @@
             padding: 8px;
         }
 
-        /* ── Detection panel ────────────────────────────── */
+        /* -- Bottom row (rules + event log, equal halves) ------------ */
+        #bottom-row {
+            grid-column: 1 / -1;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 4px;
+            min-height: 0;
+        }
+
+        /* -- Detection panel ---------------------------------------- */
         #detection-panel { grid-column: 1 / -1; }
         #detection-body {
             overflow-y: hidden;
@@ -168,7 +303,7 @@
             font-weight: bold;
         }
 
-        /* ── Active rules panel ─────────────────────────── */
+        /* -- Active rules panel ------------------------------------- */
         .rule-item {
             padding: 6px 8px;
             margin-bottom: 4px;
@@ -189,7 +324,7 @@
             float: right;
         }
 
-        /* ── Event log ──────────────────────────────────── */
+        /* -- Event log ---------------------------------------------- */
         #event-log .panel-body {
             display: flex;
             flex-direction: column;
@@ -222,7 +357,7 @@
             padding: 20px;
         }
 
-        /* ── Scrollbar ──────────────────────────────────── */
+        /* -- Scrollbar ---------------------------------------------- */
         ::-webkit-scrollbar { width: 6px; }
         ::-webkit-scrollbar-track { background: #0a0a0f; }
         ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
@@ -266,12 +401,21 @@
 
         <!-- Chart 1: Enforcement rates -->
         <div class="chart-panel" id="chart-enforcement">
-            <div class="chart-wrap" id="chart-enforcement-wrap"></div>
+            <div class="chart-legend" id="enf-legend"></div>
+            <div class="chart-tooltip" id="enf-tooltip"></div>
         </div>
 
         <!-- Chart 2: Detection scores -->
         <div class="chart-panel" id="chart-detection">
-            <div class="chart-wrap" id="chart-detection-wrap"></div>
+            <div class="chart-legend" id="det-legend"></div>
+            <div class="chart-tooltip" id="det-tooltip"></div>
+        </div>
+
+        <!-- DAG panel (spans both chart rows) -->
+        <div id="dag-panel">
+            <div class="dag-header">Rule Tree</div>
+            <canvas id="dag-canvas"></canvas>
+            <div class="dag-tooltip" id="dag-tooltip"></div>
         </div>
 
         <!-- Detection state panel -->
@@ -282,22 +426,23 @@
             </div>
         </div>
 
-        <!-- Active rules panel -->
-        <div class="panel" id="rules-panel">
-            <div class="panel-header">
-                <span>Active Rules</span>
-                <span id="rules-count" style="color:#4af;">0</span>
+        <!-- Bottom row: rules + event log (equal halves) -->
+        <div id="bottom-row">
+            <div class="panel" id="rules-panel">
+                <div class="panel-header">
+                    <span>Active Rules</span>
+                    <span id="rules-count" style="color:#4af;">0</span>
+                </div>
+                <div class="panel-body" id="rules-body">
+                    <div class="no-data-msg">No rules active</div>
+                </div>
             </div>
-            <div class="panel-body" id="rules-body">
-                <div class="no-data-msg">No rules active</div>
-            </div>
-        </div>
 
-        <!-- Event log -->
-        <div class="panel" id="event-log">
-            <div class="panel-header">Event Log</div>
-            <div class="panel-body" id="event-log-body">
-                <div class="no-data-msg">No events yet</div>
+            <div class="panel" id="event-log">
+                <div class="panel-header">Event Log</div>
+                <div class="panel-body" id="event-log-body">
+                    <div class="no-data-msg">No events yet</div>
+                </div>
             </div>
         </div>
     </div>
@@ -315,6 +460,7 @@
         lastMetrics: null,
         events: [],
         latestDetection: null,
+        dagNodes: [],
     };
 
     let enfChart = null, detChart = null;
@@ -343,6 +489,7 @@
             case 'metrics': handleMetrics(d); break;
             case 'rule_event': addEvent('rule', d); break;
             case 'detection_event': addEvent('detection', d); break;
+            case 'dag_snapshot': handleDagSnapshot(d); break;
             case 'heartbeat': break;
         }
     }
@@ -377,6 +524,8 @@
         updateDetChart();
         updateHeader(d, passR + rlR + blkR);
         updateDetectionPanel(d);
+        updateEnfLegend(passR, rlR, blkR);
+        updateDetLegend(d);
     }
 
     function trimTimeline() {
@@ -418,13 +567,92 @@
     }
 
     // =========================================================================
+    // Legend updates
+    // =========================================================================
+    const ENF_SERIES = [
+        { name: 'Pass',     color: '#4af' },
+        { name: 'Rate-Ltd', color: '#fa4' },
+        { name: 'Blocked',  color: '#f44' },
+    ];
+    const DET_SERIES = [
+        { name: 'TLS score', color: '#0ff' },
+        { name: 'TLS thr',   color: '#0ff' },
+        { name: 'REQ score', color: '#ff0' },
+        { name: 'REQ thr',   color: '#ff0' },
+    ];
+
+    function updateEnfLegend(passR, rlR, blkR) {
+        const vals = [passR, rlR, blkR];
+        el('enf-legend').innerHTML = ENF_SERIES.map((s, i) =>
+            `<div class="legend-item">` +
+            `<div class="legend-color" style="background:${s.color};"></div>` +
+            `<span class="legend-name">${s.name}</span>` +
+            `<span class="legend-value">${fmt(Math.round(vals[i]))}/s</span>` +
+            `</div>`
+        ).join('');
+    }
+
+    function updateDetLegend(d) {
+        const vals = [d.tls_score, d.tls_threshold, d.req_score, d.req_threshold];
+        el('det-legend').innerHTML = DET_SERIES.map((s, i) =>
+            `<div class="legend-item">` +
+            `<div class="legend-color" style="background:${s.color};${i % 2 === 1 ? 'border-top:1px dashed '+s.color+';height:0;' : ''}"></div>` +
+            `<span class="legend-name">${s.name}</span>` +
+            `<span class="legend-value">${vals[i].toFixed(2)}</span>` +
+            `</div>`
+        ).join('');
+    }
+
+    // =========================================================================
+    // Hover tooltip helper
+    // =========================================================================
+    function makeCursorHooks(tooltipEl, containerEl, seriesMeta, valueFmt) {
+        return {
+            setCursor: [
+                (u) => {
+                    const { left, top, idx } = u.cursor;
+                    if (idx == null) { tooltipEl.style.display = 'none'; return; }
+
+                    const ts = u.data[0][idx];
+                    const date = new Date(ts * 1000);
+                    let html = `<div style="color:#888;margin-bottom:4px;">${date.toLocaleTimeString()}</div>`;
+
+                    for (let i = 1; i < u.series.length; i++) {
+                        const s = u.series[i];
+                        const v = u.data[i][idx];
+                        if (v != null && s.show) {
+                            html += `<div style="display:flex;gap:8px;align-items:center;">` +
+                                `<span style="color:${s.stroke};">&#9632;</span>` +
+                                `<span style="flex:1;">${s.label}:</span>` +
+                                `<span style="font-weight:bold;">${valueFmt(v)}</span></div>`;
+                        }
+                    }
+                    tooltipEl.innerHTML = html;
+                    tooltipEl.style.display = 'block';
+
+                    const cr = containerEl.getBoundingClientRect();
+                    const tr = tooltipEl.getBoundingClientRect();
+                    let tx = left - tr.width - 10;
+                    let ty = top - tr.height / 2;
+                    if (tx < 0) tx = left + 10;
+                    if (ty < 0) ty = 0;
+                    if (ty + tr.height > cr.height) ty = cr.height - tr.height;
+                    tooltipEl.style.left = tx + 'px';
+                    tooltipEl.style.top = ty + 'px';
+                }
+            ],
+        };
+    }
+
+    // =========================================================================
     // Chart 1: Enforcement rates
     // =========================================================================
     function initEnfChart() {
-        const wrap = el('chart-enforcement-wrap');
+        const wrap = el('chart-enforcement');
         const r = wrap.getBoundingClientRect();
+        const tooltip = el('enf-tooltip');
         const opts = {
-            title: "Enforcement Rates (/s)",
+            title: "",
             width: r.width, height: r.height,
             pxAlign: false,
             scales: {
@@ -432,7 +660,8 @@
                 y: { range: (_, __, mx) => [0, Math.max((mx||1)*1.1, 1)] },
             },
             axes: [
-                { stroke:"#666", grid:{show:true,stroke:"#1a1a1a",width:1}, font:"10px monospace" },
+                { stroke:"#666", grid:{show:true,stroke:"#1a1a1a",width:1}, font:"10px monospace",
+                  values: (_, ticks) => ticks.map(v => new Date(v*1000).toLocaleTimeString()) },
                 { stroke:"#666", grid:{show:true,stroke:"#1a1a1a",width:1}, font:"10px monospace",
                   values:(_,t)=>t.map(v=>fmt(Math.round(v))+'/s'), size:60 },
             ],
@@ -442,10 +671,15 @@
                 { label:"Rate-Ltd",   stroke:"#fa4", fill:"rgba(255,170,68,0.08)", width:2 },
                 { label:"Blocked",    stroke:"#f44", fill:"rgba(255,68,68,0.08)",  width:2 },
             ],
-            cursor: { drag:{x:false,y:false} },
+            cursor: {
+                drag: { x: false, y: false },
+                focus: { prox: 30 },
+                points: { size: 6, width: 2 },
+            },
+            hooks: makeCursorHooks(tooltip, wrap, ENF_SERIES, v => fmt(Math.round(v)) + '/s'),
             legend: { show: false },
         };
-        enfChart = new uPlot(opts, [[],[],[],[]], wrap);
+        enfChart = new uPlot(opts, [[],[],[],[]], el('chart-enforcement'));
     }
 
     function updateEnfChart() {
@@ -457,10 +691,11 @@
     // Chart 2: Detection scores vs thresholds
     // =========================================================================
     function initDetChart() {
-        const wrap = el('chart-detection-wrap');
+        const wrap = el('chart-detection');
         const r = wrap.getBoundingClientRect();
+        const tooltip = el('det-tooltip');
         const opts = {
-            title: "Detection Scores vs Thresholds",
+            title: "",
             width: r.width, height: r.height,
             pxAlign: false,
             scales: {
@@ -468,7 +703,8 @@
                 y: { range: (_, __, mx) => [0, Math.max((mx||1)*1.1, 1)] },
             },
             axes: [
-                { stroke:"#666", grid:{show:true,stroke:"#1a1a1a",width:1}, font:"10px monospace" },
+                { stroke:"#666", grid:{show:true,stroke:"#1a1a1a",width:1}, font:"10px monospace",
+                  values: (_, ticks) => ticks.map(v => new Date(v*1000).toLocaleTimeString()) },
                 { stroke:"#666", grid:{show:true,stroke:"#1a1a1a",width:1}, font:"10px monospace",
                   values:(_,t)=>t.map(v=>v.toFixed(1)), size:50 },
             ],
@@ -479,10 +715,15 @@
                 { label:"REQ score", stroke:"#ff0",            width:2 },
                 { label:"REQ thr",   stroke:"#ff0", dash:[4,4], width:1 },
             ],
-            cursor: { drag:{x:false,y:false} },
+            cursor: {
+                drag: { x: false, y: false },
+                focus: { prox: 30 },
+                points: { size: 6, width: 2 },
+            },
+            hooks: makeCursorHooks(tooltip, wrap, DET_SERIES, v => v.toFixed(2)),
             legend: { show: false },
         };
-        detChart = new uPlot(opts, [[],[],[],[],[]], wrap);
+        detChart = new uPlot(opts, [[],[],[],[],[]], el('chart-detection'));
     }
 
     function updateDetChart() {
@@ -572,6 +813,7 @@
                     body.innerHTML = '<div class="no-data-msg">No rules active</div>';
                     return;
                 }
+                rules.sort((a, b) => a.age_secs - b.age_secs);
                 body.innerHTML = rules.map(r => `
                     <div class="rule-item">
                         <span class="rule-age">${r.age_secs.toFixed(0)}s ago</span>
@@ -608,6 +850,7 @@
 
     function renderEventLog() {
         const body = el('event-log-body');
+        state.events.sort((a, b) => b.ts - a.ts);
         body.innerHTML = state.events.map(e => `
             <div class="event-entry ${e.css}">
                 <span class="event-time">${fmtTime(e.ts)}</span>
@@ -615,6 +858,527 @@
                 <span>${escHtml(e.detail)}</span>
             </div>`).join('');
     }
+
+    // =========================================================================
+    // DAG visualization
+    // =========================================================================
+    const dagCanvas = document.getElementById('dag-canvas');
+    const dagCtx = dagCanvas.getContext('2d');
+    let dagLayout = new Map();
+    let dagHoveredNode = null;
+    let dagSelectedNode = null;
+
+    function handleDagSnapshot(data) {
+        state.dagNodes = data.nodes;
+        dagHoveredNode = null;
+        dagSelectedNode = null;
+        hideDagTooltip();
+        renderDAG();
+    }
+
+    // Prune and collapse the raw tree into a readable display graph.
+    //
+    // The compiled tree has a node for every FieldDim (12 dimensions),
+    // most of which are wildcard-only pass-throughs.  Two passes:
+    //   1. Prune dead-end actionless leaves
+    //   2. Collapse wildcard-only pass-through chains
+    //
+    // NOTE: unlike veth-lab, http-lab's compiler only places actions at
+    // terminal nodes (past all dims).  The same rule legitimately appears
+    // at multiple terminals because it exists in each subtree the tree
+    // branches into.  Deduplicating by action string would destroy branches.
+    function getDagDisplayNodes() {
+        const source = state.dagNodes || [];
+        if (source.length === 0) return [];
+
+        const byId = new Map(source.map(n => [n.id, { ...n }]));
+        const hidden = new Set();
+
+        // Build parent map
+        const parents = new Map(source.map(n => [n.id, []]));
+        for (const n of source) {
+            for (const c of (n.children || [])) {
+                if (parents.has(c)) parents.get(c).push(n.id);
+            }
+        }
+
+        // Pass 1: prune dead-end actionless leaves
+        let changed = true;
+        while (changed) {
+            changed = false;
+            for (const node of byId.values()) {
+                if (hidden.has(node.id)) continue;
+                const liveChildren = (node.children || []).filter(id => !hidden.has(id));
+                const liveWc = (node.wildcard != null && !hidden.has(node.wildcard)) ? node.wildcard : null;
+                const isLeaf = liveChildren.length === 0 && liveWc === null;
+                if (!isLeaf) continue;
+
+                if (!node.action) {
+                    hidden.add(node.id);
+                    changed = true;
+                }
+            }
+        }
+
+        // Pass 2: collapse wildcard-only pass-through chains.
+        // A node with no action, no specific edges, and only a wildcard
+        // child is a pass-through — hide it and rewire parent to child.
+        const rewire = new Map();
+        function resolve(id) {
+            let cur = id;
+            const seen = new Set();
+            while (rewire.has(cur) && !seen.has(cur)) {
+                seen.add(cur);
+                cur = rewire.get(cur);
+            }
+            return cur;
+        }
+
+        changed = true;
+        while (changed) {
+            changed = false;
+            for (const node of byId.values()) {
+                if (hidden.has(node.id)) continue;
+                const liveEdges = (node.edges || []).filter(e => !hidden.has(e.target));
+                const liveWc = (node.wildcard != null && !hidden.has(node.wildcard)) ? node.wildcard : null;
+
+                if (!node.action && liveEdges.length === 0 && liveWc != null) {
+                    hidden.add(node.id);
+                    rewire.set(node.id, liveWc);
+                    changed = true;
+                }
+            }
+        }
+
+        // Build final node list with rewired references
+        const result = Array.from(byId.values())
+            .filter(n => !hidden.has(n.id))
+            .map(n => {
+                const wc = (n.wildcard != null && !hidden.has(n.wildcard))
+                    ? n.wildcard
+                    : (n.wildcard != null ? resolve(n.wildcard) : null);
+                const finalWc = (wc != null && !hidden.has(wc)) ? wc : null;
+
+                const edges = (n.edges || [])
+                    .map(e => ({ ...e, target: hidden.has(e.target) ? resolve(e.target) : e.target }))
+                    .filter(e => !hidden.has(e.target));
+
+                const childSet = new Set(edges.map(e => e.target));
+                if (finalWc != null) childSet.add(finalWc);
+
+                return {
+                    ...n,
+                    wildcard: finalWc,
+                    children: Array.from(childSet),
+                    edges,
+                };
+            });
+
+        // Post-pruning connectivity check: remove orphan nodes
+        if (result.length === 0) return result;
+        const resultIds = new Set(result.map(n => n.id));
+        const childOf = new Map();
+        for (const n of result) {
+            for (const cid of n.children) {
+                if (resultIds.has(cid)) childOf.set(cid, n.id);
+            }
+        }
+        let rootId = result[0].id;
+        for (const n of result) {
+            if (!childOf.has(n.id)) { rootId = n.id; break; }
+        }
+        const reachable = new Set();
+        const bfsQ = [rootId];
+        while (bfsQ.length > 0) {
+            const nid = bfsQ.shift();
+            if (reachable.has(nid)) continue;
+            reachable.add(nid);
+            const nd = result.find(n => n.id === nid);
+            if (nd) for (const cid of nd.children) bfsQ.push(cid);
+        }
+        return result.filter(n => reachable.has(n.id));
+    }
+
+    function computeTreeLayout(nodes) {
+        const layout = new Map();
+        const w = dagCanvas.width;
+        const h = dagCanvas.height;
+        if (nodes.length === 0) return layout;
+
+        const parentMap = new Map();
+        for (const n of nodes) {
+            for (const cid of n.children) parentMap.set(cid, n.id);
+        }
+
+        let rootId = nodes[0].id;
+        for (const n of nodes) {
+            if (!parentMap.has(n.id)) { rootId = n.id; break; }
+        }
+
+        const depths = new Map();
+        const queue = [[rootId, 0]];
+        depths.set(rootId, 0);
+        let maxDepth = 0;
+
+        while (queue.length > 0) {
+            const [nid, depth] = queue.shift();
+            maxDepth = Math.max(maxDepth, depth);
+            const node = nodes.find(n => n.id === nid);
+            if (!node) continue;
+            for (const cid of node.children) {
+                if (!depths.has(cid)) {
+                    depths.set(cid, depth + 1);
+                    queue.push([cid, depth + 1]);
+                }
+            }
+        }
+
+        const groups = new Map();
+        for (const n of nodes) {
+            const d = depths.get(n.id) || 0;
+            if (!groups.has(d)) groups.set(d, []);
+            groups.get(d).push(n.id);
+        }
+
+        const pad = 40;
+        const ah = h - 2 * pad;
+        const yStep = maxDepth > 0 ? ah / maxDepth : 0;
+
+        for (const [depth, ids] of groups.entries()) {
+            const y = pad + depth * yStep;
+            const aw = w - 2 * pad;
+            const xStep = ids.length > 1 ? aw / (ids.length - 1) : 0;
+            for (let i = 0; i < ids.length; i++) {
+                const x = ids.length === 1 ? w / 2 : pad + i * xStep;
+                layout.set(ids[i], { x, y });
+            }
+        }
+        return layout;
+    }
+
+    let dagDisplayNodes = [];
+
+    function renderDAG() {
+        const w = dagCanvas.width;
+        const h = dagCanvas.height;
+        dagDisplayNodes = getDagDisplayNodes();
+        const nodes = dagDisplayNodes;
+
+        dagCtx.fillStyle = '#0a0a0f';
+        dagCtx.fillRect(0, 0, w, h);
+
+        if (nodes.length === 0) {
+            dagCtx.fillStyle = '#555';
+            dagCtx.font = '13px monospace';
+            dagCtx.textAlign = 'center';
+            dagCtx.textBaseline = 'middle';
+            dagCtx.fillText('No active rules', w / 2, h / 2);
+            return;
+        }
+
+        dagLayout = computeTreeLayout(nodes);
+        const layout = dagLayout;
+
+        // Draw edges
+        dagCtx.lineWidth = 1;
+        dagCtx.font = '8px monospace';
+        dagCtx.textAlign = 'center';
+        dagCtx.textBaseline = 'middle';
+
+        for (const node of nodes) {
+            const pos = layout.get(node.id);
+            if (!pos) continue;
+
+            if (node.edges) {
+                for (const edge of node.edges) {
+                    const cp = layout.get(edge.target);
+                    if (!cp) continue;
+                    dagCtx.strokeStyle = '#444';
+                    dagCtx.setLineDash([]);
+                    dagCtx.beginPath();
+                    dagCtx.moveTo(pos.x, pos.y);
+                    dagCtx.lineTo(cp.x, cp.y);
+                    dagCtx.stroke();
+                }
+            }
+
+            if (node.wildcard != null) {
+                const wp = layout.get(node.wildcard);
+                if (wp) {
+                    dagCtx.strokeStyle = '#6a6a8a';
+                    dagCtx.setLineDash([4, 3]);
+                    dagCtx.beginPath();
+                    dagCtx.moveTo(pos.x, pos.y);
+                    dagCtx.lineTo(wp.x, wp.y);
+                    dagCtx.stroke();
+                    dagCtx.setLineDash([]);
+                }
+            }
+        }
+
+        // Draw nodes
+        for (const node of nodes) {
+            const pos = layout.get(node.id);
+            if (!pos) continue;
+
+            const isHovered = dagHoveredNode && dagHoveredNode.id === node.id;
+            const isSelected = dagSelectedNode && dagSelectedNode.id === node.id;
+            const isTerminal = node.dim === 'terminal' || (node.action && node.children.length === 0);
+
+            let fill = isTerminal ? '#f84' : '#1a1a2e';
+            if (isSelected) fill = '#4af';
+            else if (isHovered) fill = isTerminal ? '#fa6' : '#2a2a4e';
+
+            dagCtx.fillStyle = fill;
+            dagCtx.beginPath();
+            if (isTerminal) {
+                // Diamond shape for terminals
+                dagCtx.moveTo(pos.x, pos.y - 7);
+                dagCtx.lineTo(pos.x + 7, pos.y);
+                dagCtx.lineTo(pos.x, pos.y + 7);
+                dagCtx.lineTo(pos.x - 7, pos.y);
+                dagCtx.closePath();
+            } else {
+                dagCtx.arc(pos.x, pos.y, 6, 0, 2 * Math.PI);
+            }
+            dagCtx.fill();
+
+            let strokeC = '#666', strokeW = 1;
+            if (isSelected) { strokeC = '#4af'; strokeW = 2; }
+            else if (isHovered) { strokeC = '#888'; strokeW = 2; }
+            dagCtx.strokeStyle = strokeC;
+            dagCtx.lineWidth = strokeW;
+            dagCtx.stroke();
+
+            dagCtx.font = '9px monospace';
+            dagCtx.textAlign = 'center';
+            dagCtx.textBaseline = 'top';
+
+            if (isTerminal && node.action) {
+                dagCtx.fillStyle = '#f84';
+                dagCtx.fillText(node.action, pos.x, pos.y + 10);
+            } else {
+                dagCtx.fillStyle = '#aaa';
+                dagCtx.fillText(node.dim, pos.x, pos.y + 10);
+            }
+        }
+    }
+
+    function findNodeAtPoint(mx, my) {
+        for (const n of dagDisplayNodes) {
+            const pos = dagLayout.get(n.id);
+            if (!pos) continue;
+            const r = 10;
+            if (Math.abs(mx - pos.x) <= r && Math.abs(my - pos.y) <= r) return n;
+        }
+        return null;
+    }
+
+    // Build metadata for tooltip: depth, subtree size, in/out degree, ancestry
+    function buildDagMeta(nodeId) {
+        const nodes = dagDisplayNodes;
+        if (nodes.length === 0) return null;
+        const byId = new Map(nodes.map(n => [n.id, n]));
+
+        // Parent map
+        const parentOf = new Map();
+        for (const n of nodes) {
+            for (const cid of n.children) parentOf.set(cid, n.id);
+        }
+
+        // Depth via BFS
+        let rootId = nodes[0].id;
+        for (const n of nodes) {
+            if (!parentOf.has(n.id)) { rootId = n.id; break; }
+        }
+        const depthMap = new Map();
+        const q = [[rootId, 0]];
+        depthMap.set(rootId, 0);
+        while (q.length > 0) {
+            const [nid, d] = q.shift();
+            const nd = byId.get(nid);
+            if (!nd) continue;
+            for (const cid of nd.children) {
+                if (!depthMap.has(cid)) { depthMap.set(cid, d + 1); q.push([cid, d + 1]); }
+            }
+        }
+
+        // Subtree size
+        function subtreeSize(id) {
+            const nd = byId.get(id);
+            if (!nd) return 1;
+            let sz = 1;
+            for (const cid of nd.children) sz += subtreeSize(cid);
+            return sz;
+        }
+
+        // Ancestry path (walk to root)
+        const ancestry = [];
+        let cur = nodeId;
+        while (parentOf.has(cur)) {
+            const pid = parentOf.get(cur);
+            const pn = byId.get(pid);
+            if (pn) {
+                let edgeLabel = '*';
+                for (const e of (pn.edges || [])) {
+                    if (e.target === cur) { edgeLabel = e.label; break; }
+                }
+                ancestry.unshift(`${pn.dim}=${edgeLabel}`);
+            }
+            cur = pid;
+        }
+
+        const node = byId.get(nodeId);
+        const inDeg = parentOf.has(nodeId) ? 1 : 0;
+        const outDeg = (node?.children || []).length;
+        const role = node?.action ? 'terminal' : (outDeg > 0 ? 'branch' : 'leaf');
+
+        return {
+            depth: depthMap.get(nodeId) ?? '?',
+            subtree: subtreeSize(nodeId),
+            inDeg,
+            outDeg,
+            role,
+            ancestry,
+        };
+    }
+
+    const DIM_DESCRIPTIONS = {
+        'src-ip': 'Source IP address',
+        'tls-group-hash': 'TLS supported groups (ordered hash)',
+        'tls-cipher-hash': 'TLS cipher suites (ordered hash)',
+        'tls-ext-order-hash': 'TLS extension order (hash)',
+        'tls-cipher-set': 'TLS cipher suites (unordered set)',
+        'tls-ext-set': 'TLS extensions (unordered set)',
+        'tls-group-set': 'TLS groups (unordered set)',
+        'method': 'HTTP method',
+        'path-prefix': 'URL path prefix',
+        'host': 'Host header',
+        'user-agent': 'User-Agent header',
+        'content-type': 'Content-Type header',
+        'terminal': 'Rule action endpoint',
+    };
+
+    function buildRuleExpression(nodeId) {
+        const nodes = dagDisplayNodes;
+        if (nodes.length === 0) return null;
+        const byId = new Map(nodes.map(n => [n.id, n]));
+
+        const parentOf = new Map();
+        const edgeFrom = new Map();
+        for (const n of nodes) {
+            for (const e of (n.edges || [])) {
+                parentOf.set(e.target, n.id);
+                edgeFrom.set(e.target, { dim: n.dim, value: e.label });
+            }
+            if (n.wildcard != null && !parentOf.has(n.wildcard)) {
+                parentOf.set(n.wildcard, n.id);
+            }
+        }
+
+        const constraints = [];
+        let cur = nodeId;
+        const seen = new Set();
+        while (parentOf.has(cur) && !seen.has(cur)) {
+            seen.add(cur);
+            const info = edgeFrom.get(cur);
+            if (info && info.dim !== 'terminal') {
+                constraints.push(`(= ${info.dim} "${info.value}")`);
+            }
+            cur = parentOf.get(cur);
+        }
+        constraints.reverse();
+        return constraints;
+    }
+
+    function showDagTooltip(node) {
+        const tip = el('dag-tooltip');
+        const meta = buildDagMeta(node.id);
+        if (!meta) { tip.style.display = 'none'; return; }
+
+        const isTerminal = node.dim === 'terminal' || (node.action && node.children.length === 0);
+        const roleLabel = isTerminal ? 'Terminal' : (meta.outDeg > 0 ? 'Decision' : 'Leaf');
+
+        let html = `<div class="tt-title">${escHtml(node.dim)} \u00b7 ${roleLabel}</div>`;
+
+        const dimDesc = DIM_DESCRIPTIONS[node.dim] || node.dim;
+        html += `<div class="tt-row"><span class="tt-label">Dimension:</span> ${escHtml(dimDesc)}</div>`;
+        html += `<div class="tt-row"><span class="tt-label">Depth:</span> ${meta.depth} \u00b7 <span class="tt-label">Subtree:</span> ${meta.subtree} nodes</div>`;
+
+        if (node.edges && node.edges.length > 0) {
+            html += `<div class="tt-row"><span class="tt-label">Branches:</span> ${node.edges.length}`;
+            if (node.wildcard != null) html += ` + wildcard`;
+            html += `</div>`;
+            for (const e of node.edges.slice(0, 5)) {
+                html += `<div class="tt-row" style="padding-left:8px;color:#8cf;">= ${escHtml(e.label)}</div>`;
+            }
+            if (node.edges.length > 5) {
+                html += `<div class="tt-row" style="color:#666;">\u2026${node.edges.length - 5} more</div>`;
+            }
+        } else if (node.wildcard != null) {
+            html += `<div class="tt-row"><span class="tt-label">Wildcard:</span> pass-through</div>`;
+        }
+
+        if (meta.ancestry.length > 0) {
+            html += `<div class="tt-row"><span class="tt-label">Path:</span> ${meta.ancestry.map(escHtml).join(' \u2192 ')}</div>`;
+        }
+
+        if (node.action) {
+            const expr = buildRuleExpression(node.id);
+            if (expr && expr.length > 0) {
+                let edn = '{:constraints\n';
+                edn += '  [' + expr.map((c, i) => (i === 0 ? '' : '   ') + c).join('\n') + ']\n';
+                edn += ' :actions [' + node.action + ']}';
+                html += `<pre class="tt-rule">${escHtml(edn)}</pre>`;
+            } else {
+                html += `<div class="tt-row"><span class="tt-label">Action:</span> ${escHtml(node.action)}</div>`;
+            }
+        }
+
+        tip.innerHTML = html;
+        tip.style.display = 'block';
+    }
+
+    function hideDagTooltip() {
+        el('dag-tooltip').style.display = 'none';
+    }
+
+    function dagMouseCoords(e) {
+        const rect = dagCanvas.getBoundingClientRect();
+        const sx = dagCanvas.width / rect.width;
+        const sy = dagCanvas.height / rect.height;
+        return [(e.clientX - rect.left) * sx, (e.clientY - rect.top) * sy];
+    }
+
+    dagCanvas.addEventListener('mousemove', function(e) {
+        const [mx, my] = dagMouseCoords(e);
+        const node = findNodeAtPoint(mx, my);
+        if ((node?.id ?? null) !== (dagHoveredNode?.id ?? null)) {
+            dagHoveredNode = node;
+            if (dagHoveredNode) showDagTooltip(dagHoveredNode);
+            else if (!dagSelectedNode) hideDagTooltip();
+            renderDAG();
+        }
+    });
+
+    dagCanvas.addEventListener('mouseleave', function() {
+        dagHoveredNode = null;
+        if (!dagSelectedNode) hideDagTooltip();
+        renderDAG();
+    });
+
+    dagCanvas.addEventListener('click', function(e) {
+        const [mx, my] = dagMouseCoords(e);
+        const node = findNodeAtPoint(mx, my);
+        if (node) {
+            dagSelectedNode = (dagSelectedNode?.id === node.id) ? null : node;
+        } else {
+            dagSelectedNode = null;
+        }
+        if (dagSelectedNode) showDagTooltip(dagSelectedNode);
+        else hideDagTooltip();
+        renderDAG();
+    });
 
     // =========================================================================
     // Utilities
@@ -639,12 +1403,18 @@
     // =========================================================================
     function onResize() {
         if (enfChart) {
-            const r = el('chart-enforcement-wrap').getBoundingClientRect();
+            const r = el('chart-enforcement').getBoundingClientRect();
             enfChart.setSize({ width: r.width, height: r.height });
         }
         if (detChart) {
-            const r = el('chart-detection-wrap').getBoundingClientRect();
+            const r = el('chart-detection').getBoundingClientRect();
             detChart.setSize({ width: r.width, height: r.height });
+        }
+        const dr = dagCanvas.getBoundingClientRect();
+        if (dr.width > 0) {
+            dagCanvas.width = Math.round(dr.width);
+            dagCanvas.height = Math.round(dr.height);
+            renderDAG();
         }
     }
     window.addEventListener('resize', onResize);
@@ -652,8 +1422,16 @@
     // =========================================================================
     // Init
     // =========================================================================
+    function initDag() {
+        const dr = dagCanvas.getBoundingClientRect();
+        dagCanvas.width = Math.round(dr.width);
+        dagCanvas.height = Math.round(dr.height);
+        renderDAG();
+    }
+
     initEnfChart();
     initDetChart();
+    initDag();
     connectSSE();
     fetchRules();
     </script>

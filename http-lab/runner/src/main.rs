@@ -57,9 +57,14 @@ struct Args {
     #[arg(long, default_value_t = 512)]
     sample_channel_capacity: usize,
 
-    /// Engram library path for persistence
-    #[arg(long, default_value = "engrams/http.bin")]
+    /// Engram library path for persistence (requires --persist-engrams to enable)
+    #[arg(long, default_value = "engrams/http")]
     engram_path: String,
+
+    /// Enable engram persistence (save on shutdown, load on startup).
+    /// Without this flag, engrams are ephemeral — rebuilt each run.
+    #[arg(long, default_value_t = false)]
+    persist_engrams: bool,
 
     /// Directory for log files (also writes to stdout)
     #[arg(long, default_value = "http-lab/logs")]
@@ -119,7 +124,11 @@ async fn main() -> Result<()> {
 
     // Spawn sidecar tasks in-process
     let sidecar_tree = tree.clone();
-    let sidecar_engram_path = args.engram_path.clone();
+    let sidecar_engram_path = if args.persist_engrams {
+        Some(args.engram_path.clone())
+    } else {
+        None
+    };
     let sidecar_metrics_addr = args.metrics_addr;
     tokio::spawn(async move {
         if let Err(e) = http_sidecar::run(

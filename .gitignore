@@ -13,6 +13,7 @@ Cargo.lock
 # Ignore log files, certs, engrams, pid files
 logs/*.log
 **/logs/*.log
+**/logs/*.json
 **/logs/*.pid
 **/certs/
 **/engrams/

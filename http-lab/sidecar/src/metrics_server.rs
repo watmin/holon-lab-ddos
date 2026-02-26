@@ -18,6 +18,7 @@ use axum::response::{Html, IntoResponse, Sse};
 use axum::routing::get;
 use axum::{Json, Router};
 use futures::stream::{self, Stream};
+use http_proxy::types::DagNode;
 use serde::Serialize;
 use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::CorsLayer;
@@ -62,6 +63,10 @@ pub enum DashboardEvent {
         detector: String,
         kind: String,
         detail: String,
+    },
+    DagSnapshot {
+        ts: f64,
+        nodes: Vec<DagNode>,
     },
     Heartbeat {
         ts: f64,

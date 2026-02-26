@@ -111,19 +111,16 @@ fn compile_recursive(rules: &[RuleSpec], dim_idx: usize) -> Rc<ShadowNode> {
         }
     }
 
-    // Build specific children
+    // Build specific children (only the rules that constrain this dim)
     for (val, val_rules) in grouped {
-        // Each specific group gets the wildcard rules too (they still apply)
-        let combined: Vec<RuleSpec> = val_rules.iter()
-            .copied()
-            .chain(wildcard_rules.iter().copied())
-            .cloned()
-            .collect();
-        let child = compile_recursive(&combined, dim_idx + 1);
+        let owned: Vec<RuleSpec> = val_rules.iter().copied().cloned().collect();
+        let child = compile_recursive(&owned, dim_idx + 1);
         node.children.insert(val, child);
     }
 
-    // Build wildcard child (rules that don't constrain this dim apply to all values)
+    // Build wildcard child (only the rules that don't constrain this dim).
+    // The evaluator's DFS explores both specific and wildcard paths at each
+    // node, so wildcard rules don't need to be duplicated into specific branches.
     if !wildcard_rules.is_empty() {
         let owned: Vec<RuleSpec> = wildcard_rules.iter().copied().cloned().collect();
         let child = compile_recursive(&owned, dim_idx + 1);
@@ -353,5 +350,27 @@ mod tests {
         let tree1 = compile(&rules1);
         let tree2 = compile(&rules2);
         assert_ne!(tree1.rule_fingerprint, tree2.rule_fingerprint);
+    }
+
+    #[test]
+    fn pure_dag_no_explosion() {
+        let rules = vec![
+            RuleSpec::new(
+                vec![Predicate::eq(FieldDim::PathPrefix, "/api/search")],
+                RuleAction::RateLimit { rps: 80 },
+            ),
+            RuleSpec::new(
+                vec![Predicate::eq(FieldDim::TlsCipherSet, "abc123")],
+                RuleAction::CloseConnection,
+            ),
+        ];
+        let tree = compile(&rules);
+        let dag = tree.to_dag_nodes();
+        let json = serde_json::to_string_pretty(&dag).unwrap();
+        eprintln!("pure_dag_no_explosion: {} nodes for {} rules\n{}", dag.len(), rules.len(), json);
+        // With pure DAG (no wildcard duplication), 2 rules with constraints
+        // on different dimensions produce separate chains — no cross-product.
+        // Was 26 with the old duplicating approach.
+        assert!(dag.len() <= 22, "expected <= 22 nodes, got {}", dag.len());
     }
 }

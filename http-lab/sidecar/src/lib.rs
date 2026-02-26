@@ -88,10 +88,11 @@ const DECAY_HALF_LIFE: usize = 500;
 // =============================================================================
 
 /// Start the sidecar. Runs until the sample_rx channel is closed.
+/// `engram_path`: if `Some`, load/save engram libraries to disk for persistence.
 pub async fn run(
     mut sample_rx: mpsc::Receiver<SampleMessage>,
     tree: Arc<ArcSwap<CompiledTree>>,
-    engram_path: String,
+    engram_path: Option<String>,
     metrics_addr: SocketAddr,
 ) -> Result<()> {
     info!("Sidecar starting");
@@ -103,15 +104,20 @@ pub async fn run(
 
     let (event_tx, _) = broadcast::channel::<DashboardEvent>(256);
 
-    // Spawn metrics server
+    // Metrics server runs on its own OS thread + tokio runtime so it's never
+    // starved by the proxy's connection-handling load during attack bursts.
     {
         let app_state = MetricsAppState {
             stats: stats.clone(),
             event_tx: event_tx.clone(),
             rules: shared_rules.clone(),
         };
-        tokio::spawn(async move {
-            run_metrics_server(metrics_addr, app_state).await;
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("metrics runtime");
+            rt.block_on(run_metrics_server(metrics_addr, app_state));
         });
     }
 
@@ -128,9 +134,10 @@ pub async fn run(
     let mut req_detector = SubspaceDetector::new(VSA_DIM, VSA_K);
     let mut req_tracker = FieldTracker::new(decay_factor(DECAY_HALF_LIFE));
 
-    // Load persisted engrams
-    tls_detector.load_library(&format!("{}.tls", engram_path));
-    req_detector.load_library(&format!("{}.req", engram_path));
+    if let Some(ref path) = engram_path {
+        tls_detector.load_library(&format!("{}.tls", path));
+        req_detector.load_library(&format!("{}.req", path));
+    }
 
     let decay_alpha = decay_factor(DECAY_HALF_LIFE);
 
@@ -202,8 +209,10 @@ pub async fn run(
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     info!("Sample channel closed — sidecar shutting down");
-                    tls_detector.save_library(&format!("{}.tls", engram_path));
-                    req_detector.save_library(&format!("{}.req", engram_path));
+                    if let Some(ref path) = engram_path {
+                        tls_detector.save_library(&format!("{}.tls", path));
+                        req_detector.save_library(&format!("{}.req", path));
+                    }
                     return Ok(());
                 }
             }
@@ -292,7 +301,6 @@ pub async fn run(
             if is_anomalous {
                 if let Some(ref max_vec) = tls_tick_max_vec {
                     tls_detector.anomaly_streak += 1;
-
                     if let Some((engram_name, engram_res)) = tls_detector.check_library(max_vec) {
                         if tls_detector.anomaly_streak == 1 {
                             warn!("[TLS] ENGRAM HIT: '{}' (residual={:.2}) — deploying stored rules",
@@ -344,8 +352,10 @@ pub async fn run(
                                         summary: rule.to_edn_compact(),
                                         engram_name: None, rule_count: None,
                                     });
+                                    tls_detector.attack_rules.push(rule.clone());
                                     mgr.upsert(&[rule]);
                                     mgr.recompile_and_deploy(&tree);
+                                    broadcast_dag(&tree, &event_tx);
                                 }
                             }
                         }
@@ -436,8 +446,10 @@ pub async fn run(
                                         summary: rule.to_edn_compact(),
                                         engram_name: None, rule_count: None,
                                     });
+                                    req_detector.attack_rules.push(rule.clone());
                                     mgr.upsert(&[rule]);
                                     mgr.recompile_and_deploy(&tree);
+                                    broadcast_dag(&tree, &event_tx);
                                 }
                             }
                         }
@@ -480,6 +492,7 @@ pub async fn run(
             let expired = mgr.expire();
             if expired > 0 {
                 mgr.recompile_and_deploy(&tree);
+                broadcast_dag(&tree, &event_tx);
                 let _ = event_tx.send(DashboardEvent::RuleEvent {
                     ts: now_ts(), action: "expired".into(),
                     summary: format!("{} rules expired ({} remaining)", expired, mgr.rule_count()),
@@ -698,6 +711,7 @@ async fn deploy_engram_rules(
     let mut mgr = rule_mgr.lock().await;
     mgr.upsert(&specs);
     mgr.recompile_and_deploy(tree);
+    broadcast_dag(tree, event_tx);
     warn!("  Deployed {} rules from engram '{}' (rate recalculated to baseline_rps={:.0}):",
           specs.len(), engram_name, baseline_rps);
     for spec in &specs {
@@ -711,29 +725,31 @@ async fn deploy_engram_rules(
     }
 }
 
-/// Mint an engram, storing current active rules in its metadata.
+/// Mint an engram, storing only rules that THIS detector generated during this attack.
 async fn mint_engram_with_rules(
     detector: &mut SubspaceDetector,
     prefix: &str,
     surprise: &[(String, f64)],
     estimated_rps: f64,
-    rule_mgr: &Arc<Mutex<RuleManager>>,
+    _rule_mgr: &Arc<Mutex<RuleManager>>,
     event_tx: &broadcast::Sender<DashboardEvent>,
 ) {
+    if detector.attack_rules.is_empty() {
+        warn!("[{}] Skipping engram mint — no rules generated during attack", prefix.to_uppercase());
+        return;
+    }
+
     let name = format!("{}-attack-{}", prefix, chrono::Utc::now().format("%Y%m%d-%H%M%S"));
     let surprise_map: HashMap<String, f64> = surprise.iter().cloned().collect();
 
-    let mgr = rule_mgr.lock().await;
-    let active_rules_json: Vec<serde_json::Value> = mgr.active_rule_specs().iter()
+    let active_rules_json: Vec<serde_json::Value> = detector.attack_rules.iter()
         .filter_map(|spec| serde_json::to_value(spec).ok())
         .collect();
 
     let mut metadata: HashMap<String, serde_json::Value> = HashMap::new();
     metadata.insert("rps".into(), serde_json::json!(estimated_rps));
     metadata.insert("streak".into(), serde_json::json!(detector.anomaly_streak));
-    if !active_rules_json.is_empty() {
-        metadata.insert("rules".into(), serde_json::json!(active_rules_json));
-    }
+    metadata.insert("rules".into(), serde_json::json!(active_rules_json));
 
     detector.mint_engram(&name, surprise_map, metadata);
     let lib_size = detector.library.len();
@@ -750,6 +766,20 @@ async fn mint_engram_with_rules(
 // =============================================================================
 // Helpers
 // =============================================================================
+
+fn broadcast_dag(tree: &ArcSwap<CompiledTree>, event_tx: &broadcast::Sender<DashboardEvent>) {
+    let compiled = tree.load();
+    let nodes = compiled.to_dag_nodes();
+    if let Ok(json) = serde_json::to_string_pretty(&nodes) {
+        let path = format!("http-lab/logs/dag_{}.json", chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f"));
+        if let Err(e) = std::fs::write(&path, &json) {
+            warn!("Failed to write DAG log to {}: {}", path, e);
+        } else {
+            info!(nodes = nodes.len(), path = %path, "DAG snapshot written");
+        }
+    }
+    let _ = event_tx.send(DashboardEvent::DagSnapshot { ts: now_ts(), nodes });
+}
 
 /// Compute per-sample decay factor from half-life.
 fn decay_factor(half_life: usize) -> f64 {

@@ -1054,6 +1054,66 @@ impl CompiledTree {
 }
 
 // =============================================================================
+// DAG serialization (for dashboard visualization)
+// =============================================================================
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DagNode {
+    pub id: usize,
+    pub dim: String,
+    pub children: Vec<usize>,
+    pub edges: Vec<DagEdge>,
+    pub wildcard: Option<usize>,
+    pub action: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DagEdge {
+    pub target: usize,
+    pub label: String,
+}
+
+impl CompiledTree {
+    pub fn to_dag_nodes(&self) -> Vec<DagNode> {
+        self.nodes.iter().enumerate().map(|(i, node)| {
+            let mut edges: Vec<DagEdge> = node.children.iter()
+                .map(|(val, &target)| DagEdge { target, label: val.clone() })
+                .collect();
+            edges.sort_by(|a, b| a.label.cmp(&b.label));
+
+            let child_ids: Vec<usize> = edges.iter().map(|e| e.target).collect();
+            let mut all_children = child_ids.clone();
+            if let Some(wc) = node.wildcard {
+                all_children.push(wc);
+            }
+
+            let action = node.action.as_ref().map(|(act, _)| match act {
+                RuleAction::Block { status } => format!("(block {})", status),
+                RuleAction::RateLimit { rps } => format!("(rate-limit {})", rps),
+                RuleAction::CloseConnection => "(close-connection)".into(),
+                RuleAction::Count { label } => format!("(count \"{}\")", label),
+                RuleAction::Pass => "(pass)".into(),
+            });
+
+            let dim_label = if node.action.is_some() && all_children.is_empty() {
+                "terminal".to_string()
+            } else {
+                node.dim.name().to_string()
+            };
+
+            DagNode {
+                id: i,
+                dim: dim_label,
+                children: all_children,
+                edges,
+                wildcard: node.wildcard,
+                action,
+            }
+        }).collect()
+    }
+}
+
+// =============================================================================
 // Utility
 // =============================================================================
 

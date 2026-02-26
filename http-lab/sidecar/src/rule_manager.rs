@@ -14,6 +14,7 @@ use http_proxy::tree::compile;
 
 /// An active rule with expiry tracking.
 pub struct ActiveRule {
+    pub created_at: Instant,
     pub last_seen: Instant,
     pub spec: RuleSpec,
     pub preloaded: bool,
@@ -42,9 +43,11 @@ impl RuleManager {
             if let Some(existing) = self.rules.get_mut(&key) {
                 existing.last_seen = Instant::now();
             } else {
+                let now = Instant::now();
                 info!("Rule added:\n{}", spec.to_edn_pretty());
                 self.rules.insert(key.clone(), ActiveRule {
-                    last_seen: Instant::now(),
+                    created_at: now,
+                    last_seen: now,
                     spec: spec.clone(),
                     preloaded: false,
                 });
@@ -81,6 +84,9 @@ impl RuleManager {
             let candidate_subset = candidate.constraints.iter()
                 .all(|cc| existing.constraints.contains(cc));
 
+            if existing_subset && candidate_subset {
+                return Some("duplicate");
+            }
             if existing_subset && candidate.constraints.len() > existing.constraints.len() {
                 return Some("subsumed");
             }
@@ -205,6 +211,19 @@ mod tests {
 
         let rule2 = make_rule(FieldDim::SrcIp, "10.0.0.2", RuleAction::block());
         assert!(mgr.is_redundant(&rule2).is_none());
+    }
+
+    #[test]
+    fn is_redundant_detects_duplicate() {
+        let mut mgr = RuleManager::new(300);
+        let rule = make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block());
+        mgr.upsert(&[rule]);
+
+        let same_constraints_diff_action = RuleSpec::new(
+            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
+            RuleAction::block(),
+        );
+        assert_eq!(mgr.is_redundant(&same_constraints_diff_action), Some("duplicate"));
     }
 
     #[test]
