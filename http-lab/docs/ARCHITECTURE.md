@@ -27,9 +27,11 @@ Client
 │ HTTP Handler (per request on the established TLS connection)             │
 │  ├─ Parse request → RequestSample (method, path, headers, query, ...)   │
 │  ├─ Enforcer: load CompiledTree from ArcSwap (wait-free)                │
-│  │    ├─ Walk DAG with request field values                              │
+│  │    ├─ Walk DAG with request field values (best-match evaluator)      │
+│  │    ├─ Returns (Verdict, Option<rule_id>)                             │
 │  │    ├─ Verdict: Pass / Block(403) / RateLimit(rps) / CloseConnection  │
-│  │    └─ If RateLimit: check per-IP token bucket                        │
+│  │    ├─ If RateLimit: check per-IP token bucket                        │
+│  │    └─ If rule matched: increment per-rule counter                    │
 │  ├─ try_send RequestSample to sidecar channel                           │
 │  └─ Forward to upstream or respond with 403/429                         │
 └──────────────────────────────────────────────────────────────────────────┘
@@ -211,7 +213,34 @@ DIM_ORDER: [SrcIp, TlsGroupHash, TlsCipherHash, TlsExtOrderHash,
             Method, PathPrefix, Host, UserAgent, ContentType]
 ```
 
-At each level, the tree branches on the field's value. Rules that don't constrain a dimension follow the wildcard path. Evaluation walks the tree depth-first, checking specific children first, then wildcards.
+At each level, the tree branches on the field's value. Rules that don't constrain a dimension follow the wildcard path.
+
+### Best-Match Evaluation
+
+Evaluation walks the tree depth-first, exploring **both** specific and wildcard branches at every level. When multiple terminal nodes match, the evaluator selects the most specific match using a structured `Specificity` ranking:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Specificity {
+    pub layers: u8,       // cross-layer (TLS+HTTP = 2) > single (1) > none (0)
+    pub has_http: u8,     // HTTP constraints (1) preferred over TLS-only (0)
+    pub constraints: u8,  // more constraints = narrower match
+}
+```
+
+The `Specificity` struct derives `Ord`, giving lexicographic comparison over its fields. Each field is an independent policy rule:
+
+1. **layers**: Cross-layer rules (TLS+HTTP) always beat single-layer rules, regardless of constraint count. Correlating signals across protocol boundaries is the strongest evidence of a specific attacker.
+2. **has_http**: At the same layer count, HTTP constraints (path, method, user-agent) are more actionable than TLS-only constraints. This breaks the tie between an HTTP-only rule and a TLS-only rule with the same number of constraints.
+3. **constraints**: More constraints = narrower match = higher priority. A rule matching `method + path + user-agent` is more surgical than one matching only `method`.
+
+This replaces the previous `specific.or(wildcard)` short-circuit, which would always prefer the specific branch even when the wildcard branch led to a more constrained (and more surgical) terminal rule.
+
+Adding a new tiebreaker is a one-line field insertion into the struct — no arithmetic changes, no multiplier rebalancing.
+
+### Per-Rule Counters
+
+Every time a rule matches a request, the proxy increments a global counter (`Mutex<HashMap<u32, u64>>`) keyed by rule ID. Each sidecar tick, the counters are snapshotted, joined with the tree's `rule_labels` map (populated during compilation with `constraints_sexpr()` and action descriptions), and broadcast as a `RuleCounters` SSE event. The dashboard computes per-rule rates and overlays the top-5 rules as dashed lines on the enforcement chart.
 
 The compiled tree is stored behind an `ArcSwap<CompiledTree>`:
 - **Proxy** reads via `ArcSwap::load()` — wait-free, no locking, no contention
@@ -257,8 +286,16 @@ The dashboard uses **Server-Sent Events (SSE)** for real-time streaming via `tok
 - `Metrics`: enforcement counts, detection scores, thresholds, RPS, streaks, engram counts
 - `RuleEvent`: rule added/expired/engram-deployed with EDN summary
 - `DetectionEvent`: anomaly confirmed, engram hit, engram minted, attack ended
+- `RuleCounters`: per-rule hit counts with labels and actions, used for rate computation
+- `DagSnapshot`: full rule tree serialized as nodes/edges for DAG visualization
 
-The frontend renders two **uPlot** charts (enforcement rates and detection scores vs. thresholds), header metrics, detection state, active rules, and a unified event log. All panels are bounded — the event log and rules list have max-height with scroll, and the timeline uses a 120-second time-based window.
+The frontend renders:
+- **Enforcement chart** (uPlot): passed/rate-limited/blocked rates + top-5 per-rule rates as dashed overlay lines
+- **Detection chart** (uPlot): TLS/REQ anomaly scores vs. adaptive thresholds
+- **DAG panel**: interactive rule tree visualization with tooltips showing full EDN rule expressions (Clojure-formatted)
+- **Legend overlays**: series names in kebab-case, per-rule section with constraint labels, action badges, and rates (capped at 75% width)
+- **Active rules** and **event log** panels (bounded, scrollable)
+- 120-second time-based timeline window
 
 ## Performance Considerations
 

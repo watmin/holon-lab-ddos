@@ -3,8 +3,8 @@
 **Status:** All attack types mitigated — GET floods, credential stuffing, scrapers, TLS-randomized floods
 **Date:** February 2026
 **Latest Update:** February 26, 2026
-**Result:** Autonomous L7 WAF with dual-tier VSA detection, adaptive TLS rule generation, engram memory, per-IP rate limiting, and real-time monitoring dashboard
-**Key Achievement:** Adaptive TLS detection — dynamically selects ordered or set-based constraints based on attacker behavior concentration. Full mitigation of randomized TLS attacks without hardcoded patterns.
+**Result:** Autonomous L7 WAF with dual-tier VSA detection, adaptive TLS rule generation, engram memory, per-IP rate limiting, best-match specificity evaluator, per-rule counters, and real-time monitoring dashboard
+**Key Achievement:** Best-match evaluator with structured `Specificity` ranking — cross-layer TLS+HTTP rules correctly outrank single-layer rules via lexicographic comparison. Per-rule hit counters provide real-time visibility into which rules are actively mitigating traffic.
 
 ## Overview
 
@@ -18,20 +18,20 @@ and philosophy at Layer 7. Built in three days of after-hours work.
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| proxy/src/types.rs | Done | TlsContext (lossless), RequestSample (structured), rule types, EDN output |
+| proxy/src/types.rs | Done | TlsContext (lossless), RequestSample (structured), rule types, EDN output, Specificity ranking, best-match DFS evaluator |
 | proxy/src/tls.rs | Done | ClientHello parser + ReplayStream + tokio-rustls handshake |
 | proxy/src/tls_names.rs | Done | Human-readable TLS name lookups (cipher suites, extensions, groups, etc.) |
 | proxy/src/http.rs | Done | Hyper HTTP/1.1 + upstream forwarding + sample enqueue + rate limit enforcement |
-| proxy/src/tree.rs | Done | Rete-spirit DAG compiler (12 dimensions, String keys) |
-| proxy/src/enforcer.rs | Done | ArcSwap rule check + per-IP token bucket rate limiter |
+| proxy/src/tree.rs | Done | Rete-spirit DAG compiler (12 dimensions, String keys), specificity scoring, rule labels |
+| proxy/src/enforcer.rs | Done | ArcSwap rule check + per-IP token bucket rate limiter, returns (Verdict, rule_id) |
 | runner/src/main.rs | Done | Binary: spawns proxy + sidecar, wires ArcSwap + channels + rate limiter |
 | sidecar/src/detectors.rs | Done | SubspaceDetector (tunable params) + EngramLibrary wrappers |
 | sidecar/src/detection.rs | Done | Detection → RuleSpec compilation (12 field dimensions) |
 | sidecar/src/field_tracker.rs | Done | Per-field value tracking with decay, baseline freezing, concentration detection |
 | sidecar/src/rule_manager.rs | Done | Upsert, expire, redundancy check, compile, ArcSwap write |
 | sidecar/src/lib.rs | Done | Dual detection loops (TLS + REQ), concentration + surprise rule gen, engram memory |
-| sidecar/src/metrics_server.rs | Done | Axum SSE dashboard, /api/rules, /api/metrics/events, /metrics, /health |
-| sidecar/static/dashboard.html | Done | Real-time UI: uPlot charts, detection state, rules, event log |
+| sidecar/src/metrics_server.rs | Done | Axum SSE dashboard, /api/rules, /api/metrics/events, /metrics, /health, RuleCounters + DagSnapshot events |
+| sidecar/static/dashboard.html | Done | Real-time UI: uPlot charts, DAG viz, per-rule counters, detection state, rules, event log |
 | generator/src/main.rs | Done | Multi-phase HTTP flood with 5 TLS profiles, status code tracking |
 | scenarios/multi_attack.json | Done | 15-phase scenario: 4 attacks + 4 replays + warmup/lull/cooldown |
 | scripts/ | Done | build.sh, setup.sh, demo.sh, teardown.sh |
@@ -174,6 +174,40 @@ and philosophy at Layer 7. Built in three days of after-hours work.
 
 **Result**: clean, readable rule tree with proper branching. Terminal tooltips show the full rule in EDN format. Node count reduced from 107 to 42 raw nodes (22 after pruning) for a 6-rule tree.
 
+### Phase 1l — Per-Rule Counters + Legend Polish COMPLETE
+
+- [x] `types.rs` — `evaluate_req`/`evaluate_tls` now return `(action, rule_id)` — rule_id threaded through DFS
+- [x] `lib.rs` (proxy) — Global `RULE_COUNTERS` map: `increment_rule_counter(rule_id)` called on every match
+- [x] `tree.rs` — `CompiledTree.rule_labels` map populated during compilation: rule_id → (constraints_sexpr, action)
+- [x] `metrics_server.rs` — `RuleCounters` SSE event with `Vec<RuleCounter>` (id, label, action, count)
+- [x] `lib.rs` (sidecar) — Counter snapshot joined with tree labels, broadcast each tick
+- [x] Dashboard: top-5 rules by rate as dashed lines on enforcement chart
+- [x] Dashboard: per-rule legend section with constraint label, action badge, rate
+- [x] Dashboard: legend names switched to kebab-case (passed, rate-limited, blocked, tls-score, etc.)
+- [x] Dashboard: action labels lowercased (rate-limit, block, close, count, pass)
+- [x] Dashboard: rule labels show `constraints_sexpr()` only — no `{:constraints ... :actions ...}` wrapper
+- [x] Dashboard: legend capped at 75% panel width to keep latest chart data visible
+- [x] Dashboard: chart tooltip allows text wrap for long rule expressions
+
+**Result**: per-rule hit counters with real-time rate computation, overlaid as dashed chart series. Full rule expressions visible in legend and tooltip without truncation.
+
+### Phase 1m — Best-Match Evaluator with Specificity Ranking COMPLETE
+
+- [x] `types.rs` — `Specificity` struct with `derive(Ord)`: lexicographic comparison over named fields
+- [x] `types.rs` — `FieldDim::is_tls()` / `is_http()` classify constraint dimensions into layers
+- [x] `types.rs` — `pick_best()` selects the match with highest `Specificity` (ties go to specific branch)
+- [x] `types.rs` — DFS evaluator explores BOTH specific and wildcard branches, picks best globally (mirrors veth-lab's `best_prio` accumulator)
+- [x] `tree.rs` — `specificity_score()` computes `Specificity { layers, has_http, constraints }` per terminal
+- [x] Previous behavior: `specific.or(wildcard)` — specific branch always shadows wildcard regardless of rule quality
+- [x] New behavior: both branches explored, most surgical match wins
+
+Specificity ranking (lexicographic, each field is an independent policy rule):
+1. `layers` — cross-layer (TLS+HTTP = 2) > single-layer (1) > unconstrained (0)
+2. `has_http` — HTTP constraints more surgical than TLS-only (1 > 0)
+3. `constraints` — more constraints = narrower match
+
+**Result**: cross-layer TLS+HTTP rules now correctly beat single-layer TLS-only rules. HTTP-only rules preferred over TLS-only at same constraint count. Adding a new ranking tiebreaker is a one-line field insertion.
+
 ## Key Decisions
 
 ### 2026-02-23
@@ -212,7 +246,7 @@ and philosophy at Layer 7. Built in three days of after-hours work.
 - TLS rules switched from CloseConnection to RateLimit — rate limiting is more proportional
 - TLS_FIELDS aligned with actual Walkable field names — surprise fingerprint was attributing to wrong fields
 
-### 2026-02-26 (continued)
+### 2026-02-26 (continued — DAG + Dashboard)
 
 - Dashboard layout: single DAG panel spanning both chart rows (not per-chart) — gives tree more vertical space
 - Tree compiler pure DAG: specific branches only get their own rules, wildcard branches only get wildcard rules — no cross-product explosion
@@ -220,6 +254,17 @@ and philosophy at Layer 7. Built in three days of after-hours work.
 - Canvas coordinate scaling: mouse events must transform CSS→buffer space to handle panel resize drift
 - Rule expression reconstruction: walk from terminal to root collecting specific edge constraints — matches veth-lab's `buildRepresentativeConstraints`
 - Per-sample processing: ~0.4ms amortized (encode_walkable + CCIPCA score + field tracker), ~2,500 samples/s single-threaded throughput
+
+### 2026-02-26 (continued — Rule Counters + Specificity)
+
+- Per-rule counter map uses `Mutex<HashMap<u32, u64>>` — incremented on every rule match, snapshotted + broadcast each tick
+- Rule labels use `constraints_sexpr()` (constraint array only) instead of full EDN with `{:constraints ... :actions ...}` — less noise in legend
+- Legend capped at 75% width — prevents overlapping live chart data where latest values are most important
+- Best-match evaluator: DFS explores both specific AND wildcard branches, `pick_best` selects highest `Specificity`
+- `Specificity` struct with derived `Ord` replaces ad-hoc numeric formula (`layers*100 + has_http*10 + cc`) — lexicographic comparison is robust to new tiebreakers
+- Tiebreaker design: `(layers, has_http, constraints)` — each field is independently motivated, not entangled by arithmetic
+- Cross-layer (TLS+HTTP) rules: 2 layers always beats 1 layer, regardless of constraint count — cross-layer correlation is the strongest signal
+- HTTP > TLS tiebreaker: at same layer count, HTTP constraints (path, method, UA) are more actionable than TLS-only
 
 ## Performance Observations
 
