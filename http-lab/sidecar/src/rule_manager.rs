@@ -118,6 +118,13 @@ impl RuleManager {
             .map(|r| r.spec.clone())
             .collect()
     }
+
+    /// Return all rules with their age in seconds (for the dashboard).
+    pub fn all_rules_with_age(&self) -> Vec<(RuleSpec, f64)> {
+        self.rules.values()
+            .map(|r| (r.spec.clone(), r.last_seen.elapsed().as_secs_f64()))
+            .collect()
+    }
 }
 
 #[cfg(test)]

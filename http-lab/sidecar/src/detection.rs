@@ -23,6 +23,9 @@ impl Detection {
             "tls_group_hash" => FieldDim::TlsGroupHash,
             "tls_cipher_hash" => FieldDim::TlsCipherHash,
             "tls_ext_order_hash" => FieldDim::TlsExtOrderHash,
+            "tls_cipher_set" => FieldDim::TlsCipherSet,
+            "tls_ext_set" => FieldDim::TlsExtSet,
+            "tls_group_set" => FieldDim::TlsGroupSet,
             "method" => FieldDim::Method,
             "path" => FieldDim::PathPrefix,
             "host" => FieldDim::Host,
@@ -94,7 +97,7 @@ impl StoredRule {
     pub fn to_rule_spec(&self) -> Option<RuleSpec> {
         let constraints: Vec<Predicate> = self.constraints.iter()
             .filter_map(|p| {
-                let dim = match p.field.as_str() {
+                    let dim = match p.field.as_str() {
                     "SrcIp" => FieldDim::SrcIp,
                     "Method" => FieldDim::Method,
                     "PathPrefix" => FieldDim::PathPrefix,
@@ -104,6 +107,9 @@ impl StoredRule {
                     "TlsGroupHash" => FieldDim::TlsGroupHash,
                     "TlsCipherHash" => FieldDim::TlsCipherHash,
                     "TlsExtOrderHash" => FieldDim::TlsExtOrderHash,
+                    "TlsCipherSet" => FieldDim::TlsCipherSet,
+                    "TlsExtSet" => FieldDim::TlsExtSet,
+                    "TlsGroupSet" => FieldDim::TlsGroupSet,
                     _ => return None,
                 };
                 Some(Predicate::eq(dim, &p.value))

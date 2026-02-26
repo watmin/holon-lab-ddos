@@ -25,6 +25,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use holon::kernel::{Encoder, VectorManager};
 
 use http_proxy::{
+    enforcer::RateLimiter,
     tls::accept_tls,
     types::{CompiledTree, ConnectionContext, SampleMessage},
     http::serve_connection,
@@ -50,8 +51,10 @@ struct Args {
     #[arg(long, default_value = "certs/key.pem")]
     key: String,
 
-    /// Sidecar sample channel capacity (samples dropped when full)
-    #[arg(long, default_value_t = 4096)]
+    /// Sidecar sample channel capacity (samples dropped when full).
+    /// Smaller values prevent sidecar stalls during rate transitions
+    /// at the cost of dropping samples under burst load.
+    #[arg(long, default_value_t = 512)]
     sample_channel_capacity: usize,
 
     /// Engram library path for persistence
@@ -132,6 +135,9 @@ async fn main() -> Result<()> {
     // Initialize holon encoder (shared across connections)
     let encoder = Arc::new(Encoder::new(VectorManager::new(4096)));
 
+    // Per-IP token bucket rate limiter (shared across all connections)
+    let rate_limiter = Arc::new(RateLimiter::new());
+
     // TLS accept loop
     let listener = TcpListener::bind(args.listen).await?;
     info!("Listening on {}", args.listen);
@@ -149,6 +155,7 @@ async fn main() -> Result<()> {
         let tree = tree.clone();
         let sample_tx = sample_tx.clone();
         let encoder = encoder.clone();
+        let rate_limiter = rate_limiter.clone();
         let upstream = args.upstream;
 
         tokio::spawn(async move {
@@ -172,6 +179,7 @@ async fn main() -> Result<()> {
                         upstream,
                         tree,
                         sample_tx,
+                        rate_limiter,
                     ).await;
                 }
                 Err(e) => {

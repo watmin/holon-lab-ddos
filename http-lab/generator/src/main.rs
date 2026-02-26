@@ -75,14 +75,17 @@ fn default_tls_profiles() -> Vec<String> {
 // =============================================================================
 
 /// A named TLS profile controls what cipher suites and ALPN the client advertises.
-/// In practice, rustls selects from its built-in list; we control ALPN here.
 /// For DDoS simulation, the key discriminator is using a uniform profile for all
 /// flood connections vs. varied profiles for legitimate traffic.
+///
+/// Profiles with `shuffle_ciphers: true` use the same cipher suite set but
+/// randomize the order per connection, testing set-based (unordered) detection.
 #[derive(Debug, Clone)]
 struct TlsProfile {
     #[allow(dead_code)]
     name: String,
     alpn: Vec<Vec<u8>>,
+    shuffle_ciphers: bool,
 }
 
 fn get_tls_profile(name: &str) -> TlsProfile {
@@ -90,37 +93,57 @@ fn get_tls_profile(name: &str) -> TlsProfile {
         "chrome_120" => TlsProfile {
             name: name.to_string(),
             alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            shuffle_ciphers: false,
         },
         "firefox_121" => TlsProfile {
             name: name.to_string(),
             alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            shuffle_ciphers: false,
         },
         "curl_800" => TlsProfile {
             name: name.to_string(),
             alpn: vec![b"http/1.1".to_vec()],
+            shuffle_ciphers: false,
         },
         "python_requests" => TlsProfile {
             name: name.to_string(),
             alpn: vec![],
+            shuffle_ciphers: false,
+        },
+        "bot_shuffled" => TlsProfile {
+            name: name.to_string(),
+            alpn: vec![b"http/1.1".to_vec()],
+            shuffle_ciphers: true,
         },
         _ => TlsProfile {
             name: name.to_string(),
             alpn: vec![b"http/1.1".to_vec()],
+            shuffle_ciphers: false,
         },
     }
 }
 
 fn build_tls_config(profile: &TlsProfile, insecure: bool) -> Arc<ClientConfig> {
+    let provider = if profile.shuffle_ciphers {
+        let mut p = rustls::crypto::ring::default_provider();
+        p.cipher_suites.shuffle(&mut rand::thread_rng());
+        Arc::new(p)
+    } else {
+        Arc::new(rustls::crypto::ring::default_provider())
+    };
+
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let builder = ClientConfig::builder().with_root_certificates(root_store);
+    let builder = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("valid TLS versions")
+        .with_root_certificates(root_store);
 
     let mut config = builder.with_no_client_auth();
     config.alpn_protocols = profile.alpn.clone();
 
     if insecure {
-        // Accept any certificate (for self-signed dev certs)
         config.dangerous().set_certificate_verifier(Arc::new(AcceptAnyCert));
     }
 
@@ -219,6 +242,10 @@ fn build_request(pattern: &str, path_override: Option<&str>, rng: &mut impl Rng)
 
 static SENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+static STATUS_2XX: AtomicU64 = AtomicU64::new(0);
+static STATUS_403: AtomicU64 = AtomicU64::new(0);
+static STATUS_429: AtomicU64 = AtomicU64::new(0);
+static STATUS_OTHER: AtomicU64 = AtomicU64::new(0);
 
 /// Send multiple HTTP requests over a single TLS connection.
 /// Returns (success_count, error_count) for requests on this connection.
@@ -257,8 +284,15 @@ async fn send_requests_on_conn(
         let req = builder.body(Full::new(bytes::Bytes::new())).unwrap();
         match sender.send_request(req).await {
             Ok(resp) => {
+                let status = resp.status().as_u16();
                 let _ = resp.into_body().collect().await;
                 ok += 1;
+                match status {
+                    200..=299 => { STATUS_2XX.fetch_add(1, Ordering::Relaxed); }
+                    403 => { STATUS_403.fetch_add(1, Ordering::Relaxed); }
+                    429 => { STATUS_429.fetch_add(1, Ordering::Relaxed); }
+                    _ => { STATUS_OTHER.fetch_add(1, Ordering::Relaxed); }
+                }
             }
             Err(_) => {
                 err += 1;
@@ -331,8 +365,12 @@ async fn run_phase(phase: &Phase, target: SocketAddr, host: &str, insecure: bool
             let total_sent = SENT_COUNT.load(Ordering::Relaxed);
             let total_errors = ERROR_COUNT.load(Ordering::Relaxed);
             info!(
-                "Phase '{}': conns={} sent={} errors={}",
+                "Phase '{}': conns={} sent={} errors={} | 2xx={} 403={} 429={} other={}",
                 phase.name, spawned, total_sent, total_errors,
+                STATUS_2XX.load(Ordering::Relaxed),
+                STATUS_403.load(Ordering::Relaxed),
+                STATUS_429.load(Ordering::Relaxed),
+                STATUS_OTHER.load(Ordering::Relaxed),
             );
             last_report = Instant::now();
         }

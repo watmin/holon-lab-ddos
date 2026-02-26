@@ -45,6 +45,66 @@
       "tls_profiles": ["python_requests"]
     },
     {
+      "name": "lull-3",
+      "duration_s": 15,
+      "rps": 60,
+      "pattern": "browse",
+      "tls_profiles": ["chrome_120", "firefox_121"]
+    },
+    {
+      "name": "wave4-shuffled-tls-flood",
+      "duration_s": 30,
+      "rps": 1500,
+      "pattern": "get_flood",
+      "path": "/api/data",
+      "tls_profiles": ["bot_shuffled"]
+    },
+    {
+      "name": "lull-5",
+      "duration_s": 15,
+      "rps": 60,
+      "pattern": "browse",
+      "tls_profiles": ["chrome_120", "firefox_121"]
+    },
+    {
+      "name": "wave5-get-flood-replay",
+      "duration_s": 20,
+      "rps": 2000,
+      "pattern": "get_flood",
+      "path": "/api/search",
+      "tls_profiles": ["curl_800"]
+    },
+    {
+      "name": "lull-5b",
+      "duration_s": 15,
+      "rps": 60,
+      "pattern": "browse",
+      "tls_profiles": ["chrome_120", "firefox_121"]
+    },
+    {
+      "name": "wave5b-shuffled-tls-replay",
+      "duration_s": 20,
+      "rps": 1500,
+      "pattern": "get_flood",
+      "path": "/api/data",
+      "tls_profiles": ["bot_shuffled"]
+    },
+    {
+      "name": "lull-4",
+      "duration_s": 15,
+      "rps": 60,
+      "pattern": "browse",
+      "tls_profiles": ["chrome_120", "firefox_121"]
+    },
+    {
+      "name": "wave6-credential-stuffing-replay",
+      "duration_s": 20,
+      "rps": 1500,
+      "pattern": "credential_stuff",
+      "path": "/api/v1/auth/login",
+      "tls_profiles": ["python_requests"]
+    },
+    {
       "name": "cooldown",
       "duration_s": 15,
       "rps": 50,

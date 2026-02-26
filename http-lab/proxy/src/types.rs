@@ -104,6 +104,36 @@ impl TlsContext {
             .join(",")
     }
 
+    /// Sorted canonical string of cipher suites (order-independent set).
+    pub fn cipher_set_string(&self) -> String {
+        let mut sorted: Vec<u16> = self.cipher_suites.clone();
+        sorted.sort();
+        sorted.iter()
+            .map(|c| format!("0x{:04x}", c))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Sorted canonical string of extension types (order-independent set).
+    pub fn ext_set_string(&self) -> String {
+        let mut sorted: Vec<u16> = self.extensions.iter().map(|&(t, _)| t).collect();
+        sorted.sort();
+        sorted.iter()
+            .map(|t| format!("0x{:04x}", t))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Sorted canonical string of supported groups (order-independent set).
+    pub fn group_set_string(&self) -> String {
+        let mut sorted: Vec<u16> = self.supported_groups.clone();
+        sorted.sort();
+        sorted.iter()
+            .map(|g| format!("0x{:04x}", g))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
     /// Compute the classical JA4 fingerprint string for logging and external tool
     /// correlation. This is purely a derived string — not used for detection.
     ///
@@ -652,6 +682,9 @@ pub enum FieldDim {
     TlsGroupHash,
     TlsCipherHash,
     TlsExtOrderHash,
+    TlsCipherSet,
+    TlsExtSet,
+    TlsGroupSet,
     Method,
     PathPrefix,
     Host,
@@ -666,6 +699,9 @@ impl FieldDim {
             FieldDim::TlsGroupHash => "tls-group-hash",
             FieldDim::TlsCipherHash => "tls-cipher-hash",
             FieldDim::TlsExtOrderHash => "tls-ext-order-hash",
+            FieldDim::TlsCipherSet => "tls-cipher-set",
+            FieldDim::TlsExtSet => "tls-ext-set",
+            FieldDim::TlsGroupSet => "tls-group-set",
             FieldDim::Method => "method",
             FieldDim::PathPrefix => "path-prefix",
             FieldDim::Host => "host",
@@ -681,6 +717,9 @@ impl FieldDim {
             FieldDim::TlsGroupHash => req.tls_ctx.group_string(),
             FieldDim::TlsCipherHash => req.tls_ctx.cipher_string(),
             FieldDim::TlsExtOrderHash => req.tls_ctx.ext_order_string(),
+            FieldDim::TlsCipherSet => req.tls_ctx.cipher_set_string(),
+            FieldDim::TlsExtSet => req.tls_ctx.ext_set_string(),
+            FieldDim::TlsGroupSet => req.tls_ctx.group_set_string(),
             FieldDim::Method => req.method.clone(),
             FieldDim::PathPrefix => req.path.clone(),
             FieldDim::Host => req.host.clone().unwrap_or_default(),
@@ -696,6 +735,9 @@ impl FieldDim {
             FieldDim::TlsGroupHash => sample.tls_ctx.group_string(),
             FieldDim::TlsCipherHash => sample.tls_ctx.cipher_string(),
             FieldDim::TlsExtOrderHash => sample.tls_ctx.ext_order_string(),
+            FieldDim::TlsCipherSet => sample.tls_ctx.cipher_set_string(),
+            FieldDim::TlsExtSet => sample.tls_ctx.ext_set_string(),
+            FieldDim::TlsGroupSet => sample.tls_ctx.group_set_string(),
             _ => String::new(),
         }
     }
@@ -705,6 +747,9 @@ impl FieldDim {
 /// Primary discriminators (most-partitioning) first.
 pub const DIM_ORDER: &[FieldDim] = &[
     FieldDim::SrcIp,
+    FieldDim::TlsCipherSet,
+    FieldDim::TlsExtSet,
+    FieldDim::TlsGroupSet,
     FieldDim::TlsGroupHash,
     FieldDim::TlsCipherHash,
     FieldDim::Method,
@@ -855,6 +900,9 @@ impl RuleSpec {
             RuleAction::Pass => "(pass)".to_string(),
         }
     }
+
+    /// Alias for `to_edn()`.
+    pub fn to_edn_compact(&self) -> String { self.to_edn() }
 
     /// Emit rule as EDN (compact, single-line).
     pub fn to_edn(&self) -> String {

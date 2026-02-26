@@ -27,8 +27,15 @@ pub struct SubspaceDetector {
 
 impl SubspaceDetector {
     pub fn new(dim: usize, k: usize) -> Self {
+        Self::with_subspace_params(dim, k, 2.0, 0.01, 3.5, 500)
+    }
+
+    pub fn with_subspace_params(
+        dim: usize, k: usize,
+        amnesia: f64, ema_alpha: f64, sigma_mult: f64, reorth_interval: usize,
+    ) -> Self {
         Self {
-            baseline: OnlineSubspace::with_params(dim, k, 2.0, 0.01, 3.5, 500),
+            baseline: OnlineSubspace::with_params(dim, k, amnesia, ema_alpha, sigma_mult, reorth_interval),
             attack_subspace: None,
             library: EngramLibrary::new(dim),
             anomaly_streak: 0,

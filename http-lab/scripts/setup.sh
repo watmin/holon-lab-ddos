@@ -33,10 +33,30 @@ else
     echo "==> Starting mock backend on :8080"
     python3 -c "
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import sys
+import sys, threading, time
+
+request_count = 0
+count_lock = threading.Lock()
+
+def reporter():
+    global request_count
+    last = 0
+    while True:
+        time.sleep(5)
+        with count_lock:
+            current = request_count
+        delta = current - last
+        rate = delta / 5.0
+        print(f'[backend] requests={current} ({rate:.0f}/s)', flush=True)
+        last = current
+
+threading.Thread(target=reporter, daemon=True).start()
 
 class QuietHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        global request_count
+        with count_lock:
+            request_count += 1
         body = f'OK {self.command} {self.path}\n'.encode()
         self.send_response(200)
         self.send_header('Content-Length', str(len(body)))

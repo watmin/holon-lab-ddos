@@ -4,6 +4,11 @@
 //! from the ArcSwap (wait-free) and evaluates rules against the request.
 //! Returns a Verdict that the http handler acts on immediately.
 
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::Mutex;
+use std::time::Instant;
+
 use crate::types::{CompiledTree, RequestSample, RuleAction, TlsSample};
 
 /// What the enforcer decided to do with a request.
@@ -19,6 +24,55 @@ pub enum Verdict {
     CloseConnection,
     /// Count only — do not block, but record the match.
     Count,
+}
+
+// =============================================================================
+// Per-IP token bucket rate limiter
+// =============================================================================
+
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+/// Concurrent per-source-IP token bucket.
+///
+/// Each IP gets its own bucket that refills at `rps` tokens/sec (capacity
+/// also capped at `rps`). `allow()` is called in the hot path; the Mutex
+/// hold time is pure arithmetic — no I/O, no allocations on the fast path.
+pub struct RateLimiter {
+    buckets: Mutex<HashMap<IpAddr, TokenBucket>>,
+}
+
+impl RateLimiter {
+    pub fn new() -> Self {
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns `true` if the request is allowed through, `false` if it
+    /// should be 429'd. Consumes one token from the bucket for `ip`.
+    pub fn allow(&self, ip: IpAddr, rps: u32) -> bool {
+        let now = Instant::now();
+        let rate = rps as f64;
+        let mut map = self.buckets.lock().unwrap();
+        let bucket = map.entry(ip).or_insert_with(|| TokenBucket {
+            tokens: rate,
+            last_refill: now,
+        });
+
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * rate).min(rate);
+        bucket.last_refill = now;
+
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Evaluate a RequestSample against the compiled tree.
@@ -135,6 +189,46 @@ mod tests {
         let tree = compile(&rules);
         let req = make_req("10.0.0.2");
         assert!(matches!(evaluate(&req, &tree), Verdict::Pass));
+    }
+
+    #[test]
+    fn rate_limiter_allows_within_budget() {
+        let rl = RateLimiter::new();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        // Bucket starts full at rps tokens — first rps calls should pass
+        for _ in 0..100 {
+            assert!(rl.allow(ip, 100));
+        }
+        // Next call exhausts the bucket
+        assert!(!rl.allow(ip, 100));
+    }
+
+    #[test]
+    fn rate_limiter_refills_over_time() {
+        let rl = RateLimiter::new();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        // Drain the bucket
+        for _ in 0..10 {
+            rl.allow(ip, 10);
+        }
+        assert!(!rl.allow(ip, 10));
+        // After sleeping, bucket should have refilled
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(rl.allow(ip, 10));
+    }
+
+    #[test]
+    fn rate_limiter_isolates_ips() {
+        let rl = RateLimiter::new();
+        let ip_a: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip_b: IpAddr = "10.0.0.2".parse().unwrap();
+        // Drain ip_a
+        for _ in 0..5 {
+            rl.allow(ip_a, 5);
+        }
+        assert!(!rl.allow(ip_a, 5));
+        // ip_b should be unaffected
+        assert!(rl.allow(ip_b, 5));
     }
 
     #[test]

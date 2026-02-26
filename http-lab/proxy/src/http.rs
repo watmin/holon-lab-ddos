@@ -28,7 +28,7 @@ use tracing::{debug, warn};
 
 use crate::tls::ReplayStream;
 
-use crate::enforcer::Verdict;
+use crate::enforcer::{RateLimiter, Verdict};
 use crate::types::{
     CompiledTree, ConnectionContext, HttpVersion, RequestSample,
     SampleMessage, TlsSample, now_us,
@@ -45,6 +45,7 @@ pub async fn serve_connection(
     upstream_addr: SocketAddr,
     tree: Arc<ArcSwap<CompiledTree>>,
     sample_tx: mpsc::Sender<SampleMessage>,
+    rate_limiter: Arc<RateLimiter>,
 ) {
     // Best-effort: send TLS sample to sidecar
     let tls_sample = TlsSample::from_conn(&conn_ctx);
@@ -53,13 +54,15 @@ pub async fn serve_connection(
     let conn_ctx_c = conn_ctx.clone();
     let tree_c = tree.clone();
     let sample_tx_c = sample_tx.clone();
+    let rl = rate_limiter.clone();
 
     let svc = service_fn(move |req: Request<Incoming>| {
         let conn_ctx = conn_ctx_c.clone();
         let tree = tree_c.clone();
         let sample_tx = sample_tx_c.clone();
+        let rate_limiter = rl.clone();
         async move {
-            handle_request(req, conn_ctx, upstream_addr, tree, sample_tx).await
+            handle_request(req, conn_ctx, upstream_addr, tree, sample_tx, rate_limiter).await
         }
     });
 
@@ -81,6 +84,7 @@ async fn handle_request(
     upstream_addr: SocketAddr,
     tree: Arc<ArcSwap<CompiledTree>>,
     sample_tx: mpsc::Sender<SampleMessage>,
+    rate_limiter: Arc<RateLimiter>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let sample = build_request_sample(&req, &conn_ctx);
 
@@ -104,13 +108,17 @@ async fn handle_request(
                 .body(Full::new(Bytes::from("Blocked\n")))
                 .unwrap());
         }
-        Verdict::RateLimit(_rps) => {
-            crate::ENFORCED_RATE_LIMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let _ = sample_tx.try_send(SampleMessage::RequestSample(sample));
-            return Ok(Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .body(Full::new(Bytes::from("Rate limited\n")))
-                .unwrap());
+        Verdict::RateLimit(rps) => {
+            if !rate_limiter.allow(sample.src_ip, rps) {
+                crate::ENFORCED_RATE_LIMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = sample_tx.try_send(SampleMessage::RequestSample(sample));
+                return Ok(Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .body(Full::new(Bytes::from("Rate limited\n")))
+                    .unwrap());
+            }
+            crate::ENFORCED_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = sample_tx.try_send(SampleMessage::RequestSample(sample.clone()));
         }
         Verdict::Pass | Verdict::Count => {
             crate::ENFORCED_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

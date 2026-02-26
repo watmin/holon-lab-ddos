@@ -4,7 +4,7 @@
 //! Tracks frequency of each field value (src_ip, method, path, tls_group_hash, etc.)
 //! across a sliding window using lazy decay so we don't need to reset per tick.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::detectors::ValueStats;
 
@@ -18,6 +18,8 @@ pub struct FieldTracker {
     pub alpha: f64,
     /// Max values to track per field before evicting low-count entries
     max_values_per_field: usize,
+    /// "field:value" keys that were concentrated during warmup baseline
+    baseline_concentrated: HashSet<String>,
 }
 
 impl FieldTracker {
@@ -27,6 +29,7 @@ impl FieldTracker {
             req_count: 0,
             alpha,
             max_values_per_field: 10_000,
+            baseline_concentrated: HashSet::new(),
         }
     }
 
@@ -67,6 +70,57 @@ impl FieldTracker {
         } else {
             Vec::new()
         }
+    }
+
+    /// Snapshot current concentrated values as the baseline.
+    /// Called once at the end of warmup so we don't flag always-dominant values.
+    pub fn freeze_baseline(&mut self, threshold: f64) {
+        self.baseline_concentrated.clear();
+        let req = self.req_count;
+        let alpha = self.alpha;
+
+        for (field, field_map) in &self.fields {
+            let total: f64 = field_map.values()
+                .map(|s| s.decayed_count(req, alpha))
+                .sum();
+            if total < 1.0 { continue; }
+
+            for (value, stats) in field_map {
+                let conc = stats.decayed_count(req, alpha) / total;
+                if conc >= threshold {
+                    self.baseline_concentrated.insert(format!("{}:{}", field, value));
+                }
+            }
+        }
+    }
+
+    /// Find field values whose concentration exceeds `threshold`, excluding
+    /// values that were already concentrated during baseline.
+    pub fn find_concentrated_values(&self, threshold: f64) -> Vec<(String, String, f64)> {
+        let req = self.req_count;
+        let alpha = self.alpha;
+        let mut results = Vec::new();
+
+        for (field, field_map) in &self.fields {
+            let total: f64 = field_map.values()
+                .map(|s| s.decayed_count(req, alpha))
+                .sum();
+            if total < 1.0 { continue; }
+
+            for (value, stats) in field_map {
+                let conc = stats.decayed_count(req, alpha) / total;
+                if conc >= threshold {
+                    let key = format!("{}:{}", field, value);
+                    if self.baseline_concentrated.contains(&key) {
+                        continue;
+                    }
+                    results.push((field.clone(), value.clone(), conc));
+                }
+            }
+        }
+
+        results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        results
     }
 
     /// Total decayed requests across all values for a field.
