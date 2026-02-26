@@ -840,11 +840,11 @@ impl RuleAction {
 
     pub fn describe(&self) -> &'static str {
         match self {
-            RuleAction::Block { .. } => "BLOCK",
-            RuleAction::RateLimit { .. } => "RATE-LIMIT",
-            RuleAction::CloseConnection => "CLOSE",
-            RuleAction::Count { .. } => "COUNT",
-            RuleAction::Pass => "PASS",
+            RuleAction::Block { .. } => "block",
+            RuleAction::RateLimit { .. } => "rate-limit",
+            RuleAction::CloseConnection => "close",
+            RuleAction::Count { .. } => "count",
+            RuleAction::Pass => "pass",
         }
     }
 }
@@ -898,6 +898,18 @@ impl RuleSpec {
             RuleAction::CloseConnection => "(close-connection)".to_string(),
             RuleAction::Count { label } => format!("(count \"{}\")", label),
             RuleAction::Pass => "(pass)".to_string(),
+        }
+    }
+
+    /// Just the constraint array as an s-expression: `[(= method "GET") (= path "/api")]`
+    pub fn constraints_sexpr(&self) -> String {
+        let mut sorted: Vec<&Predicate> = self.constraints.iter().collect();
+        sorted.sort_by_key(|p| p.dim() as u8);
+        if sorted.is_empty() {
+            "[]".to_string()
+        } else {
+            let clauses: Vec<String> = sorted.iter().map(|p| p.to_sexpr_clause()).collect();
+            format!("[{}]", clauses.join(" "))
         }
     }
 
@@ -998,6 +1010,8 @@ pub struct CompiledTree {
     pub root: usize,
     /// Canonical EDN of all rules used to build this tree (for diffing).
     pub rule_fingerprint: String,
+    /// Per-rule labels: rule_id → (edn_label, action_description).
+    pub rule_labels: HashMap<u32, (String, String)>,
 }
 
 impl CompiledTree {
@@ -1009,38 +1023,35 @@ impl CompiledTree {
             wildcard: None,
             action: None,
         };
-        Self { nodes: vec![root], root: 0, rule_fingerprint: String::new() }
+        Self { nodes: vec![root], root: 0, rule_fingerprint: String::new(), rule_labels: HashMap::new() }
     }
 
-    /// Evaluate a request against this tree. Returns the matching action if any.
-    pub fn evaluate_req(&self, req: &RequestSample) -> Option<&RuleAction> {
+    /// Evaluate a request against this tree. Returns (action, rule_id) if any rule matches.
+    pub fn evaluate_req(&self, req: &RequestSample) -> Option<(&RuleAction, u32)> {
         self.dfs_req(req, self.root)
     }
 
-    /// Evaluate a TLS sample against this tree. Returns the matching action if any.
-    pub fn evaluate_tls(&self, sample: &TlsSample) -> Option<&RuleAction> {
+    /// Evaluate a TLS sample against this tree. Returns (action, rule_id) if any rule matches.
+    pub fn evaluate_tls(&self, sample: &TlsSample) -> Option<(&RuleAction, u32)> {
         self.dfs_tls(sample, self.root)
     }
 
-    fn dfs_req<'a>(&'a self, req: &RequestSample, node_idx: usize) -> Option<&'a RuleAction> {
+    fn dfs_req<'a>(&'a self, req: &RequestSample, node_idx: usize) -> Option<(&'a RuleAction, u32)> {
         let node = self.nodes.get(node_idx)?;
 
-        // Check specific child first (higher priority than wildcard)
         let field_val = node.dim.extract_value(req);
         let specific = node.children.get(&field_val)
             .and_then(|&child| self.dfs_req(req, child));
 
-        // Check wildcard child
         let wildcard = node.wildcard
             .and_then(|child| self.dfs_req(req, child));
 
-        // Return deepest/specific match, falling back to wildcard, then this node's action
         specific
             .or(wildcard)
-            .or_else(|| node.action.as_ref().map(|(a, _)| a))
+            .or_else(|| node.action.as_ref().map(|(a, id)| (a, *id)))
     }
 
-    fn dfs_tls<'a>(&'a self, sample: &TlsSample, node_idx: usize) -> Option<&'a RuleAction> {
+    fn dfs_tls<'a>(&'a self, sample: &TlsSample, node_idx: usize) -> Option<(&'a RuleAction, u32)> {
         let node = self.nodes.get(node_idx)?;
         let field_val = node.dim.extract_value_tls(sample);
         let specific = node.children.get(&field_val)
@@ -1049,7 +1060,7 @@ impl CompiledTree {
             .and_then(|child| self.dfs_tls(sample, child));
         specific
             .or(wildcard)
-            .or_else(|| node.action.as_ref().map(|(a, _)| a))
+            .or_else(|| node.action.as_ref().map(|(a, id)| (a, *id)))
     }
 }
 

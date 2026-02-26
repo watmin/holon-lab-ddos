@@ -66,7 +66,15 @@ pub fn compile(rules: &[RuleSpec]) -> CompiledTree {
         "rule tree compiled"
     );
 
-    CompiledTree { nodes, root, rule_fingerprint }
+    let mut rule_labels = std::collections::HashMap::new();
+    for rule in rules {
+        let rid = rule_identity_hash(rule);
+        rule_labels.entry(rid).or_insert_with(|| {
+            (rule.constraints_sexpr(), rule.action.describe().to_string())
+        });
+    }
+
+    CompiledTree { nodes, root, rule_fingerprint, rule_labels }
 }
 
 /// Recursively build the shadow trie for rules starting at dim_index.
@@ -248,7 +256,7 @@ mod tests {
         };
 
         let action = tree.evaluate_req(&req);
-        assert!(matches!(action, Some(RuleAction::Block { status: 403 })));
+        assert!(matches!(action, Some((RuleAction::Block { status: 403 }, _))));
     }
 
     fn make_test_req(method: &str, path: &str, ip_str: &str) -> crate::types::RequestSample {
@@ -273,8 +281,8 @@ mod tests {
         let req2 = make_test_req("GET", "/", "10.0.0.2");
         let req3 = make_test_req("GET", "/", "10.0.0.3");
 
-        assert!(matches!(tree.evaluate_req(&req1), Some(RuleAction::Block { status: 403 })));
-        assert!(matches!(tree.evaluate_req(&req2), Some(RuleAction::CloseConnection)));
+        assert!(matches!(tree.evaluate_req(&req1), Some((RuleAction::Block { status: 403 }, _))));
+        assert!(matches!(tree.evaluate_req(&req2), Some((RuleAction::CloseConnection, _))));
         assert!(tree.evaluate_req(&req3).is_none());
     }
 
@@ -285,7 +293,7 @@ mod tests {
 
         let req = make_test_req("GET", "/", "1.2.3.4");
         let action = tree.evaluate_req(&req);
-        assert!(matches!(action, Some(RuleAction::Count { .. })));
+        assert!(matches!(action, Some((RuleAction::Count { .. }, _))));
     }
 
     #[test]
@@ -303,11 +311,11 @@ mod tests {
 
         let req_blocked = make_test_req("GET", "/", "10.0.0.1");
         let action = tree.evaluate_req(&req_blocked);
-        assert!(matches!(action, Some(RuleAction::Block { .. })));
+        assert!(matches!(action, Some((RuleAction::Block { .. }, _))));
 
         let req_other = make_test_req("GET", "/", "10.0.0.2");
         let action = tree.evaluate_req(&req_other);
-        assert!(matches!(action, Some(RuleAction::Pass)));
+        assert!(matches!(action, Some((RuleAction::Pass, _))));
     }
 
     #[test]
@@ -322,7 +330,7 @@ mod tests {
         let tree = compile(&[rule]);
 
         let req_match = make_test_req("POST", "/api", "10.0.0.1");
-        assert!(matches!(tree.evaluate_req(&req_match), Some(RuleAction::Block { .. })));
+        assert!(matches!(tree.evaluate_req(&req_match), Some((RuleAction::Block { .. }, _))));
 
         let req_wrong_method = make_test_req("GET", "/api", "10.0.0.1");
         assert!(tree.evaluate_req(&req_wrong_method).is_none());

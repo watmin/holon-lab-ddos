@@ -77,19 +77,20 @@ impl RateLimiter {
 
 /// Evaluate a RequestSample against the compiled tree.
 /// Called synchronously on every request (ArcSwap load is wait-free).
-pub fn evaluate(req: &RequestSample, tree: &CompiledTree) -> Verdict {
+/// Returns (verdict, optional rule_id) for per-rule counter tracking.
+pub fn evaluate(req: &RequestSample, tree: &CompiledTree) -> (Verdict, Option<u32>) {
     match tree.evaluate_req(req) {
-        None => Verdict::Pass,
-        Some(action) => action_to_verdict(action),
+        None => (Verdict::Pass, None),
+        Some((action, rule_id)) => (action_to_verdict(action), Some(rule_id)),
     }
 }
 
 /// Evaluate a TlsSample against the compiled tree.
 /// Called once per connection at TLS accept time.
-pub fn evaluate_tls(sample: &TlsSample, tree: &CompiledTree) -> Verdict {
+pub fn evaluate_tls(sample: &TlsSample, tree: &CompiledTree) -> (Verdict, Option<u32>) {
     match tree.evaluate_tls(sample) {
-        None => Verdict::Pass,
-        Some(action) => action_to_verdict(action),
+        None => (Verdict::Pass, None),
+        Some((action, rule_id)) => (action_to_verdict(action), Some(rule_id)),
     }
 }
 
@@ -122,7 +123,7 @@ mod tests {
     fn evaluate_empty_tree_is_pass() {
         let tree = CompiledTree::empty();
         let req = make_req("1.2.3.4");
-        assert!(matches!(evaluate(&req, &tree), Verdict::Pass));
+        assert!(matches!(evaluate(&req, &tree), (Verdict::Pass, None)));
     }
 
     #[test]
@@ -133,7 +134,9 @@ mod tests {
         )];
         let tree = compile(&rules);
         let req = make_req("10.0.0.1");
-        assert!(matches!(evaluate(&req, &tree), Verdict::Block(403)));
+        let (v, rid) = evaluate(&req, &tree);
+        assert!(matches!(v, Verdict::Block(403)));
+        assert!(rid.is_some());
     }
 
     #[test]
@@ -144,7 +147,9 @@ mod tests {
         )];
         let tree = compile(&rules);
         let req = make_req("10.0.0.1");
-        assert!(matches!(evaluate(&req, &tree), Verdict::RateLimit(100)));
+        let (v, rid) = evaluate(&req, &tree);
+        assert!(matches!(v, Verdict::RateLimit(100)));
+        assert!(rid.is_some());
     }
 
     #[test]
@@ -155,7 +160,9 @@ mod tests {
         )];
         let tree = compile(&rules);
         let req = make_req("10.0.0.1");
-        assert!(matches!(evaluate(&req, &tree), Verdict::CloseConnection));
+        let (v, rid) = evaluate(&req, &tree);
+        assert!(matches!(v, Verdict::CloseConnection));
+        assert!(rid.is_some());
     }
 
     #[test]
@@ -166,7 +173,9 @@ mod tests {
         )];
         let tree = compile(&rules);
         let req = make_req("10.0.0.1");
-        assert!(matches!(evaluate(&req, &tree), Verdict::Count));
+        let (v, rid) = evaluate(&req, &tree);
+        assert!(matches!(v, Verdict::Count));
+        assert!(rid.is_some());
     }
 
     #[test]
@@ -177,7 +186,9 @@ mod tests {
         )];
         let tree = compile(&rules);
         let req = make_req("10.0.0.1");
-        assert!(matches!(evaluate(&req, &tree), Verdict::Pass));
+        let (v, rid) = evaluate(&req, &tree);
+        assert!(matches!(v, Verdict::Pass));
+        assert!(rid.is_some());
     }
 
     #[test]
@@ -188,7 +199,7 @@ mod tests {
         )];
         let tree = compile(&rules);
         let req = make_req("10.0.0.2");
-        assert!(matches!(evaluate(&req, &tree), Verdict::Pass));
+        assert!(matches!(evaluate(&req, &tree), (Verdict::Pass, None)));
     }
 
     #[test]
@@ -244,6 +255,6 @@ mod tests {
             tls_vec,
             timestamp_us: now_us(),
         };
-        assert!(matches!(evaluate_tls(&sample, &tree), Verdict::Pass));
+        assert!(matches!(evaluate_tls(&sample, &tree), (Verdict::Pass, None)));
     }
 }

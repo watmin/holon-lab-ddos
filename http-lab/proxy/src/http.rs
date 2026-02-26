@@ -90,7 +90,11 @@ async fn handle_request(
 
     // Phase 1: synchronous rule check (wait-free ArcSwap load)
     let compiled = tree.load();
-    let verdict = crate::enforcer::evaluate(&sample, &compiled);
+    let (verdict, rule_id) = crate::enforcer::evaluate(&sample, &compiled);
+
+    if let Some(rid) = rule_id {
+        crate::increment_rule_counter(rid);
+    }
 
     match verdict {
         Verdict::CloseConnection => {

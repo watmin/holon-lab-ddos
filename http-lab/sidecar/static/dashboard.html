@@ -123,7 +123,8 @@
         .chart-legend {
             position: absolute;
             bottom: 8px;
-            left: 70px;
+            left: 8px;
+            max-width: 75%;
             background: rgba(0, 0, 0, 0.85);
             padding: 8px 10px;
             border-radius: 4px;
@@ -160,6 +161,28 @@
             margin-left: auto;
             white-space: nowrap;
         }
+        .legend-section-title {
+            font-size: 9px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #666;
+            margin-top: 4px;
+            padding-top: 3px;
+            border-top: 1px solid #333;
+        }
+        .legend-name-rule {
+            font-size: 10px;
+            white-space: normal;
+            word-break: break-all;
+            overflow: visible;
+            text-overflow: unset;
+        }
+        .legend-action {
+            font-size: 9px;
+            color: #888;
+            margin-left: 4px;
+            white-space: nowrap;
+        }
 
         /* -- Hover tooltip ------------------------------------------ */
         .chart-tooltip {
@@ -176,6 +199,7 @@
             font-family: 'Consolas', monospace;
             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
             white-space: nowrap;
+            max-width: 500px;
         }
 
         /* -- DAG tooltip -------------------------------------------- */
@@ -452,11 +476,17 @@
     // State
     // =========================================================================
     const WINDOW_SECS = 120;
+    const TOP_RULE_SLOTS = 5;
+    const RULE_COLORS = ['#8b8','#b8b','#88b','#bb8','#8bb'];
     const state = {
         connected: false,
         ts: [],
         passRate: [], rateLtdRate: [], blockRate: [],
         tlsScore: [], tlsThr: [], reqScore: [], reqThr: [],
+        ruleRates: Array.from({length: TOP_RULE_SLOTS}, () => []),
+        ruleCounters: new Map(),
+        lastCountersTs: null,
+        topRuleKeys: [],
         lastMetrics: null,
         events: [],
         latestDetection: null,
@@ -487,6 +517,7 @@
     function handleEvent(d) {
         switch (d.type) {
             case 'metrics': handleMetrics(d); break;
+            case 'rule_counters': handleRuleCounters(d); break;
             case 'rule_event': addEvent('rule', d); break;
             case 'detection_event': addEvent('detection', d); break;
             case 'dag_snapshot': handleDagSnapshot(d); break;
@@ -518,6 +549,13 @@
         state.tlsThr.push(d.tls_threshold);
         state.reqScore.push(d.req_score);
         state.reqThr.push(d.req_threshold);
+
+        for (let i = 0; i < TOP_RULE_SLOTS; i++) {
+            const key = state.topRuleKeys[i];
+            const c = key ? state.ruleCounters.get(key) : null;
+            state.ruleRates[i].push(c ? c.rate : null);
+        }
+
         trimTimeline();
 
         updateEnfChart();
@@ -539,7 +577,54 @@
             state.tlsThr.shift();
             state.reqScore.shift();
             state.reqThr.shift();
+            for (let i = 0; i < TOP_RULE_SLOTS; i++) state.ruleRates[i].shift();
         }
+    }
+
+    // =========================================================================
+    // Per-rule counter handler
+    // =========================================================================
+    function handleRuleCounters(d) {
+        const ts = d.ts;
+        const counterDt = state.lastCountersTs ? (ts - state.lastCountersTs) : 0;
+
+        const aggregated = new Map();
+        for (const c of (d.counters || [])) {
+            const key = c.label;
+            if (!aggregated.has(key)) {
+                aggregated.set(key, { count: 0, label: c.label, action: c.action });
+            }
+            aggregated.get(key).count += c.count;
+        }
+
+        for (const [key, agg] of aggregated.entries()) {
+            const prev = state.ruleCounters.get(key);
+            let rate = 0;
+            if (prev && counterDt > 0) {
+                const delta = agg.count - prev.count;
+                rate = Math.max(0, delta / counterDt);
+            }
+            state.ruleCounters.set(key, {
+                count: agg.count,
+                rate,
+                ts,
+                label: agg.label,
+                action: agg.action,
+            });
+        }
+        state.lastCountersTs = ts;
+
+        // Pick top N rules by rate
+        const sorted = [...state.ruleCounters.entries()]
+            .sort((a, b) => b[1].rate - a[1].rate)
+            .slice(0, TOP_RULE_SLOTS);
+        state.topRuleKeys = sorted.map(([k]) => k);
+
+        updateEnfLegend(
+            state.passRate[state.passRate.length-1] || 0,
+            state.rateLtdRate[state.rateLtdRate.length-1] || 0,
+            state.blockRate[state.blockRate.length-1] || 0
+        );
     }
 
     // =========================================================================
@@ -570,26 +655,47 @@
     // Legend updates
     // =========================================================================
     const ENF_SERIES = [
-        { name: 'Pass',     color: '#4af' },
-        { name: 'Rate-Ltd', color: '#fa4' },
-        { name: 'Blocked',  color: '#f44' },
+        { name: 'passed',       color: '#4af' },
+        { name: 'rate-limited', color: '#fa4' },
+        { name: 'blocked',      color: '#f44' },
     ];
     const DET_SERIES = [
-        { name: 'TLS score', color: '#0ff' },
-        { name: 'TLS thr',   color: '#0ff' },
-        { name: 'REQ score', color: '#ff0' },
-        { name: 'REQ thr',   color: '#ff0' },
+        { name: 'tls-score',     color: '#0ff' },
+        { name: 'tls-threshold', color: '#0ff' },
+        { name: 'req-score',     color: '#ff0' },
+        { name: 'req-threshold', color: '#ff0' },
     ];
 
     function updateEnfLegend(passR, rlR, blkR) {
         const vals = [passR, rlR, blkR];
-        el('enf-legend').innerHTML = ENF_SERIES.map((s, i) =>
+        let html = ENF_SERIES.map((s, i) =>
             `<div class="legend-item">` +
             `<div class="legend-color" style="background:${s.color};"></div>` +
             `<span class="legend-name">${s.name}</span>` +
             `<span class="legend-value">${fmt(Math.round(vals[i]))}/s</span>` +
             `</div>`
         ).join('');
+
+        if (state.topRuleKeys.length > 0) {
+            html += '<div class="legend-section-title">per-rule</div>';
+            for (let i = 0; i < state.topRuleKeys.length; i++) {
+                const key = state.topRuleKeys[i];
+                const c = state.ruleCounters.get(key);
+                if (!c) continue;
+                const color = RULE_COLORS[i % RULE_COLORS.length];
+                html += `<div class="legend-item legend-item-rule">` +
+                    `<div class="legend-color" style="background:${color};"></div>` +
+                    `<span class="legend-name legend-name-rule" title="${escHtml(c.label)}">${escHtml(c.label)}</span>` +
+                    `<span class="legend-action">${escHtml(c.action)}</span>` +
+                    `<span class="legend-value">${fmt(Math.round(c.rate))}/s</span>` +
+                    `</div>`;
+            }
+        }
+        el('enf-legend').innerHTML = html;
+    }
+
+    function escHtml(s) {
+        return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
 
     function updateDetLegend(d) {
@@ -621,10 +727,10 @@
                         const s = u.series[i];
                         const v = u.data[i][idx];
                         if (v != null && s.show) {
-                            html += `<div style="display:flex;gap:8px;align-items:center;">` +
-                                `<span style="color:${s.stroke};">&#9632;</span>` +
+                            html += `<div style="display:flex;gap:8px;align-items:baseline;white-space:normal;word-break:break-all;">` +
+                                `<span style="color:${s.stroke};flex-shrink:0;">&#9632;</span>` +
                                 `<span style="flex:1;">${s.label}:</span>` +
-                                `<span style="font-weight:bold;">${valueFmt(v)}</span></div>`;
+                                `<span style="font-weight:bold;flex-shrink:0;">${valueFmt(v)}</span></div>`;
                         }
                     }
                     tooltipEl.innerHTML = html;
@@ -667,9 +773,16 @@
             ],
             series: [
                 {},
-                { label:"Pass",       stroke:"#4af", fill:"rgba(68,170,255,0.08)", width:2 },
-                { label:"Rate-Ltd",   stroke:"#fa4", fill:"rgba(255,170,68,0.08)", width:2 },
-                { label:"Blocked",    stroke:"#f44", fill:"rgba(255,68,68,0.08)",  width:2 },
+                { label:"passed",       stroke:"#4af", fill:"rgba(68,170,255,0.08)", width:2 },
+                { label:"rate-limited", stroke:"#fa4", fill:"rgba(255,170,68,0.08)", width:2 },
+                { label:"blocked",      stroke:"#f44", fill:"rgba(255,68,68,0.08)",  width:2 },
+                ...Array.from({length: TOP_RULE_SLOTS}, (_, i) => ({
+                    label: `rule-${i}`,
+                    stroke: RULE_COLORS[i % RULE_COLORS.length],
+                    width: 1,
+                    dash: [5, 5],
+                    show: true,
+                })),
             ],
             cursor: {
                 drag: { x: false, y: false },
@@ -679,12 +792,32 @@
             hooks: makeCursorHooks(tooltip, wrap, ENF_SERIES, v => fmt(Math.round(v)) + '/s'),
             legend: { show: false },
         };
-        enfChart = new uPlot(opts, [[],[],[],[]], el('chart-enforcement'));
+        const emptyData = [[], [], [], [], ...Array.from({length: TOP_RULE_SLOTS}, () => [])];
+        enfChart = new uPlot(opts, emptyData, el('chart-enforcement'));
     }
 
     function updateEnfChart() {
         if (!enfChart || state.ts.length === 0) return;
-        enfChart.setData([state.ts, state.passRate, state.rateLtdRate, state.blockRate]);
+        const data = [state.ts, state.passRate, state.rateLtdRate, state.blockRate];
+        for (let i = 0; i < TOP_RULE_SLOTS; i++) data.push(state.ruleRates[i]);
+
+        // Update per-rule series labels dynamically
+        for (let i = 0; i < TOP_RULE_SLOTS; i++) {
+            const key = state.topRuleKeys[i];
+            const c = key ? state.ruleCounters.get(key) : null;
+            const seriesIdx = 4 + i;
+            if (enfChart.series[seriesIdx]) {
+                enfChart.series[seriesIdx].label = c ? c.label : `rule-${i}`;
+                enfChart.series[seriesIdx].show = !!c;
+            }
+        }
+
+        enfChart.setData(data);
+    }
+
+    function truncateLabel(s, max) {
+        if (s.length <= max) return s;
+        return s.substring(0, max - 3) + '...';
     }
 
     // =========================================================================
@@ -710,10 +843,10 @@
             ],
             series: [
                 {},
-                { label:"TLS score", stroke:"#0ff",            width:2 },
-                { label:"TLS thr",   stroke:"#0ff", dash:[4,4], width:1 },
-                { label:"REQ score", stroke:"#ff0",            width:2 },
-                { label:"REQ thr",   stroke:"#ff0", dash:[4,4], width:1 },
+                { label:"tls-score",     stroke:"#0ff",            width:2 },
+                { label:"tls-threshold", stroke:"#0ff", dash:[4,4], width:1 },
+                { label:"req-score",     stroke:"#ff0",            width:2 },
+                { label:"req-threshold", stroke:"#ff0", dash:[4,4], width:1 },
             ],
             cursor: {
                 drag: { x: false, y: false },

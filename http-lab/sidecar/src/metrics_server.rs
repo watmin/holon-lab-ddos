@@ -19,7 +19,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use futures::stream::{self, Stream};
 use http_proxy::types::DagNode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::CorsLayer;
 use tracing::info;
@@ -68,9 +68,22 @@ pub enum DashboardEvent {
         ts: f64,
         nodes: Vec<DagNode>,
     },
+    RuleCounters {
+        ts: f64,
+        counters: Vec<RuleCounter>,
+    },
     Heartbeat {
         ts: f64,
     },
+}
+
+/// Per-rule hit counter sent to the dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleCounter {
+    pub id: u32,
+    pub label: String,
+    pub action: String,
+    pub count: u64,
 }
 
 // =============================================================================

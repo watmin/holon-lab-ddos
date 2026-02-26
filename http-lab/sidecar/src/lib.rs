@@ -565,6 +565,30 @@ pub async fn run(
             tick_count,
         });
 
+        // Emit per-rule counters
+        {
+            let snapshot = http_proxy::rule_counter_snapshot();
+            let compiled = tree.load();
+            let counters: Vec<metrics_server::RuleCounter> = snapshot.iter()
+                .filter_map(|(&rid, &count)| {
+                    compiled.rule_labels.get(&rid).map(|(label, action)| {
+                        metrics_server::RuleCounter {
+                            id: rid,
+                            label: label.clone(),
+                            action: action.clone(),
+                            count,
+                        }
+                    })
+                })
+                .collect();
+            if !counters.is_empty() {
+                let _ = event_tx.send(DashboardEvent::RuleCounters {
+                    ts: now_ts(),
+                    counters,
+                });
+            }
+        }
+
         // Periodic metrics snapshot (every 10 ticks)
         if tick_count % 10 == 0 {
             let s = stats.read().await;
