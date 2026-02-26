@@ -693,6 +693,22 @@ pub enum FieldDim {
 }
 
 impl FieldDim {
+    /// True for TLS-layer dimensions.
+    pub fn is_tls(&self) -> bool {
+        matches!(self,
+            FieldDim::TlsGroupHash | FieldDim::TlsCipherHash | FieldDim::TlsExtOrderHash |
+            FieldDim::TlsCipherSet | FieldDim::TlsExtSet | FieldDim::TlsGroupSet
+        )
+    }
+
+    /// True for HTTP-layer dimensions.
+    pub fn is_http(&self) -> bool {
+        matches!(self,
+            FieldDim::Method | FieldDim::PathPrefix | FieldDim::Host |
+            FieldDim::UserAgent | FieldDim::ContentType
+        )
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             FieldDim::SrcIp => "src-ip",
@@ -989,6 +1005,19 @@ impl RuleSpec {
 // Compiled rule tree (Rete-spirit DAG — pure userspace)
 // =============================================================================
 
+/// Specificity rank for best-match selection. Fields are compared in
+/// declaration order (derive(Ord) gives lexicographic comparison).
+/// To add a new tiebreaker, insert a field at the appropriate position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Specificity {
+    /// Cross-layer (TLS+HTTP = 2) > single-layer (1) > unconstrained (0).
+    pub layers: u8,
+    /// HTTP constraints are more surgical than TLS-only.
+    pub has_http: u8,
+    /// More constraints = narrower match.
+    pub constraints: u8,
+}
+
 /// A node in the in-memory rule tree.
 #[derive(Debug, Clone)]
 pub struct TreeNode {
@@ -999,7 +1028,7 @@ pub struct TreeNode {
     /// Wildcard child: for rules that don't constrain this dimension.
     pub wildcard: Option<usize>,
     /// Action at this node (from highest-priority terminating rule).
-    pub action: Option<(RuleAction, u32)>, // (action, rule_id)
+    pub action: Option<(RuleAction, u32, Specificity)>,
 }
 
 /// The compiled rule tree, held behind an ArcSwap for zero-downtime updates.
@@ -1027,16 +1056,21 @@ impl CompiledTree {
     }
 
     /// Evaluate a request against this tree. Returns (action, rule_id) if any rule matches.
+    /// Explores all paths (specific + wildcard) and picks the most specific match.
     pub fn evaluate_req(&self, req: &RequestSample) -> Option<(&RuleAction, u32)> {
-        self.dfs_req(req, self.root)
+        self.dfs_req(req, self.root).map(|(a, id, _)| (a, id))
     }
 
     /// Evaluate a TLS sample against this tree. Returns (action, rule_id) if any rule matches.
     pub fn evaluate_tls(&self, sample: &TlsSample) -> Option<(&RuleAction, u32)> {
-        self.dfs_tls(sample, self.root)
+        self.dfs_tls(sample, self.root).map(|(a, id, _)| (a, id))
     }
 
-    fn dfs_req<'a>(&'a self, req: &RequestSample, node_idx: usize) -> Option<(&'a RuleAction, u32)> {
+    /// DFS returning (action, rule_id, specificity).
+    /// Explores both specific and wildcard branches; picks the most specific
+    /// match via lexicographic tuple comparison, mirroring veth-lab's
+    /// best-priority accumulator.
+    fn dfs_req<'a>(&'a self, req: &RequestSample, node_idx: usize) -> Option<(&'a RuleAction, u32, Specificity)> {
         let node = self.nodes.get(node_idx)?;
 
         let field_val = node.dim.extract_value(req);
@@ -1046,21 +1080,35 @@ impl CompiledTree {
         let wildcard = node.wildcard
             .and_then(|child| self.dfs_req(req, child));
 
-        specific
-            .or(wildcard)
-            .or_else(|| node.action.as_ref().map(|(a, id)| (a, *id)))
+        let best_child = pick_best(specific, wildcard);
+        let this_node = node.action.as_ref().map(|(a, id, s)| (a, *id, *s));
+        pick_best(best_child, this_node)
     }
 
-    fn dfs_tls<'a>(&'a self, sample: &TlsSample, node_idx: usize) -> Option<(&'a RuleAction, u32)> {
+    fn dfs_tls<'a>(&'a self, sample: &TlsSample, node_idx: usize) -> Option<(&'a RuleAction, u32, Specificity)> {
         let node = self.nodes.get(node_idx)?;
         let field_val = node.dim.extract_value_tls(sample);
         let specific = node.children.get(&field_val)
             .and_then(|&child| self.dfs_tls(sample, child));
         let wildcard = node.wildcard
             .and_then(|child| self.dfs_tls(sample, child));
-        specific
-            .or(wildcard)
-            .or_else(|| node.action.as_ref().map(|(a, id)| (a, *id)))
+        let best_child = pick_best(specific, wildcard);
+        let this_node = node.action.as_ref().map(|(a, id, s)| (a, *id, *s));
+        pick_best(best_child, this_node)
+    }
+}
+
+/// Pick the more specific match. Ties go to `a` (specific-branch candidate).
+fn pick_best<'a>(
+    a: Option<(&'a RuleAction, u32, Specificity)>,
+    b: Option<(&'a RuleAction, u32, Specificity)>,
+) -> Option<(&'a RuleAction, u32, Specificity)> {
+    match (a, b) {
+        (Some(av), Some(bv)) => {
+            if bv.2 > av.2 { Some(bv) } else { Some(av) }
+        }
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (None, None) => None,
     }
 }
 
@@ -1098,7 +1146,7 @@ impl CompiledTree {
                 all_children.push(wc);
             }
 
-            let action = node.action.as_ref().map(|(act, _)| match act {
+            let action = node.action.as_ref().map(|(act, _, _)| match act {
                 RuleAction::Block { status } => format!("(block {})", status),
                 RuleAction::RateLimit { rps } => format!("(rate-limit {})", rps),
                 RuleAction::CloseConnection => "(close-connection)".into(),

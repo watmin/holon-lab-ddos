@@ -13,6 +13,8 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::types::Specificity;
+
 use tracing::info;
 
 use crate::types::{
@@ -26,7 +28,7 @@ use crate::types::{
 #[derive(Debug, Clone)]
 struct ShadowNode {
     dim_index: usize,
-    action: Option<(RuleAction, u32)>, // (action, rule_id)
+    action: Option<(RuleAction, u32, Specificity)>,
     /// Specific-value children: field_value → subtree
     children: HashMap<String, Rc<ShadowNode>>,
     /// Wildcard child (rules that don't constrain this dimension)
@@ -90,7 +92,8 @@ fn compile_recursive(rules: &[RuleSpec], dim_idx: usize) -> Rc<ShadowNode> {
     if dim_idx >= DIM_ORDER.len() {
         if let Some(rule) = rules.iter().max_by_key(|r| r.priority) {
             let rule_id = rule_identity_hash(rule);
-            node.action = Some((rule.action.clone(), rule_id));
+            let score = specificity_score(rule);
+            node.action = Some((rule.action.clone(), rule_id, score));
         }
         return Rc::new(node);
     }
@@ -187,6 +190,16 @@ fn build_fingerprint(rules: &[RuleSpec]) -> String {
         .collect();
     keys.sort();
     keys.join("|")
+}
+
+fn specificity_score(rule: &RuleSpec) -> Specificity {
+    let has_tls = rule.constraints.iter().any(|p| p.dim().is_tls());
+    let has_http = rule.constraints.iter().any(|p| p.dim().is_http());
+    Specificity {
+        layers: has_tls as u8 + has_http as u8,
+        has_http: has_http as u8,
+        constraints: rule.constraints.len() as u8,
+    }
 }
 
 fn rule_identity_hash(rule: &RuleSpec) -> u32 {
