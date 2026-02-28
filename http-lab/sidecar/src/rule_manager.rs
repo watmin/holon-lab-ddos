@@ -9,14 +9,14 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use tracing::info;
 
-use http_proxy::types::{CompiledTree, RuleSpec};
-use http_proxy::tree::compile;
+use http_proxy::expr::RuleExpr;
+use http_proxy::expr_tree::{compile_expr, ExprCompiledTree};
 
 /// An active rule with expiry tracking.
 pub struct ActiveRule {
     pub created_at: Instant,
     pub last_seen: Instant,
-    pub spec: RuleSpec,
+    pub spec: RuleExpr,
     pub preloaded: bool,
 }
 
@@ -36,7 +36,7 @@ impl RuleManager {
     }
 
     /// Upsert rules into the active set. Returns keys of newly added rules.
-    pub fn upsert(&mut self, specs: &[RuleSpec]) -> Vec<String> {
+    pub fn upsert(&mut self, specs: &[RuleExpr]) -> Vec<String> {
         let mut newly_added = Vec::new();
         for spec in specs {
             let key = spec.identity_key();
@@ -70,7 +70,7 @@ impl RuleManager {
     }
 
     /// Check if a candidate rule is redundant given existing rules.
-    pub fn is_redundant(&self, candidate: &RuleSpec) -> Option<&'static str> {
+    pub fn is_redundant(&self, candidate: &RuleExpr) -> Option<&'static str> {
         if candidate.constraints.is_empty() { return Some("empty"); }
         let candidate_action = std::mem::discriminant(&candidate.action);
 
@@ -98,9 +98,9 @@ impl RuleManager {
     }
 
     /// Compile the current rule set and write to the shared ArcSwap.
-    pub fn recompile_and_deploy(&self, tree: &ArcSwap<CompiledTree>) {
-        let specs: Vec<RuleSpec> = self.rules.values().map(|r| r.spec.clone()).collect();
-        let compiled = compile(&specs);
+    pub fn recompile_and_deploy(&self, tree: &ArcSwap<ExprCompiledTree>) {
+        let specs: Vec<RuleExpr> = self.rules.values().map(|r| r.spec.clone()).collect();
+        let compiled = compile_expr(&specs);
         info!(
             rules = specs.len(),
             nodes = compiled.nodes.len(),
@@ -113,12 +113,12 @@ impl RuleManager {
         self.rules.len()
     }
 
-    pub fn all_specs(&self) -> Vec<RuleSpec> {
+    pub fn all_specs(&self) -> Vec<RuleExpr> {
         self.rules.values().map(|r| r.spec.clone()).collect()
     }
 
     /// Return only non-preloaded (auto-generated) rule specs for engram storage.
-    pub fn active_rule_specs(&self) -> Vec<RuleSpec> {
+    pub fn active_rule_specs(&self) -> Vec<RuleExpr> {
         self.rules.values()
             .filter(|r| !r.preloaded)
             .map(|r| r.spec.clone())
@@ -126,7 +126,7 @@ impl RuleManager {
     }
 
     /// Return all rules with their age in seconds (for the dashboard).
-    pub fn all_rules_with_age(&self) -> Vec<(RuleSpec, f64)> {
+    pub fn all_rules_with_age(&self) -> Vec<(RuleExpr, f64)> {
         self.rules.values()
             .map(|r| (r.spec.clone(), r.last_seen.elapsed().as_secs_f64()))
             .collect()
@@ -136,16 +136,17 @@ impl RuleManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_proxy::types::{FieldDim, Predicate, RuleAction};
+    use http_proxy::expr::{Dimension, Expr, Value};
+    use http_proxy::types::RuleAction;
 
-    fn make_rule(dim: FieldDim, val: &str, action: RuleAction) -> RuleSpec {
-        RuleSpec::new(vec![Predicate::eq(dim, val)], action)
+    fn make_rule(dim: Dimension, val: &str, action: RuleAction) -> RuleExpr {
+        RuleExpr::new(vec![Expr::eq(dim, Value::str(val))], action)
     }
 
     #[test]
     fn upsert_adds_new_rules() {
         let mut mgr = RuleManager::new(300);
-        let rule = make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block());
+        let rule = make_rule(Dimension::src_ip(), "10.0.0.1", RuleAction::block());
         let added = mgr.upsert(&[rule]);
         assert_eq!(added.len(), 1);
         assert_eq!(mgr.rule_count(), 1);
@@ -154,7 +155,7 @@ mod tests {
     #[test]
     fn upsert_deduplicates() {
         let mut mgr = RuleManager::new(300);
-        let rule = make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block());
+        let rule = make_rule(Dimension::src_ip(), "10.0.0.1", RuleAction::block());
         let added1 = mgr.upsert(&[rule.clone()]);
         let added2 = mgr.upsert(&[rule]);
         assert_eq!(added1.len(), 1);
@@ -165,7 +166,7 @@ mod tests {
     #[test]
     fn expire_removes_old_rules() {
         let mut mgr = RuleManager::new(0);
-        let rule = make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block());
+        let rule = make_rule(Dimension::src_ip(), "10.0.0.1", RuleAction::block());
         mgr.upsert(&[rule]);
         std::thread::sleep(std::time::Duration::from_millis(10));
         let removed = mgr.expire();
@@ -176,7 +177,7 @@ mod tests {
     #[test]
     fn expire_preserves_preloaded() {
         let mut mgr = RuleManager::new(0);
-        let rule = make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block());
+        let rule = make_rule(Dimension::src_ip(), "10.0.0.1", RuleAction::block());
         mgr.upsert(&[rule]);
         for active in mgr.rules.values_mut() {
             active.preloaded = true;
@@ -190,13 +191,13 @@ mod tests {
     #[test]
     fn is_redundant_detects_subsumed() {
         let mut mgr = RuleManager::new(300);
-        let broad = make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block());
+        let broad = make_rule(Dimension::src_ip(), "10.0.0.1", RuleAction::block());
         mgr.upsert(&[broad]);
 
-        let specific = RuleSpec::new(
+        let specific = RuleExpr::new(
             vec![
-                Predicate::eq(FieldDim::SrcIp, "10.0.0.1"),
-                Predicate::eq(FieldDim::Method, "GET"),
+                Expr::eq(Dimension::src_ip(), Value::str("10.0.0.1")),
+                Expr::eq(Dimension::method(), Value::str("GET")),
             ],
             RuleAction::block(),
         );
@@ -206,43 +207,43 @@ mod tests {
     #[test]
     fn is_redundant_allows_unrelated() {
         let mut mgr = RuleManager::new(300);
-        let rule1 = make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block());
+        let rule1 = make_rule(Dimension::src_ip(), "10.0.0.1", RuleAction::block());
         mgr.upsert(&[rule1]);
 
-        let rule2 = make_rule(FieldDim::SrcIp, "10.0.0.2", RuleAction::block());
+        let rule2 = make_rule(Dimension::src_ip(), "10.0.0.2", RuleAction::block());
         assert!(mgr.is_redundant(&rule2).is_none());
     }
 
     #[test]
     fn is_redundant_detects_duplicate() {
         let mut mgr = RuleManager::new(300);
-        let rule = make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block());
+        let rule = make_rule(Dimension::src_ip(), "10.0.0.1", RuleAction::block());
         mgr.upsert(&[rule]);
 
-        let same_constraints_diff_action = RuleSpec::new(
-            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
+        let dup = RuleExpr::new(
+            vec![Expr::eq(Dimension::src_ip(), Value::str("10.0.0.1"))],
             RuleAction::block(),
         );
-        assert_eq!(mgr.is_redundant(&same_constraints_diff_action), Some("duplicate"));
+        assert_eq!(mgr.is_redundant(&dup), Some("duplicate"));
     }
 
     #[test]
     fn is_redundant_rejects_empty() {
         let mgr = RuleManager::new(300);
-        let empty = RuleSpec::new(vec![], RuleAction::block());
+        let empty = RuleExpr::new(vec![], RuleAction::block());
         assert_eq!(mgr.is_redundant(&empty), Some("empty"));
     }
 
     #[test]
     fn recompile_and_deploy_updates_tree() {
         let mgr_rules = vec![
-            make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block()),
-            make_rule(FieldDim::SrcIp, "10.0.0.2", RuleAction::CloseConnection),
+            make_rule(Dimension::src_ip(), "10.0.0.1", RuleAction::block()),
+            make_rule(Dimension::src_ip(), "10.0.0.2", RuleAction::CloseConnection { name: None }),
         ];
         let mut mgr = RuleManager::new(300);
         mgr.upsert(&mgr_rules);
 
-        let tree = ArcSwap::new(Arc::new(CompiledTree::empty()));
+        let tree = ArcSwap::new(Arc::new(ExprCompiledTree::empty()));
         mgr.recompile_and_deploy(&tree);
 
         let loaded = tree.load();

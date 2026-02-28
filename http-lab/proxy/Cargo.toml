@@ -29,10 +29,20 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-lega
 http-body-util = "0.1"
 bytes = "1"
 
+# Regex for guard predicates
+regex = "1"
+
+# EDN parsing (same as veth-lab)
+edn-rs = "0.18.0"
+
 # Shared rule tree swap
 arc-swap = "1"
 
 # Holon VSA
 holon = { path = "../../../holon-rs" }
+
+[[bench]]
+name = "tree_perf"
+harness = false
 
 [dev-dependencies]

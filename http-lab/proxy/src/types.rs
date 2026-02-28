@@ -829,26 +829,24 @@ impl Predicate {
     }
 }
 
+/// Structured name for rules/actions: (namespace, name).
+pub type RuleName = Option<(String, String)>;
+
 /// Action to take when a rule matches.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RuleAction {
-    /// Block the request with an HTTP error response.
-    Block { status: u16 },
-    /// Rate-limit: allow up to `rps` requests per second from matching clients.
-    RateLimit { rps: u32 },
-    /// Close the TCP connection (for TLS/IP level rules).
-    CloseConnection,
-    /// Count matches for observability without taking action.
-    Count { label: String },
-    /// Explicitly pass (can be used to whitelist).
-    Pass,
+    Block { status: u16, name: RuleName },
+    RateLimit { rps: u32, name: RuleName },
+    CloseConnection { name: RuleName },
+    Count { name: RuleName },
+    Pass { name: RuleName },
 }
 
 impl RuleAction {
-    pub fn block() -> Self { RuleAction::Block { status: 403 } }
-    pub fn close() -> Self { RuleAction::CloseConnection }
-    pub fn pass() -> Self { RuleAction::Pass }
-    pub fn count(label: impl Into<String>) -> Self { RuleAction::Count { label: label.into() } }
+    pub fn block() -> Self { RuleAction::Block { status: 403, name: None } }
+    pub fn close() -> Self { RuleAction::CloseConnection { name: None } }
+    pub fn pass() -> Self { RuleAction::Pass { name: None } }
+    pub fn count() -> Self { RuleAction::Count { name: None } }
 
     pub fn is_terminal(&self) -> bool {
         !matches!(self, RuleAction::Count { .. })
@@ -858,9 +856,35 @@ impl RuleAction {
         match self {
             RuleAction::Block { .. } => "block",
             RuleAction::RateLimit { .. } => "rate-limit",
-            RuleAction::CloseConnection => "close",
+            RuleAction::CloseConnection { .. } => "close",
             RuleAction::Count { .. } => "count",
-            RuleAction::Pass => "pass",
+            RuleAction::Pass { .. } => "pass",
+        }
+    }
+
+    pub fn name(&self) -> &RuleName {
+        match self {
+            RuleAction::Block { name, .. } => name,
+            RuleAction::RateLimit { name, .. } => name,
+            RuleAction::CloseConnection { name } => name,
+            RuleAction::Count { name } => name,
+            RuleAction::Pass { name } => name,
+        }
+    }
+
+    pub fn to_sexpr(&self) -> String {
+        let base = match self {
+            RuleAction::Block { status, .. } => format!("(block {})", status),
+            RuleAction::RateLimit { rps, .. } => format!("(rate-limit {})", rps),
+            RuleAction::CloseConnection { .. } => "(close-connection)".to_string(),
+            RuleAction::Count { .. } => "(count)".to_string(),
+            RuleAction::Pass { .. } => "(pass)".to_string(),
+        };
+        if let Some((ns, n)) = self.name() {
+            let inner = &base[1..base.len()-1];
+            format!("({} :name [\"{}\" \"{}\"])", inner, ns, n)
+        } else {
+            base
         }
     }
 }
@@ -908,13 +932,7 @@ impl RuleSpec {
     }
 
     fn action_to_sexpr(action: &RuleAction) -> String {
-        match action {
-            RuleAction::Block { status } => format!("(block {})", status),
-            RuleAction::RateLimit { rps } => format!("(rate-limit {})", rps),
-            RuleAction::CloseConnection => "(close-connection)".to_string(),
-            RuleAction::Count { label } => format!("(count \"{}\")", label),
-            RuleAction::Pass => "(pass)".to_string(),
-        }
+        action.to_sexpr()
     }
 
     /// Just the constraint array as an s-expression: `[(= method "GET") (= path "/api")]`
@@ -1146,13 +1164,7 @@ impl CompiledTree {
                 all_children.push(wc);
             }
 
-            let action = node.action.as_ref().map(|(act, _, _)| match act {
-                RuleAction::Block { status } => format!("(block {})", status),
-                RuleAction::RateLimit { rps } => format!("(rate-limit {})", rps),
-                RuleAction::CloseConnection => "(close-connection)".into(),
-                RuleAction::Count { label } => format!("(count \"{}\")", label),
-                RuleAction::Pass => "(pass)".into(),
-            });
+            let action = node.action.as_ref().map(|(act, _, _)| act.to_sexpr());
 
             let dim_label = if node.action.is_some() && all_children.is_empty() {
                 "terminal".to_string()
@@ -1450,7 +1462,7 @@ mod tests {
     fn rule_to_edn_pretty_single_constraint() {
         let rule = RuleSpec::new(
             vec![Predicate::eq(FieldDim::PathPrefix, "/api/search")],
-            RuleAction::RateLimit { rps: 100 },
+            RuleAction::RateLimit { rps: 100, name: None },
         );
         let edn = rule.to_edn_pretty();
         assert!(edn.contains("(= path-prefix \"/api/search\")"));

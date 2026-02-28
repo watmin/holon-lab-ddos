@@ -29,8 +29,9 @@ use tracing::{debug, warn};
 use crate::tls::ReplayStream;
 
 use crate::enforcer::{RateLimiter, Verdict};
+use crate::expr_tree::ExprCompiledTree;
 use crate::types::{
-    CompiledTree, ConnectionContext, HttpVersion, RequestSample,
+    ConnectionContext, HttpVersion, RequestSample,
     SampleMessage, TlsSample, now_us,
 };
 
@@ -43,7 +44,7 @@ pub async fn serve_connection(
     io: tokio_rustls::server::TlsStream<ReplayStream>,
     conn_ctx: Arc<ConnectionContext>,
     upstream_addr: SocketAddr,
-    tree: Arc<ArcSwap<CompiledTree>>,
+    tree: Arc<ArcSwap<ExprCompiledTree>>,
     sample_tx: mpsc::Sender<SampleMessage>,
     rate_limiter: Arc<RateLimiter>,
 ) {
@@ -82,7 +83,7 @@ async fn handle_request(
     req: Request<Incoming>,
     conn_ctx: Arc<ConnectionContext>,
     upstream_addr: SocketAddr,
-    tree: Arc<ArcSwap<CompiledTree>>,
+    tree: Arc<ArcSwap<ExprCompiledTree>>,
     sample_tx: mpsc::Sender<SampleMessage>,
     rate_limiter: Arc<RateLimiter>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {

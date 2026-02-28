@@ -4,7 +4,7 @@
 //!   - TLS accept loop (proxy tasks)
 //!   - Sidecar detection tasks (in-process, same tokio runtime)
 //!
-//! The ArcSwap<CompiledTree> and bounded mpsc channel are created here and
+//! The ArcSwap<ExprCompiledTree> and bounded mpsc channel are created here and
 //! shared between proxy and sidecar via Arc.
 
 use std::net::SocketAddr;
@@ -26,8 +26,9 @@ use holon::kernel::{Encoder, VectorManager};
 
 use http_proxy::{
     enforcer::RateLimiter,
+    expr_tree::ExprCompiledTree,
     tls::accept_tls,
-    types::{CompiledTree, ConnectionContext, SampleMessage},
+    types::{ConnectionContext, SampleMessage},
     http::serve_connection,
 };
 
@@ -117,7 +118,7 @@ async fn main() -> Result<()> {
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
     // Shared rule tree (starts empty — all traffic passes until sidecar populates rules)
-    let tree: Arc<ArcSwap<CompiledTree>> = Arc::new(ArcSwap::new(Arc::new(CompiledTree::empty())));
+    let tree: Arc<ArcSwap<ExprCompiledTree>> = Arc::new(ArcSwap::new(Arc::new(ExprCompiledTree::empty())));
 
     // Bounded sample channel — proxy uses try_send (drop on full)
     let (sample_tx, sample_rx) = mpsc::channel::<SampleMessage>(args.sample_channel_capacity);

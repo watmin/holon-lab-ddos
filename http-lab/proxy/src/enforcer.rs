@@ -1,6 +1,6 @@
 //! Synchronous rule enforcer.
 //!
-//! Called on every request in the hot path. Loads the current CompiledTree
+//! Called on every request in the hot path. Loads the current ExprCompiledTree
 //! from the ArcSwap (wait-free) and evaluates rules against the request.
 //! Returns a Verdict that the http handler acts on immediately.
 
@@ -9,7 +9,8 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::types::{CompiledTree, RequestSample, RuleAction, TlsSample};
+use crate::expr_tree::ExprCompiledTree;
+use crate::types::{RequestSample, RuleAction, TlsSample};
 
 /// What the enforcer decided to do with a request.
 #[derive(Debug, Clone)]
@@ -78,7 +79,7 @@ impl RateLimiter {
 /// Evaluate a RequestSample against the compiled tree.
 /// Called synchronously on every request (ArcSwap load is wait-free).
 /// Returns (verdict, optional rule_id) for per-rule counter tracking.
-pub fn evaluate(req: &RequestSample, tree: &CompiledTree) -> (Verdict, Option<u32>) {
+pub fn evaluate(req: &RequestSample, tree: &ExprCompiledTree) -> (Verdict, Option<u32>) {
     match tree.evaluate_req(req) {
         None => (Verdict::Pass, None),
         Some((action, rule_id)) => (action_to_verdict(action), Some(rule_id)),
@@ -87,7 +88,7 @@ pub fn evaluate(req: &RequestSample, tree: &CompiledTree) -> (Verdict, Option<u3
 
 /// Evaluate a TlsSample against the compiled tree.
 /// Called once per connection at TLS accept time.
-pub fn evaluate_tls(sample: &TlsSample, tree: &CompiledTree) -> (Verdict, Option<u32>) {
+pub fn evaluate_tls(sample: &TlsSample, tree: &ExprCompiledTree) -> (Verdict, Option<u32>) {
     match tree.evaluate_tls(sample) {
         None => (Verdict::Pass, None),
         Some((action, rule_id)) => (action_to_verdict(action), Some(rule_id)),
@@ -96,18 +97,19 @@ pub fn evaluate_tls(sample: &TlsSample, tree: &CompiledTree) -> (Verdict, Option
 
 fn action_to_verdict(action: &RuleAction) -> Verdict {
     match action {
-        RuleAction::Block { status } => Verdict::Block(*status),
-        RuleAction::RateLimit { rps } => Verdict::RateLimit(*rps),
-        RuleAction::CloseConnection => Verdict::CloseConnection,
+        RuleAction::Block { status, .. } => Verdict::Block(*status),
+        RuleAction::RateLimit { rps, .. } => Verdict::RateLimit(*rps),
+        RuleAction::CloseConnection { .. } => Verdict::CloseConnection,
         RuleAction::Count { .. } => Verdict::Count,
-        RuleAction::Pass => Verdict::Pass,
+        RuleAction::Pass { .. } => Verdict::Pass,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::compile;
+    use crate::expr::{Dimension, Expr, RuleExpr, Value};
+    use crate::expr_tree::compile_expr;
     use crate::types::*;
     use std::sync::Arc;
     use holon::kernel::{Encoder, VectorManager};
@@ -119,20 +121,23 @@ mod tests {
         test_request_sample("GET", "/", ip_str.parse().unwrap(), vec![], tls_ctx, tls_vec)
     }
 
+    fn ip_rule(ip: &str, action: RuleAction) -> RuleExpr {
+        RuleExpr::new(
+            vec![Expr::eq(Dimension::src_ip(), Value::str(ip))],
+            action,
+        )
+    }
+
     #[test]
     fn evaluate_empty_tree_is_pass() {
-        let tree = CompiledTree::empty();
+        let tree = ExprCompiledTree::empty();
         let req = make_req("1.2.3.4");
         assert!(matches!(evaluate(&req, &tree), (Verdict::Pass, None)));
     }
 
     #[test]
     fn evaluate_block_verdict() {
-        let rules = vec![RuleSpec::new(
-            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
-            RuleAction::Block { status: 403 },
-        )];
-        let tree = compile(&rules);
+        let tree = compile_expr(&[ip_rule("10.0.0.1", RuleAction::Block { status: 403, name: None })]);
         let req = make_req("10.0.0.1");
         let (v, rid) = evaluate(&req, &tree);
         assert!(matches!(v, Verdict::Block(403)));
@@ -141,11 +146,7 @@ mod tests {
 
     #[test]
     fn evaluate_rate_limit_verdict() {
-        let rules = vec![RuleSpec::new(
-            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
-            RuleAction::RateLimit { rps: 100 },
-        )];
-        let tree = compile(&rules);
+        let tree = compile_expr(&[ip_rule("10.0.0.1", RuleAction::RateLimit { rps: 100, name: None })]);
         let req = make_req("10.0.0.1");
         let (v, rid) = evaluate(&req, &tree);
         assert!(matches!(v, Verdict::RateLimit(100)));
@@ -154,11 +155,7 @@ mod tests {
 
     #[test]
     fn evaluate_close_connection_verdict() {
-        let rules = vec![RuleSpec::new(
-            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
-            RuleAction::CloseConnection,
-        )];
-        let tree = compile(&rules);
+        let tree = compile_expr(&[ip_rule("10.0.0.1", RuleAction::CloseConnection { name: None })]);
         let req = make_req("10.0.0.1");
         let (v, rid) = evaluate(&req, &tree);
         assert!(matches!(v, Verdict::CloseConnection));
@@ -167,11 +164,7 @@ mod tests {
 
     #[test]
     fn evaluate_count_verdict() {
-        let rules = vec![RuleSpec::new(
-            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
-            RuleAction::count("test-counter"),
-        )];
-        let tree = compile(&rules);
+        let tree = compile_expr(&[ip_rule("10.0.0.1", RuleAction::count())]);
         let req = make_req("10.0.0.1");
         let (v, rid) = evaluate(&req, &tree);
         assert!(matches!(v, Verdict::Count));
@@ -180,11 +173,7 @@ mod tests {
 
     #[test]
     fn evaluate_pass_verdict() {
-        let rules = vec![RuleSpec::new(
-            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
-            RuleAction::Pass,
-        )];
-        let tree = compile(&rules);
+        let tree = compile_expr(&[ip_rule("10.0.0.1", RuleAction::Pass { name: None })]);
         let req = make_req("10.0.0.1");
         let (v, rid) = evaluate(&req, &tree);
         assert!(matches!(v, Verdict::Pass));
@@ -193,11 +182,7 @@ mod tests {
 
     #[test]
     fn evaluate_non_matching_is_pass() {
-        let rules = vec![RuleSpec::new(
-            vec![Predicate::eq(FieldDim::SrcIp, "10.0.0.1")],
-            RuleAction::block(),
-        )];
-        let tree = compile(&rules);
+        let tree = compile_expr(&[ip_rule("10.0.0.1", RuleAction::block())]);
         let req = make_req("10.0.0.2");
         assert!(matches!(evaluate(&req, &tree), (Verdict::Pass, None)));
     }
@@ -206,11 +191,9 @@ mod tests {
     fn rate_limiter_allows_within_budget() {
         let rl = RateLimiter::new();
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        // Bucket starts full at rps tokens — first rps calls should pass
         for _ in 0..100 {
             assert!(rl.allow(ip, 100));
         }
-        // Next call exhausts the bucket
         assert!(!rl.allow(ip, 100));
     }
 
@@ -218,12 +201,10 @@ mod tests {
     fn rate_limiter_refills_over_time() {
         let rl = RateLimiter::new();
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        // Drain the bucket
         for _ in 0..10 {
             rl.allow(ip, 10);
         }
         assert!(!rl.allow(ip, 10));
-        // After sleeping, bucket should have refilled
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(rl.allow(ip, 10));
     }
@@ -233,18 +214,16 @@ mod tests {
         let rl = RateLimiter::new();
         let ip_a: IpAddr = "10.0.0.1".parse().unwrap();
         let ip_b: IpAddr = "10.0.0.2".parse().unwrap();
-        // Drain ip_a
         for _ in 0..5 {
             rl.allow(ip_a, 5);
         }
         assert!(!rl.allow(ip_a, 5));
-        // ip_b should be unaffected
         assert!(rl.allow(ip_b, 5));
     }
 
     #[test]
     fn evaluate_tls_with_empty_tree() {
-        let tree = CompiledTree::empty();
+        let tree = ExprCompiledTree::empty();
         let tls_ctx = Arc::new(TlsContext::default());
         let enc = Encoder::new(VectorManager::new(4096));
         let tls_vec = enc.encode_walkable(tls_ctx.as_ref());

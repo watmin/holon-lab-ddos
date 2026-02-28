@@ -6,6 +6,8 @@
 //! main() entry point and links both proxy and sidecar.
 
 pub mod enforcer;
+pub mod expr;
+pub mod expr_tree;
 pub mod http;
 pub mod tls;
 pub mod tls_names;

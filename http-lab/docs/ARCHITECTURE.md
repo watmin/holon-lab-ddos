@@ -26,7 +26,7 @@ Client
 │                                                                          │
 │ HTTP Handler (per request on the established TLS connection)             │
 │  ├─ Parse request → RequestSample (method, path, headers, query, ...)   │
-│  ├─ Enforcer: load CompiledTree from ArcSwap (wait-free)                │
+│  ├─ Enforcer: load ExprCompiledTree from ArcSwap (wait-free)            │
 │  │    ├─ Walk DAG with request field values (best-match evaluator)      │
 │  │    ├─ Returns (Verdict, Option<rule_id>)                             │
 │  │    ├─ Verdict: Pass / Block(403) / RateLimit(rps) / CloseConnection  │
@@ -184,22 +184,33 @@ This makes rule generation adaptive: it catches both fixed-order bots (curl, pyt
 
 ### EDN Rule Syntax
 
-Rules are rendered in EDN (Extensible Data Notation), matching veth-lab's s-expression format:
+Rules are rendered in EDN (Extensible Data Notation), a composable s-expression format. The full language specification is in `RULE-LANGUAGE.md`. Live-generated rules from the detection pipeline:
 
 ```clojure
-;; Single constraint
-(rule
-  (and
-    (= path-prefix "/api/search"))
-  (rate-limit :rps 200))
+;; HTTP path concentration (auto-generated from FieldTracker)
+{:constraints [(= path "/api/search")]
+ :actions     [(rate-limit 83)]}
 
-;; Compound TLS rule (set-based, order-independent)
-(rule
-  (and
-    (= tls-cipher-set "TLS_AES_128_GCM_SHA256,TLS_AES_256_GCM_SHA384,TLS_CHACHA20_POLY1305_SHA256")
-    (= tls-ext-set "server_name,supported_groups,ec_point_formats,..."))
-  (rate-limit :rps 200))
+;; Cross-layer TLS+HTTP compound rule (auto-generated from surprise + concentration)
+{:constraints [(= path "/api/v1/auth/login")
+               (= method "POST")
+               (= (first (header "content-type")) "application/json")]
+ :actions     [(rate-limit 83)]}
+
+;; TLS fingerprint with set-based matching (order-independent)
+{:constraints [(= tls-ext-types #{"0x0000" "0x0005" "0x000a" "0x000b" "0x000d" "0x0017" "0x0023" "0x002b" "0x002d" "0x0033"})
+               (= tls-ciphers #{"0x00ff" "0x1301" "0x1302" "0x1303" "0xc02b" "0xc02c" "0xc02f" "0xc030" "0xcca8" "0xcca9"})
+               (= tls-groups #{"0x0017" "0x0018" "0x001d"})]
+ :actions     [(rate-limit 83)]}
+
+;; Cross-layer HTTP+TLS (auto-generated: REQ concentration + TLS surprise in same tick)
+{:constraints [(= method "POST")
+               (= (first (header "content-type")) "application/json")
+               (= tls-ext-types #{"0x0000" "0x0005" "0x000a" "0x000b" "0x000d" "0x0017" "0x0023" "0x002b" "0x002d" "0x0033"})]
+ :actions     [(rate-limit 83)]}
 ```
+
+Dimension accessors compose: `(first (header "content-type"))` extracts the first value of the `Content-Type` header. This is not a special-cased field — any header, cookie, or query parameter can be targeted with the same composition functions.
 
 ## Rule Engine
 
@@ -242,20 +253,20 @@ Adding a new tiebreaker is a one-line field insertion into the struct — no ari
 
 Every time a rule matches a request, the proxy increments a global counter (`Mutex<HashMap<u32, u64>>`) keyed by rule ID. Each sidecar tick, the counters are snapshotted, joined with the tree's `rule_labels` map (populated during compilation with `constraints_sexpr()` and action descriptions), and broadcast as a `RuleCounters` SSE event. The dashboard computes per-rule rates and overlays the top-5 rules as dashed lines on the enforcement chart.
 
-The compiled tree is stored behind an `ArcSwap<CompiledTree>`:
+The compiled tree is stored behind an `ArcSwap<ExprCompiledTree>`:
 - **Proxy** reads via `ArcSwap::load()` — wait-free, no locking, no contention
 - **Sidecar** writes via `ArcSwap::store()` — brief pointer swap, proxy sees the new tree on next request
 
 ### Rule Lifecycle
 
 1. **Generation**: Detection pipeline produces `Vec<Detection>` (field/value/rate_factor)
-2. **Compilation**: `compile_compound_rule()` creates a `RuleSpec` (constraints + action)
+2. **Compilation**: `compile_compound_rule_expr()` creates a `RuleExpr` with composable constraints (e.g., `(= (first (header "user-agent")) "python-requests/2.31.0")`)
 3. **Redundancy check**: `RuleManager::is_redundant()` rejects subsumed or over-broad rules
 4. **Upsert**: Rule added to active set with last-seen timestamp
-5. **Deploy**: All active rules compiled to a new `CompiledTree`, atomically swapped
+5. **Deploy**: All active rules compiled to a new `ExprCompiledTree` via `compile_expr()`, atomically swapped
 6. **Expire**: Rules not refreshed within TTL (300s) are removed
 
-Engram rules follow the same pipeline but skip redundancy checking and recalculate rate limits based on current `baseline_rps`.
+Engram rules are serialized as EDN strings (not JSON structs), enabling human-readable engram metadata and round-trip fidelity through `parse_edn()` / `to_edn()`. On re-detection, stored EDN rules are parsed back into `RuleExpr` values, rate limits recalculated to current `baseline_rps`, and deployed through the same pipeline.
 
 ## Rate Limiting
 
@@ -304,6 +315,102 @@ The frontend renders:
 - **Drain cap**: The sidecar drains at most 512 samples per pass to keep ticks responsive during bursts.
 - **Tick hybrid trigger**: Fires on sample count (200) or elapsed time (500ms), preventing both starvation at low volume and lag at high volume.
 - **Decay is lazy**: `ValueStats` tracks a `last_decay_req` counter and applies decay on read, avoiding per-request exponentiation across all tracked values.
+
+## Rule Tree Performance (Benchmarked)
+
+The expression tree (`ExprCompiledTree`) was stress-tested across rule counts (100 to 1M) and constraint complexity (1 to 6 dimensions), using randomized rules with unique per-rule rate limits and correctness verification at every point. Results from release builds (February 2026).
+
+### Evaluation Latency by Complexity (100K rules)
+
+Rules range from 1 constraint (src-ip only) to 6 constraints spanning both TLS and HTTP layers (src-ip + method + path-prefix + user-agent + content-type + sni):
+
+```
+ dims   layers    compile    nodes    hit p50    hit p99    miss p50    evals/s
+ ────   ──────    ───────    ─────    ───────    ───────    ────────    ───────
+    1     HTTP      227ms   100001      669ns     1139ns       116ns    1.5M/s
+    2     HTTP      195ms   100006      756ns     1336ns        50ns    1.3M/s
+    3     HTTP      246ms   100006      737ns     1367ns        48ns    1.4M/s
+    4     HTTP      293ms   100037     1282ns     2245ns        63ns    780K/s
+    5     HTTP      395ms   100096     1482ns     2731ns        48ns    675K/s
+    6  TLS+HTTP     516ms   100146     1800ns     3400ns        46ns    556K/s
+```
+
+Evaluation cost scales with tree **depth** (number of constraint dimensions), not rule count. Each level is one HashMap lookup. The jump at 4-dim comes from header accessor extraction (`(first (header "user-agent"))`) which involves a linear scan of the headers list — still under 2µs.
+
+### Evaluation Latency by Scale (fixed complexity)
+
+Holding complexity constant and scaling rules from 100 to 1M:
+
+```
+2-dim (ip + method)                        4-dim (ip + method + path + ua)
+─────────────────────────────────────      ─────────────────────────────────────
+  rules    compile    hit p50  miss p50      rules    compile    hit p50  miss p50
+    100       0ms      379ns     60ns          100       0ms      724ns     63ns
+  1,000       1ms      526ns     65ns        1,000       8ms      997ns     76ns
+ 10,000      20ms      816ns     70ns       10,000      35ms     1323ns     65ns
+100,000     318ms      960ns     71ns      100,000     335ms     1411ns     70ns
+500,000    1805ms     1154ns     65ns      500,000    2330ms     1689ns     72ns
+  1,000K   3160ms     1109ns     53ns        1,000K   4263ms     1875ns     50ns
+
+6-dim (ip + method + path + ua + ct + sni)
+─────────────────────────────────────────
+  rules    compile    hit p50  miss p50
+    100       3ms     1527ns     41ns
+  1,000       4ms     1670ns     48ns
+ 10,000      55ms     1636ns     43ns
+100,000     494ms     1921ns     40ns
+500,000    2788ms     2114ns     38ns
+  1,000K   5881ms     2573ns     48ns
+```
+
+Hit latency stays nearly flat as rules scale 10,000x. Miss latency is ~50ns regardless (falls through the root immediately). A single core at 6-dim complexity evaluates **~390K rules/sec** against a million-rule tree. At 2-dim, it exceeds **900K/sec**.
+
+### Mixed-Complexity Workload (100K rules)
+
+Simulates a realistic deployment with rules of varying specificity (10% 1-dim, 25% 2-dim, 30% 3-dim, 20% 4-dim, 10% 5-dim, 5% 6-dim):
+
+```
+ target    rules    hit p50    hit p99    miss p50    correct
+ ──────    ─────    ───────    ───────    ────────    ───────
+  1-dim    10000     1454ns     2676ns       124ns    2000/2000
+  2-dim    25000     1633ns     3004ns       124ns    2000/2000
+  3-dim    30000     1543ns     2682ns       126ns    2000/2000
+  4-dim    20000     1754ns     2846ns       122ns    2000/2000
+  5-dim    10000     2044ns     3387ns       122ns    2000/2000
+  6-dim     5000     2353ns     4078ns       122ns    2000/2000
+```
+
+All tiers achieve 100% correctness. A 16-core host could evaluate **~6M+ requests/sec** against a 100K mixed-complexity rule tree — well above any realistic HTTP throughput. This makes fully inline evaluation (no sampling) viable.
+
+### Compilation Cost
+
+Compilation is O(n) — each rule is touched once per dimension level:
+
+```
+ complexity    100     1K      10K     100K      500K      1M
+ ──────────   ────   ─────   ─────   ──────   ──────   ──────
+    2-dim      0ms     1ms    20ms    318ms    1.8s     3.2s
+    4-dim      0ms     8ms    35ms    335ms    2.3s     4.3s
+    6-dim      3ms     4ms    55ms    494ms    2.8s     5.9s
+```
+
+In practice, the detection system produces tens of rules per attack wave, making compilation sub-millisecond. The ArcSwap atomic flip means the proxy never blocks during recompilation.
+
+### Optimizations Applied
+
+- **Zero-clone recursion**: `compile_recursive` borrows rules (`&[&RuleExpr]`) instead of deep-cloning at each tree level. Only the winning action at terminal nodes is cloned.
+- **Lightweight dim ordering**: `compute_dim_order` counts rules per dimension instead of collecting all unique values — eliminates a million-entry HashMap.
+- **Hash-based fingerprint**: FNV hash over sorted rule identity hashes instead of concatenating and sorting 1M identity key strings.
+- **Lazy labels**: `rule_labels` computed on demand rather than eagerly for every rule at compilation.
+- **Cow canonical keys**: `canonical_key_cow()` borrows for the common `Value::Str` case, reducing heap allocations during tree grouping.
+
+These optimizations brought 1M-rule compilation from ~8.3s to 3.3s (release) for 2-dim rules, matching veth-lab's eBPF tree compiler.
+
+### Why This Matters
+
+Traditional WAF engines evaluate rules sequentially — O(n) per request, often involving regex matching against each rule's pattern. Adding rules linearly degrades throughput. The expression tree eliminates this entirely: rules are compiled into a discrimination DAG where evaluation is a fixed number of hash lookups (one per constraint dimension). At runtime, no rule is ever "checked" — the request's field values are hashed and used to navigate directly to the matching terminal node.
+
+The miss path makes this concrete: ~50ns regardless of tree size. A non-matching request does a single hash miss at the root and returns immediately. No rule was consulted. Even the most complex 6-dimension cross-layer rule (TLS fingerprint + method + path + user-agent + content-type + SNI) evaluates in under 2.6µs at 1M rules — faster than a single PCRE regex match in most production WAF engines. This is what makes fully inline enforcement viable without sampling: the evaluation cost is determined by the expressiveness of the rule language (number of dimensions), not the number of rules deployed.
 
 ## Crate Dependencies
 

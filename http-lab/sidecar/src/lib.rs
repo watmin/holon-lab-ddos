@@ -11,7 +11,7 @@
 //!   - Per-sample exponential decay on accumulation buffers
 //!   - Two-tier detection: subspace anomaly detection + engram-based fast mitigation
 //!
-//! Both loops share one RuleManager and write to the shared ArcSwap<CompiledTree>.
+//! Both loops share one RuleManager and write to the shared ArcSwap<ExprCompiledTree>.
 //! The proxy tasks read the tree via ArcSwap::load() — wait-free.
 
 pub mod detection;
@@ -31,8 +31,10 @@ use holon::kernel::{Encoder, VectorManager};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{info, warn};
 
-use http_proxy::types::{CompiledTree, RequestSample, RuleAction, RuleSpec, SampleMessage, TlsSample};
-use crate::detection::{compile_compound_rule, Detection};
+use http_proxy::expr::RuleExpr;
+use http_proxy::expr_tree::ExprCompiledTree;
+use http_proxy::types::{RequestSample, RuleAction, SampleMessage, TlsSample};
+use crate::detection::{compile_compound_rule_expr, Detection};
 use crate::detectors::SubspaceDetector;
 use crate::field_tracker::FieldTracker;
 use crate::metrics_server::{
@@ -91,7 +93,7 @@ const DECAY_HALF_LIFE: usize = 500;
 /// `engram_path`: if `Some`, load/save engram libraries to disk for persistence.
 pub async fn run(
     mut sample_rx: mpsc::Receiver<SampleMessage>,
-    tree: Arc<ArcSwap<CompiledTree>>,
+    tree: Arc<ArcSwap<ExprCompiledTree>>,
     engram_path: Option<String>,
     metrics_addr: SocketAddr,
 ) -> Result<()> {
@@ -344,7 +346,7 @@ pub async fn run(
                                 .take(3)
                                 .collect();
 
-                            if let Some(rule) = compile_compound_rule(&top_fields, true, estimated_rps, false) {
+                            if let Some(rule) = compile_compound_rule_expr(&top_fields, true, estimated_rps, false) {
                                 let mut mgr = rule_mgr.lock().await;
                                 if mgr.is_redundant(&rule).is_none() {
                                     let _ = event_tx.send(DashboardEvent::RuleEvent {
@@ -438,7 +440,7 @@ pub async fn run(
                                 }
                             }).collect();
 
-                            if let Some(rule) = compile_compound_rule(&top_fields, true, estimated_rps, false) {
+                            if let Some(rule) = compile_compound_rule_expr(&top_fields, true, estimated_rps, false) {
                                 let mut mgr = rule_mgr.lock().await;
                                 if mgr.is_redundant(&rule).is_none() {
                                     let _ = event_tx.send(DashboardEvent::RuleEvent {
@@ -698,37 +700,37 @@ async fn deploy_engram_rules(
     detector: &SubspaceDetector,
     engram_name: &str,
     rule_mgr: &Arc<Mutex<RuleManager>>,
-    tree: &Arc<ArcSwap<CompiledTree>>,
+    tree: &Arc<ArcSwap<ExprCompiledTree>>,
     event_tx: &broadcast::Sender<DashboardEvent>,
     baseline_rps: f64,
 ) {
-    let stored_rules: Vec<serde_json::Value> = detector.library.get(engram_name)
+    let stored_edns: Vec<String> = detector.library.get(engram_name)
         .and_then(|e| e.metadata().get("rules").cloned())
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
 
-    if stored_rules.is_empty() {
+    if stored_edns.is_empty() {
         warn!("  Engram '{}' has no stored rules", engram_name);
         return;
     }
 
-    let specs: Vec<RuleSpec> = stored_rules.iter().filter_map(|v| {
-        match serde_json::from_value::<RuleSpec>(v.clone()) {
-            Ok(mut spec) => {
-                if let RuleAction::RateLimit { ref mut rps } = spec.action {
+    let specs: Vec<RuleExpr> = stored_edns.iter().filter_map(|edn| {
+        match http_proxy::expr::parse_edn(edn) {
+            Ok(mut rule) => {
+                if let RuleAction::RateLimit { ref mut rps, .. } = rule.action {
                     *rps = baseline_rps.max(10.0) as u32;
                 }
-                Some(spec)
+                Some(rule)
             }
             Err(e) => {
-                warn!("  Failed to deserialize stored rule: {}", e);
+                warn!("  Failed to parse stored rule EDN: {}", e);
                 None
             }
         }
     }).collect();
 
     if specs.is_empty() {
-        warn!("  Engram '{}': {} stored values but 0 deserialized", engram_name, stored_rules.len());
+        warn!("  Engram '{}': {} stored values but 0 parsed", engram_name, stored_edns.len());
         return;
     }
 
@@ -766,18 +768,18 @@ async fn mint_engram_with_rules(
     let name = format!("{}-attack-{}", prefix, chrono::Utc::now().format("%Y%m%d-%H%M%S"));
     let surprise_map: HashMap<String, f64> = surprise.iter().cloned().collect();
 
-    let active_rules_json: Vec<serde_json::Value> = detector.attack_rules.iter()
-        .filter_map(|spec| serde_json::to_value(spec).ok())
+    let rule_edns: Vec<String> = detector.attack_rules.iter()
+        .map(|rule| rule.to_edn())
         .collect();
 
     let mut metadata: HashMap<String, serde_json::Value> = HashMap::new();
     metadata.insert("rps".into(), serde_json::json!(estimated_rps));
     metadata.insert("streak".into(), serde_json::json!(detector.anomaly_streak));
-    metadata.insert("rules".into(), serde_json::json!(active_rules_json));
+    metadata.insert("rules".into(), serde_json::json!(rule_edns));
 
     detector.mint_engram(&name, surprise_map, metadata);
     let lib_size = detector.library.len();
-    let rules_stored = active_rules_json.len();
+    let rules_stored = rule_edns.len();
     warn!("[{}] Engram minted: '{}' (library size: {}, {} rules stored)",
           prefix.to_uppercase(), name, lib_size, rules_stored);
     let _ = event_tx.send(DashboardEvent::DetectionEvent {
@@ -791,7 +793,7 @@ async fn mint_engram_with_rules(
 // Helpers
 // =============================================================================
 
-fn broadcast_dag(tree: &ArcSwap<CompiledTree>, event_tx: &broadcast::Sender<DashboardEvent>) {
+fn broadcast_dag(tree: &ArcSwap<ExprCompiledTree>, event_tx: &broadcast::Sender<DashboardEvent>) {
     let compiled = tree.load();
     let nodes = compiled.to_dag_nodes();
     if let Ok(json) = serde_json::to_string_pretty(&nodes) {

@@ -269,7 +269,7 @@ mod tests {
         };
 
         let action = tree.evaluate_req(&req);
-        assert!(matches!(action, Some((RuleAction::Block { status: 403 }, _))));
+        assert!(matches!(action, Some((RuleAction::Block { status: 403, .. }, _))));
     }
 
     fn make_test_req(method: &str, path: &str, ip_str: &str) -> crate::types::RequestSample {
@@ -286,7 +286,7 @@ mod tests {
     fn multiple_rules_different_dims() {
         let rules = vec![
             make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block()),
-            make_rule(FieldDim::SrcIp, "10.0.0.2", RuleAction::CloseConnection),
+            make_rule(FieldDim::SrcIp, "10.0.0.2", RuleAction::CloseConnection { name: None }),
         ];
         let tree = compile(&rules);
 
@@ -294,14 +294,14 @@ mod tests {
         let req2 = make_test_req("GET", "/", "10.0.0.2");
         let req3 = make_test_req("GET", "/", "10.0.0.3");
 
-        assert!(matches!(tree.evaluate_req(&req1), Some((RuleAction::Block { status: 403 }, _))));
-        assert!(matches!(tree.evaluate_req(&req2), Some((RuleAction::CloseConnection, _))));
+        assert!(matches!(tree.evaluate_req(&req1), Some((RuleAction::Block { status: 403, name: None }, _))));
+        assert!(matches!(tree.evaluate_req(&req2), Some((RuleAction::CloseConnection { name: None }, _))));
         assert!(tree.evaluate_req(&req3).is_none());
     }
 
     #[test]
     fn wildcard_rule_matches_all() {
-        let rule = RuleSpec::new(vec![], RuleAction::count("test"));
+        let rule = RuleSpec::new(vec![], RuleAction::count());
         let tree = compile(&[rule]);
 
         let req = make_test_req("GET", "/", "1.2.3.4");
@@ -328,7 +328,7 @@ mod tests {
 
         let req_other = make_test_req("GET", "/", "10.0.0.2");
         let action = tree.evaluate_req(&req_other);
-        assert!(matches!(action, Some((RuleAction::Pass, _))));
+        assert!(matches!(action, Some((RuleAction::Pass { .. }, _))));
     }
 
     #[test]
@@ -356,7 +356,7 @@ mod tests {
     fn compile_idempotent() {
         let rules = vec![
             make_rule(FieldDim::SrcIp, "10.0.0.1", RuleAction::block()),
-            make_rule(FieldDim::SrcIp, "10.0.0.2", RuleAction::CloseConnection),
+            make_rule(FieldDim::SrcIp, "10.0.0.2", RuleAction::CloseConnection { name: None }),
         ];
         let tree1 = compile(&rules);
         let tree2 = compile(&rules);
@@ -378,11 +378,11 @@ mod tests {
         let rules = vec![
             RuleSpec::new(
                 vec![Predicate::eq(FieldDim::PathPrefix, "/api/search")],
-                RuleAction::RateLimit { rps: 80 },
+                RuleAction::RateLimit { rps: 80, name: None },
             ),
             RuleSpec::new(
                 vec![Predicate::eq(FieldDim::TlsCipherSet, "abc123")],
-                RuleAction::CloseConnection,
+                RuleAction::CloseConnection { name: None },
             ),
         ];
         let tree = compile(&rules);

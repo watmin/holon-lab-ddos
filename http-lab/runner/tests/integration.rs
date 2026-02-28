@@ -25,8 +25,10 @@ use holon::kernel::{Encoder, VectorManager};
 
 use http_proxy::tls::accept_tls;
 use http_proxy::types::*;
+use http_proxy::expr::{Dimension, Expr, RuleExpr, Value};
+use http_proxy::expr_tree::{compile_expr, ExprCompiledTree};
 use http_proxy::http::serve_connection;
-use http_proxy::tree::compile;
+use http_proxy::enforcer::RateLimiter;
 
 // =============================================================================
 // TLS config helpers (self-signed certs via rcgen)
@@ -85,7 +87,7 @@ async fn setup() -> (
     SocketAddr,
     Arc<rustls::ClientConfig>,
     mpsc::Receiver<SampleMessage>,
-    Arc<ArcSwap<CompiledTree>>,
+    Arc<ArcSwap<ExprCompiledTree>>,
 ) {
     // 1. Start mock backend
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -97,7 +99,7 @@ async fn setup() -> (
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
     // 3. Shared state
-    let tree: Arc<ArcSwap<CompiledTree>> = Arc::new(ArcSwap::new(Arc::new(CompiledTree::empty())));
+    let tree: Arc<ArcSwap<ExprCompiledTree>> = Arc::new(ArcSwap::new(Arc::new(ExprCompiledTree::empty())));
     let (sample_tx, sample_rx) = mpsc::channel::<SampleMessage>(1024);
     let encoder = Arc::new(Encoder::new(VectorManager::new(4096)));
 
@@ -125,12 +127,14 @@ async fn setup() -> (
                             tls_ctx,
                             &encoder,
                         ));
+                        let rate_limiter = Arc::new(RateLimiter::new());
                         serve_connection(
                             tls_stream,
                             conn_ctx,
                             backend_addr,
                             tree,
                             sample_tx,
+                            rate_limiter,
                         ).await;
                     }
                     Err(_) => {}
@@ -253,9 +257,12 @@ async fn proxy_blocks_with_rule() {
     ).await;
     assert_eq!(status, StatusCode::OK);
 
-    // Deploy a block rule for all traffic (wildcard)
-    let rule = RuleSpec::new(vec![], RuleAction::block());
-    let compiled = compile(&[rule]);
+    // Deploy a block rule matching any method (effectively wildcard)
+    let rule = RuleExpr::new(
+        vec![Expr::eq(Dimension::method(), Value::str("GET"))],
+        RuleAction::block(),
+    );
+    let compiled = compile_expr(&[rule]);
     tree.store(Arc::new(compiled));
 
     // Second request (new connection) should be blocked
@@ -271,8 +278,11 @@ async fn proxy_blocks_with_rule() {
 async fn proxy_rate_limits_with_rule() {
     let (proxy_addr, client_config, _rx, tree) = setup().await;
 
-    let rule = RuleSpec::new(vec![], RuleAction::RateLimit { rps: 10 });
-    let compiled = compile(&[rule]);
+    let rule = RuleExpr::new(
+        vec![Expr::eq(Dimension::method(), Value::str("GET"))],
+        RuleAction::RateLimit { rps: 0, name: None },
+    );
+    let compiled = compile_expr(&[rule]);
     tree.store(Arc::new(compiled));
 
     let (status, body) = send_request(

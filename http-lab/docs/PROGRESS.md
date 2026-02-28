@@ -2,9 +2,9 @@
 
 **Status:** All attack types mitigated — GET floods, credential stuffing, scrapers, TLS-randomized floods
 **Date:** February 2026
-**Latest Update:** February 26, 2026
-**Result:** Autonomous L7 WAF with dual-tier VSA detection, adaptive TLS rule generation, engram memory, per-IP rate limiting, best-match specificity evaluator, per-rule counters, and real-time monitoring dashboard
-**Key Achievement:** Best-match evaluator with structured `Specificity` ranking — cross-layer TLS+HTTP rules correctly outrank single-layer rules via lexicographic comparison. Per-rule hit counters provide real-time visibility into which rules are actively mitigating traffic.
+**Latest Update:** February 28, 2026
+**Result:** Autonomous L7 WAF with composable rule expression language integrated end-to-end, Rete-spirit DAG compiler achieving sub-microsecond rule evaluation at million-rule scale, dual-tier VSA detection, adaptive TLS rule generation, engram memory with EDN-serialized rules, per-IP rate limiting, best-match specificity evaluator, per-rule counters, and real-time monitoring dashboard
+**Key Achievement:** The composable rule language is live — detection generates rules like `(= (first (header "content-type")) "application/json")` and cross-layer TLS+HTTP compound rules automatically. Expression tree evaluation is O(tree depth), not O(rule count). 1M rules evaluate in ~1.1µs to ~2.6µs. Miss path: ~50ns. A single core exceeds 900K evals/sec.
 
 ## Overview
 
@@ -22,14 +22,16 @@ and philosophy at Layer 7. Built in three days of after-hours work.
 | proxy/src/tls.rs | Done | ClientHello parser + ReplayStream + tokio-rustls handshake |
 | proxy/src/tls_names.rs | Done | Human-readable TLS name lookups (cipher suites, extensions, groups, etc.) |
 | proxy/src/http.rs | Done | Hyper HTTP/1.1 + upstream forwarding + sample enqueue + rate limit enforcement |
-| proxy/src/tree.rs | Done | Rete-spirit DAG compiler (12 dimensions, String keys), specificity scoring, rule labels |
-| proxy/src/enforcer.rs | Done | ArcSwap rule check + per-IP token bucket rate limiter, returns (Verdict, rule_id) |
+| proxy/src/expr.rs | Done | Composable rule expression language: RuleExpr, Expr, Dimension (26 fields), Operator (13 ops), Value types, EDN parser/serializer, dimension extraction |
+| proxy/src/expr_tree.rs | Done | Expression tree compiler: Rete-spirit DAG from RuleExpr, O(depth) evaluation, zero-clone compilation, dynamic dim ordering, guard predicates |
+| proxy/src/tree.rs | Done | Legacy DAG compiler (12 dimensions, String keys), specificity scoring, rule labels |
+| proxy/src/enforcer.rs | Done | ExprCompiledTree rule check + per-IP token bucket rate limiter, returns (Verdict, rule_id) |
 | runner/src/main.rs | Done | Binary: spawns proxy + sidecar, wires ArcSwap + channels + rate limiter |
 | sidecar/src/detectors.rs | Done | SubspaceDetector (tunable params) + EngramLibrary wrappers |
-| sidecar/src/detection.rs | Done | Detection → RuleSpec compilation (12 field dimensions) |
+| sidecar/src/detection.rs | Done | Detection → RuleExpr compilation via composable expression language |
 | sidecar/src/field_tracker.rs | Done | Per-field value tracking with decay, baseline freezing, concentration detection |
-| sidecar/src/rule_manager.rs | Done | Upsert, expire, redundancy check, compile, ArcSwap write |
-| sidecar/src/lib.rs | Done | Dual detection loops (TLS + REQ), concentration + surprise rule gen, engram memory |
+| sidecar/src/rule_manager.rs | Done | Upsert, expire, redundancy check, compile_expr, ArcSwap<ExprCompiledTree> write |
+| sidecar/src/lib.rs | Done | Dual detection loops (TLS + REQ), concentration + surprise rule gen, engram memory with EDN serialization |
 | sidecar/src/metrics_server.rs | Done | Axum SSE dashboard, /api/rules, /api/metrics/events, /metrics, /health, RuleCounters + DagSnapshot events |
 | sidecar/static/dashboard.html | Done | Real-time UI: uPlot charts, DAG viz, per-rule counters, detection state, rules, event log |
 | generator/src/main.rs | Done | Multi-phase HTTP flood with 5 TLS profiles, status code tracking |
@@ -101,7 +103,7 @@ and philosophy at Layer 7. Built in three days of after-hours work.
 - [x] `http.rs` — Integrated rate limiter: check `allow()` before forwarding, 429 on excess
 - [x] `lib.rs` — Rate factor calculation: `baseline_rps / estimated_rps` (veth-lab approach)
 - [x] `lib.rs` — Engram minting with surprise fingerprint + active rules stored as metadata
-- [x] `lib.rs` — Engram deployment: deserialize stored `RuleSpec`, recalculate rate limits to current baseline
+- [x] `lib.rs` — Engram deployment: parse stored EDN rules via `parse_edn()`, recalculate rate limits to current baseline
 - [x] `lib.rs` — Concentration-based rule generation: `find_concentrated_values(0.5)` replaces raw surprise for REQ rules
 - [x] `lib.rs` — FieldTracker baseline freezing: concentrated values during warmup excluded from attack attribution
 - [x] Engram persistence: load/save to disk as JSON
@@ -208,6 +210,88 @@ Specificity ranking (lexicographic, each field is an independent policy rule):
 
 **Result**: cross-layer TLS+HTTP rules now correctly beat single-layer TLS-only rules. HTTP-only rules preferred over TLS-only at same constraint count. Adding a new ranking tiebreaker is a one-line field insertion.
 
+### Phase 1n — Composable Rule Expression Language COMPLETE
+
+- [x] `expr.rs` — `RuleExpr` struct: constraints + action + optional comment/label/name fields
+- [x] `expr.rs` — `Expr` constraint type: operator + dimension + value (tier-1 tree-native, tier-2 guard predicates)
+- [x] `expr.rs` — `Dimension` enum: `Simple(SimpleDim)` + `Header(name)` + `Cookie(name)` + `Query(name)` + composition functions (`First`, `Last`, `Nth`, `Get`, `Key`, `Val`, `Count`, `Keys`, `Vals`, `SetOf`, `Lower`)
+- [x] `expr.rs` — `SimpleDim`: 26 field dimensions (11 HTTP + 15 TLS) covering request line, headers, cookies, query params, path parts, TLS scalar/set/list/map fields
+- [x] `expr.rs` — `Operator` enum: `Eq`, `Exists`, `Gt`, `Lt`, `Gte`, `Lte`, `Prefix`, `Suffix`, `Contains`, `Regex`, `Not`, `Subset`, `Superset`
+- [x] `expr.rs` — `Value` enum: `Str`, `Num`, `Bool`, `List`, `Set`, `Pair`, `Nil` with canonical key rendering
+- [x] `expr.rs` — EDN parser (via `edn-rs` crate): full round-trip `parse_rule_edn()` ↔ `to_edn()` / `to_edn_pretty()`
+- [x] `expr.rs` — `RuleAction` enum with structured `name: Option<(String, String)>` (namespace, name) for all variants
+- [x] `expr.rs` — Dimension extraction: `extract_from_request()` and `extract_from_tls()` resolve full accessor chains against live protocol data
+- [x] `docs/RULE-LANGUAGE.md` — full language specification with examples, dimension catalog, operator reference, composition functions
+
+**Result**: Lisp-like composable rule language with EDN serialization. Rules like `(= (first (header "user-agent")) "python-requests/2.31.0")` and `(exists (set (lower (keys query-params))) "debug")` express arbitrary constraints over TLS and HTTP fields. The language is extensible — new dimensions and operators can be added without changing the grammar or tree compiler.
+
+### Phase 1o — Expression Tree Compiler + Sub-Microsecond Evaluation COMPLETE
+
+- [x] `expr_tree.rs` — `ExprCompiledTree`: Rete-spirit DAG compiled from `Vec<RuleExpr>`, one level per constraint dimension
+- [x] `expr_tree.rs` — Dynamic dimension ordering: `compute_dim_order()` ranks dimensions by rule participation count for optimal branching
+- [x] `expr_tree.rs` — Dual match modes: `Exact` (single value → HashMap get, O(1)) and `Membership` (collection → iterate + probe, O(|collection|))
+- [x] `expr_tree.rs` — Guard predicates: tier-2 operators (prefix, suffix, contains, gt/lt, regex, subset/superset) evaluated as post-match filters on terminal nodes
+- [x] `expr_tree.rs` — Best-match DFS evaluator: explores specific + wildcard branches, selects highest `Specificity`
+- [x] `expr_tree.rs` — `evaluate_req()` and `evaluate_tls()` for HTTP and TLS-only rule evaluation
+- [x] `expr_tree.rs` — Zero-clone compilation: borrows rules (`&[&RuleExpr]`) during recursion, `Cow` canonical keys
+- [x] `expr_tree.rs` — FNV hash-based fingerprint for O(1) tree identity comparison
+- [x] `expr_tree.rs` — Lazy rule labels: deferred to access time, not computed during compilation
+- [x] `proxy/tests/tree_perf.rs` — Comprehensive performance benchmarks: complexity sweep (1–6 dims), scale sweep (100–1M rules), mixed-complexity workload
+
+Performance (release, February 2026):
+
+| Metric | 2-dim @ 1M rules | 6-dim @ 1M rules | Miss (any) |
+|--------|-------------------|-------------------|------------|
+| eval p50 | 1,109 ns | 2,573 ns | ~50 ns |
+| evals/sec/core | 900K+ | 390K+ | — |
+| compile time | 3.2s | 5.9s | — |
+
+Evaluation is O(tree depth). 100 rules or 1,000,000 — same number of hash lookups. Miss latency is ~50ns regardless of tree size (single hash miss at root). No rule is ever "checked" at runtime — field values navigate directly to the matching terminal. This is fundamentally different from traditional WAF architectures that do O(n) sequential rule evaluation.
+
+**Result**: expression tree achieves constant-time rule evaluation independent of rule count. A 16-core host can evaluate ~6M+ requests/sec against a 100K mixed-complexity rule tree. Fully inline enforcement is viable without sampling — the rule engine is no longer the bottleneck.
+
+### Phase 1p — Expression Tree Integration + Live Detection Pipeline COMPLETE
+
+- [x] `enforcer.rs` — Swapped from `CompiledTree` to `ExprCompiledTree` for both `evaluate()` and `evaluate_tls()`
+- [x] `http.rs` — `serve_connection` and `handle_request` now use `Arc<ArcSwap<ExprCompiledTree>>`
+- [x] `runner/main.rs` — Initializes `ArcSwap<ExprCompiledTree>::empty()`
+- [x] `sidecar/rule_manager.rs` — `RuleManager` stores `RuleExpr`, compiles with `compile_expr()`, deploys to `ArcSwap<ExprCompiledTree>`
+- [x] `sidecar/detectors.rs` — `attack_rules` changed from `Vec<RuleSpec>` to `Vec<RuleExpr>`
+- [x] `sidecar/lib.rs` — Detection loop uses `compile_compound_rule_expr()`, engram rules serialized/parsed as EDN strings
+- [x] `expr_tree.rs` — `to_dag_nodes()` added for DAG visualization, `rule_labels` populated during compilation
+- [x] `proxy/benches/tree_perf.rs` — Performance tests moved from `tests/` to `benches/` for on-demand invocation
+- [x] All 287 tests passing (237 proxy + 42 sidecar + 8 integration)
+- [x] Live validation: multi-attack scenario produces composable rules with accessor chains, TLS set matching, cross-layer compound rules
+
+Live-generated rules from the detection pipeline (first time the composable language was exercised end-to-end):
+
+```clojure
+;; HTTP path concentration
+{:constraints [(= path "/api/search")] :actions [(rate-limit 83)]}
+
+;; TLS fingerprint (set-based, order-independent)
+{:constraints [(= tls-ext-types #{"0x0000" "0x0005" ...})
+               (= tls-ciphers #{"0x00ff" "0x1301" ...})
+               (= tls-groups #{"0x0017" "0x0018" "0x001d"})]
+ :actions [(rate-limit 83)]}
+
+;; Composable accessor chain — first value of Content-Type header
+{:constraints [(= path "/api/v1/auth/login")
+               (= method "POST")
+               (= (first (header "content-type")) "application/json")]
+ :actions [(rate-limit 83)]}
+
+;; Cross-layer HTTP+TLS — compound rule spanning both protocol layers
+{:constraints [(= method "POST")
+               (= (first (header "content-type")) "application/json")
+               (= tls-ext-types #{"0x0000" "0x0005" ...})]
+ :actions [(rate-limit 83)]}
+```
+
+The system now produces complementary layered rules: an HTTP-path rule catches the attack at the endpoint level, while a cross-layer HTTP+TLS rule catches the attacker by their TLS fingerprint regardless of which endpoint they target. The redundancy checker correctly allows both because neither subsumes the other — they defend different attack surfaces with the same composable language.
+
+**Result**: the full pipeline from anomaly detection through rule generation to sub-microsecond enforcement now speaks the composable expression language. Legacy `RuleSpec`/`CompiledTree` types remain in the codebase but are no longer in the live path. The only remaining gap is `FieldTracker` coverage — expanding the tracked fields unlocks all 26+ dimensions the language already supports.
+
 ## Key Decisions
 
 ### 2026-02-23
@@ -266,6 +350,29 @@ Specificity ranking (lexicographic, each field is an independent policy rule):
 - Cross-layer (TLS+HTTP) rules: 2 layers always beats 1 layer, regardless of constraint count — cross-layer correlation is the strongest signal
 - HTTP > TLS tiebreaker: at same layer count, HTTP constraints (path, method, UA) are more actionable than TLS-only
 
+### 2026-02-27 / 2026-02-28 (Rule Language + Expression Tree)
+
+- Composable rule language over EDN — Clojure-like s-expressions, not a custom DSL. Rules are data.
+- `edn-rs` crate for parsing instead of hand-rolled parser — veth-lab parity, standard format
+- Dimension accessor chains (`(first (header "user-agent"))`) compose generically — no magic named headers
+- `Value::Set` uses a proper set type with quoted string elements in EDN serialization — not comma-delimited strings
+- `RuleAction` and `RuleExpr` parity with veth-lab: structured names `(namespace, name)`, optional comment/label
+- `RateLimit` period extensibility deferred — current structure supports `(rate-limit (period (minutes 5)) 300)` as additive future work
+- Tree compiler zero-clone: `&[&RuleExpr]` slices through recursion instead of deep-cloning `RuleExpr` vecs at each level
+- `canonical_key_cow()` returns `Cow<'_, str>` for zero-alloc grouping on the hot path
+- `compute_dim_order` simplified to rule-count-per-dimension instead of unique-value-set collection — eliminates million-entry HashMaps
+- Hash-based fingerprint (FNV over sorted rule identity hashes) instead of string concatenation — O(n) instead of O(n log n) with less allocation
+- Lazy rule labels — only materialized when the dashboard requests them, not during compilation of 1M rules that may never be displayed
+
+### 2026-02-28 (Expression Tree Integration)
+
+- Full pipeline swap from `RuleSpec`/`CompiledTree` to `RuleExpr`/`ExprCompiledTree` — detection through enforcement
+- Engram rules serialized as EDN strings instead of JSON structs — human-readable, round-trip stable via `parse_edn()` / `to_edn()`
+- Performance benchmarks moved from `tests/` to `benches/` — `cargo test` stays fast, `cargo bench` for on-demand profiling
+- Cross-layer compound rules emerge naturally: REQ detector and TLS detector independently generate complementary rules in the same attack
+- Redundancy checker correctly allows complementary rules: `path + method + content-type` and `method + content-type + tls-ext-types` target different surfaces
+- Legacy types (`RuleSpec`, `CompiledTree`, `tree.rs`) retained but no longer in live path — available for reference/comparison
+
 ## Performance Observations
 
 - Python mock backend is the throughput bottleneck — proxy serves 429s much faster than forwarding to origin (Rust vs Python, expected)
@@ -275,6 +382,11 @@ Specificity ranking (lexicographic, each field is an independent policy rule):
 - Engram re-detection deploys rules in 1 tick vs 3+ ticks for first-time detection
 - Per-sample processing: ~0.4ms (encode_walkable ~0.2ms, CCIPCA score ~0.05ms, field tracking ~0.05ms, overhead ~0.1ms)
 - Theoretical inline WAF throughput: ~2,800 RPS/core, ~45K RPS on 16 cores (score + enforce are read-only, scale linearly)
+- **Rule evaluation is scale-independent**: 1M rules evaluate in ~1.1µs (2-dim) to ~2.6µs (6-dim). Cost is O(tree depth), not O(rule count). 10,000x more rules adds <2x latency.
+- **Miss path is ~50ns**: a non-matching request does one hash miss at the root and returns. No rules consulted.
+- **Compilation scales linearly**: 1M 2-dim rules compile in 3.2s, 6-dim in 5.9s. In practice, attack waves produce tens of rules — sub-millisecond compilation.
+- **Mixed-complexity realistic workload**: 100K rules with distribution from 1-dim to 6-dim, all p50 evals under 2.4µs, 100% correctness across all tiers.
+- **Single-core rule evaluation throughput**: 900K+ evals/sec (2-dim), 556K+ (6-dim). On 16 cores: ~6M+ evals/sec for mixed workloads — rule engine is not the bottleneck.
 
 ## Resolved Questions
 
