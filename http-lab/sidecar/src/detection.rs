@@ -3,11 +3,17 @@
 //! Adapted from veth-lab/sidecar/src/detection.rs for HTTP field dimensions.
 //! Takes a list of anomalous fields and compiles them into RuleSpecs (old)
 //! or RuleExprs (new expression language).
+//!
+//! Extended with SurpriseDetection → Expr conversion for VSA-probed fields:
+//!   Content → `(= (first (header "name")) "value")`
+//!   Shape   → `(= (count (first (header "name"))) length)`
+//!   Duplicate → `(= (count (header "name")) count)`
 
 use serde::{Deserialize, Serialize};
 
 use http_proxy::expr::{Dimension, Expr, RuleExpr, SimpleDim, Value};
 use http_proxy::types::{FieldDim, Predicate, RuleAction, RuleSpec};
+use crate::detectors::{DetectionKind, SurpriseDetection};
 
 /// A single field-level anomaly detection result.
 pub struct Detection {
@@ -95,6 +101,151 @@ fn parse_comma_set(s: &str) -> Value {
         return Value::Set(Default::default());
     }
     Value::set_from_strs(s.split(',').map(|v| v.trim()))
+}
+
+/// Convert a SurpriseDetection (from VSA drill-down probing) into an Expr.
+///
+/// Maps (top_name, kind) → Dimension composition:
+///   Content + headers       → `(= (first (header "name")) "value")`
+///   Content + path_parts    → `(= (nth path-parts idx) "value")`
+///   Content + cookies       → `(= (first (cookie "name")) "value")`
+///   Shape + header_shapes   → `(= (count (first (header "name"))) len)`
+///   Shape + path_shape      → `(= (count (nth path-parts idx)) len)`
+///   Duplicate + headers     → `(= (count (header "name")) count)`
+pub fn surprise_to_expr(det: &SurpriseDetection) -> Option<Expr> {
+    match det.kind {
+        DetectionKind::Content => {
+            match det.top_name.as_str() {
+                "headers" => {
+                    Some(Expr::eq(
+                        Dimension::header_first(&det.header_name),
+                        Value::str(&det.value),
+                    ))
+                }
+                "path_parts" => {
+                    if let Some(idx) = det.header_name.strip_prefix("path[").and_then(|s| s.strip_suffix(']')) {
+                        if let Ok(i) = idx.parse::<i32>() {
+                            return Some(Expr::eq(
+                                Dimension::Nth(Box::new(Dimension::Simple(SimpleDim::PathParts)), i),
+                                Value::str(&det.value),
+                            ));
+                        }
+                    }
+                    None
+                }
+                "cookies" => {
+                    Some(Expr::eq(
+                        Dimension::cookie_first(&det.header_name),
+                        Value::str(&det.value),
+                    ))
+                }
+                _ => None,
+            }
+        }
+        DetectionKind::Shape => {
+            let len: i64 = det.value.parse().ok()?;
+            match det.top_name.as_str() {
+                "header_shapes" | "headers" => {
+                    Some(Expr::eq(
+                        Dimension::Count(Box::new(
+                            Dimension::First(Box::new(Dimension::Header(det.header_name.clone())))
+                        )),
+                        Value::num(len),
+                    ))
+                }
+                "path_shape" | "path_parts" => {
+                    if let Some(idx) = det.header_name.strip_prefix("path[").and_then(|s| s.strip_suffix(']')) {
+                        if let Ok(i) = idx.parse::<i32>() {
+                            return Some(Expr::eq(
+                                Dimension::Count(Box::new(
+                                    Dimension::Nth(Box::new(Dimension::Simple(SimpleDim::PathParts)), i)
+                                )),
+                                Value::num(len),
+                            ));
+                        }
+                    }
+                    None
+                }
+                "query_shape" => {
+                    None
+                }
+                _ => None,
+            }
+        }
+        DetectionKind::Duplicate => {
+            let count: i64 = det.value.parse().ok()?;
+            Some(Expr::eq(
+                Dimension::Count(Box::new(Dimension::Header(det.header_name.clone()))),
+                Value::num(count),
+            ))
+        }
+    }
+}
+
+/// Merge FieldTracker-based detections with surprise-based detections into
+/// a single constraint list, deduplicating by header name.
+pub fn merge_detections_to_exprs(
+    field_detections: &[Detection],
+    surprise_detections: &[SurpriseDetection],
+) -> Vec<Expr> {
+    let mut exprs: Vec<Expr> = Vec::new();
+    let mut seen_headers: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // FieldTracker detections first (they cover the 12 scalar fields)
+    for d in field_detections {
+        if let Some(expr) = d.to_expr() {
+            let key = match d.field.as_str() {
+                "host" => "host".to_string(),
+                "user_agent" => "user-agent".to_string(),
+                "content_type" => "content-type".to_string(),
+                _ => d.field.clone(),
+            };
+            seen_headers.insert(key);
+            exprs.push(expr);
+        }
+    }
+
+    // Surprise detections (content-before-shape, already sorted)
+    for sd in surprise_detections {
+        if seen_headers.contains(&sd.header_name) {
+            continue;
+        }
+        if let Some(expr) = surprise_to_expr(sd) {
+            seen_headers.insert(sd.header_name.clone());
+            exprs.push(expr);
+        }
+    }
+
+    exprs
+}
+
+/// Compile merged detections (field + surprise) into a compound RuleExpr.
+pub fn compile_merged_rule_expr(
+    field_detections: &[Detection],
+    surprise_detections: &[SurpriseDetection],
+    use_rate_limit: bool,
+    estimated_rps: f64,
+    connection_level: bool,
+) -> Option<RuleExpr> {
+    let constraints = merge_detections_to_exprs(field_detections, surprise_detections);
+    if constraints.is_empty() { return None; }
+
+    let rate_factor = field_detections.first()
+        .map(|d| d.rate_factor)
+        .or_else(|| surprise_detections.first().map(|d| d.rate_factor))
+        .unwrap_or(1.0);
+
+    let allowed_rps = (estimated_rps * rate_factor).max(10.0) as u32;
+
+    let action = if connection_level {
+        RuleAction::CloseConnection { name: None }
+    } else if use_rate_limit {
+        RuleAction::RateLimit { rps: allowed_rps, name: None }
+    } else {
+        RuleAction::block()
+    };
+
+    Some(RuleExpr::new(constraints, action))
 }
 
 /// Compile multiple detections into a compound RuleExpr (new expression tree).
@@ -432,5 +583,109 @@ mod tests {
         } else {
             panic!("expected Set");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Surprise detection → Expr tests
+    // -----------------------------------------------------------------------
+
+    fn sdet(kind: DetectionKind, header_name: &str, value: &str, top_name: &str) -> SurpriseDetection {
+        SurpriseDetection {
+            kind,
+            header_name: header_name.to_string(),
+            value: value.to_string(),
+            top_name: top_name.to_string(),
+            rate_factor: 0.1,
+        }
+    }
+
+    #[test]
+    fn surprise_content_header() {
+        let sd = sdet(DetectionKind::Content, "user-agent", "bot/1.0", "headers");
+        let expr = surprise_to_expr(&sd).unwrap();
+        assert_eq!(expr.dim, Dimension::header_first("user-agent"));
+        assert_eq!(expr.value, Value::str("bot/1.0"));
+    }
+
+    #[test]
+    fn surprise_shape_header() {
+        let sd = sdet(DetectionKind::Shape, "user-agent", "26", "header_shapes");
+        let expr = surprise_to_expr(&sd).unwrap();
+        assert_eq!(
+            expr.dim,
+            Dimension::Count(Box::new(Dimension::First(Box::new(Dimension::Header("user-agent".to_string())))))
+        );
+        assert_eq!(expr.value, Value::num(26));
+    }
+
+    #[test]
+    fn surprise_duplicate_header() {
+        let sd = sdet(DetectionKind::Duplicate, "host", "2", "headers");
+        let expr = surprise_to_expr(&sd).unwrap();
+        assert_eq!(
+            expr.dim,
+            Dimension::Count(Box::new(Dimension::Header("host".to_string())))
+        );
+        assert_eq!(expr.value, Value::num(2));
+    }
+
+    #[test]
+    fn surprise_content_path_part() {
+        let sd = sdet(DetectionKind::Content, "path[1]", "api", "path_parts");
+        let expr = surprise_to_expr(&sd).unwrap();
+        assert_eq!(
+            expr.dim,
+            Dimension::Nth(Box::new(Dimension::Simple(SimpleDim::PathParts)), 1)
+        );
+        assert_eq!(expr.value, Value::str("api"));
+    }
+
+    #[test]
+    fn surprise_shape_path() {
+        let sd = sdet(DetectionKind::Shape, "path[1]", "3", "path_shape");
+        let expr = surprise_to_expr(&sd).unwrap();
+        assert_eq!(
+            expr.dim,
+            Dimension::Count(Box::new(
+                Dimension::Nth(Box::new(Dimension::Simple(SimpleDim::PathParts)), 1)
+            ))
+        );
+        assert_eq!(expr.value, Value::num(3));
+    }
+
+    #[test]
+    fn surprise_content_cookie() {
+        let sd = sdet(DetectionKind::Content, "session", "exploit", "cookies");
+        let expr = surprise_to_expr(&sd).unwrap();
+        assert_eq!(expr.dim, Dimension::cookie_first("session"));
+        assert_eq!(expr.value, Value::str("exploit"));
+    }
+
+    #[test]
+    fn surprise_unknown_top_returns_none() {
+        let sd = sdet(DetectionKind::Content, "foo", "bar", "unknown_top");
+        assert!(surprise_to_expr(&sd).is_none());
+    }
+
+    #[test]
+    fn merge_deduplicates_by_header_name() {
+        let field_dets = vec![det("user_agent", "bot/1.0")];
+        let surprise_dets = vec![
+            sdet(DetectionKind::Content, "user-agent", "bot/1.0", "headers"),
+            sdet(DetectionKind::Content, "accept", "text/html", "headers"),
+        ];
+        let exprs = merge_detections_to_exprs(&field_dets, &surprise_dets);
+        assert_eq!(exprs.len(), 2);
+    }
+
+    #[test]
+    fn compile_merged_rule_expr_basic() {
+        let field_dets = vec![det("method", "POST")];
+        let surprise_dets = vec![
+            sdet(DetectionKind::Shape, "user-agent", "26", "header_shapes"),
+        ];
+        let rule = compile_merged_rule_expr(&field_dets, &surprise_dets, true, 100.0, false).unwrap();
+        assert_eq!(rule.constraints.len(), 2);
+        assert!(matches!(rule.action, RuleAction::RateLimit { .. }));
     }
 }

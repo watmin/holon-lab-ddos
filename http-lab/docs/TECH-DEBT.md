@@ -1,17 +1,19 @@
 # http-lab Technical Debt & Improvements
 
-Captured 2026-02-26. Not blocking current feature work — address when stabilizing.
+Captured 2026-02-26, updated 2026-02-28. Not blocking current feature work — address when stabilizing.
 
 ## 1. Split types.rs (~1,900 lines)
 
 `proxy/src/types.rs` is the largest file and mixes several concerns:
 
 - **Data model**: `TlsContext`, `RequestSample`, `RuleSpec`, `Predicate`, `FieldDim`, `RuleAction`
-- **Walkable implementations**: `encode_walkable()` for both TLS and HTTP
+- **Walkable implementations**: `encode_walkable()` for both TLS and HTTP (including shape encoding)
 - **EDN serialization**: `to_edn_pretty()`, `to_edn_compact()`, `constraints_sexpr()`
 - **DFS evaluator**: `evaluate_req()`, `evaluate_tls()`, `dfs_req()`, `dfs_tls()`, `pick_best()`
 - **Specificity ranking**: `Specificity` struct and layer classification
 - **DAG serialization**: `DagNode`, `DagEdge`, `to_dag_nodes()`
+
+Note: `expr.rs` (2,343 lines) and `expr_tree.rs` (2,299 lines) also warrant review. `expr.rs` mixes dimension definitions, EDN parsing, value types, and extraction logic. `expr_tree.rs` mixes tree compilation, DFS evaluation, specificity ranking, and serialization. These are structured similarly to `types.rs` and would benefit from the same splitting approach.
 
 Suggested split:
 
@@ -29,19 +31,22 @@ Tests for each module move with their code. No public API changes needed; just r
 
 ## 2. Test Coverage Gaps
 
-Current test distribution (111 total):
+Current test distribution (301 total):
 
 | File | Tests | Risk |
 |------|-------|------|
+| `expr.rs` | 106 | Low — comprehensive coverage of dimension extraction, EDN round-trip, value types |
+| `expr_tree.rs` | 48 | Low — tree compilation, evaluation, specificity, DAG serialization |
 | `types.rs` | 37 | Low — well covered |
+| `detection.rs` | 36 | Low — surprise_to_expr, merge, compile paths |
 | `tls.rs` | 22 | Low — parser edge cases covered |
 | `enforcer.rs` | 11 | Low |
-| `detection.rs` | 11 | Low |
-| `tree.rs` | 9 | Medium — compiler correctness is critical |
+| `detectors.rs` | 11 | Low — drilldown_probe, SurpriseHistory |
+| `tree.rs` | 9 | Low — legacy compiler (no longer in live path) |
 | `rule_manager.rs` | 9 | Low |
 | `field_tracker.rs` | 6 | Medium — decay math is subtle |
 | `http.rs` | 6 | Low |
-| **`sidecar/lib.rs`** | **0** | **High — 856 lines, orchestrates entire detection pipeline** |
+| **`sidecar/lib.rs`** | **0** | **High — 902 lines, orchestrates entire detection pipeline** |
 
 Priority additions:
 

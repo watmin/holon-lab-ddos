@@ -1,12 +1,16 @@
-//! SubspaceDetector and EngramLibrary wrappers for HTTP fields.
+//! SubspaceDetector, EngramLibrary wrappers, and surprise-driven attribution
+//! for HTTP fields.
 //!
 //! Adapted from veth-lab/sidecar/src/detectors.rs with HTTP-specific fields.
+//! Adds ProbeTarget-based drill-down probing and SurpriseHistory for
+//! cross-tick consistency detection without per-key HashMaps.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use holon::kernel::{Encoder, Primitives, Vector};
 use holon::memory::{EngramLibrary, OnlineSubspace};
+use http_proxy::types::RequestSample;
 use tracing::{error, info};
 
 // =============================================================================
@@ -152,6 +156,443 @@ impl SubspaceDetector {
 }
 
 // =============================================================================
+// ProbeTarget — structured field identification for drill-down probing
+// =============================================================================
+
+/// Identifies a specific field or position within the Walkable encoding tree.
+/// Uses programmer-controlled `&'static str` names and `usize` indices —
+/// never user-controlled strings — to prevent key poisoning.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ProbeTarget {
+    /// Top-level Walkable field: "headers", "header_shapes", "path_shape", etc.
+    TopLevel(&'static str),
+    /// Positional item within a top-level list: "headers.[2]"
+    Position(&'static str, usize),
+    /// Nested position within a positional item: "headers.[2].[1]"
+    Nested(&'static str, usize, usize),
+}
+
+impl ProbeTarget {
+    /// Build the role key string matching the encoder's `make_path` convention.
+    pub fn role_key(&self) -> String {
+        match self {
+            Self::TopLevel(name) => name.to_string(),
+            Self::Position(name, i) => format!("{}.[{}]", name, i),
+            Self::Nested(name, i, j) => format!("{}.[{}].[{}]", name, i, j),
+        }
+    }
+}
+
+/// Categorizes the nature of a detection for rule generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DetectionKind {
+    /// Literal value match: `(= (first (header "ua")) "bot/1.0")`
+    Content,
+    /// Length match: `(= (count (first (header "ua"))) 26)`
+    Shape,
+    /// Duplicate count: `(= (count (header "host")) 2)`
+    Duplicate,
+}
+
+/// A single probe result with both literal and structural values.
+#[derive(Debug, Clone)]
+pub struct ProbeHit {
+    pub target: ProbeTarget,
+    pub score: f64,
+    pub content_value: String,
+    pub shape_value: usize,
+    pub header_name: String,
+}
+
+/// Top-level Walkable fields to sweep during surprise probing.
+const PROBE_TOP_LEVELS: &[&str] = &[
+    "headers", "header_shapes", "path_shape", "query_shape",
+    "path_parts", "query_parts", "header_order", "cookies",
+];
+
+/// Drill-down probing: probe the anomalous component at top-level,
+/// then positionally drill into anomalous top-level fields.
+/// Returns ranked `ProbeHit` list with literal values from the sample.
+pub fn drilldown_probe(
+    detector: &SubspaceDetector,
+    vec_f64: &[f64],
+    encoder: &Encoder,
+    sample: &RequestSample,
+) -> Vec<ProbeHit> {
+    let anomaly = detector.baseline.anomalous_component(vec_f64);
+    let anomaly_vec = Vector::from_f64(&anomaly);
+
+    let probe_norm = |key: &str| -> f64 {
+        let role = encoder.get_vector(key);
+        let unbound = Primitives::bind(&anomaly_vec, &role);
+        unbound.data().iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt()
+    };
+
+    let mut top_scores: Vec<(&str, f64)> = PROBE_TOP_LEVELS.iter()
+        .map(|&name| (name, probe_norm(name)))
+        .collect();
+    top_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut hits: Vec<ProbeHit> = Vec::new();
+
+    for &(top_name, top_score) in top_scores.iter().take(4) {
+        if top_score < 1.0 {
+            continue;
+        }
+
+        match top_name {
+            "headers" => {
+                for (i, (hdr_name, hdr_val)) in sample.headers.iter().enumerate() {
+                    let value_key = format!("headers.[{}].[1]", i);
+                    let score = probe_norm(&value_key);
+                    if score > 1.0 {
+                        hits.push(ProbeHit {
+                            target: ProbeTarget::Nested("headers", i, 1),
+                            score,
+                            content_value: hdr_val.clone(),
+                            shape_value: hdr_val.len(),
+                            header_name: hdr_name.clone(),
+                        });
+                    }
+                }
+            }
+            "header_shapes" => {
+                for (i, (hdr_name, hdr_val)) in sample.headers.iter().enumerate() {
+                    let len_key = format!("header_shapes.[{}].[1]", i);
+                    let score = probe_norm(&len_key);
+                    if score > 1.0 {
+                        hits.push(ProbeHit {
+                            target: ProbeTarget::Nested("header_shapes", i, 1),
+                            score,
+                            content_value: hdr_val.clone(),
+                            shape_value: hdr_val.len(),
+                            header_name: hdr_name.clone(),
+                        });
+                    }
+                }
+            }
+            "path_shape" => {
+                let parts: Vec<&str> = sample.path.split('/').collect();
+                for (i, part) in parts.iter().enumerate() {
+                    let key = format!("path_shape.[{}]", i);
+                    let score = probe_norm(&key);
+                    if score > 1.0 {
+                        hits.push(ProbeHit {
+                            target: ProbeTarget::Position("path_shape", i),
+                            score,
+                            content_value: part.to_string(),
+                            shape_value: part.len(),
+                            header_name: format!("path[{}]", i),
+                        });
+                    }
+                }
+            }
+            "query_shape" => {
+                if let Some(ref q) = sample.query {
+                    let segs: Vec<&str> = q.split('&').filter(|s| !s.is_empty()).collect();
+                    for (i, seg) in segs.iter().enumerate() {
+                        let key = format!("query_shape.[{}]", i);
+                        let score = probe_norm(&key);
+                        if score > 1.0 {
+                            hits.push(ProbeHit {
+                                target: ProbeTarget::Position("query_shape", i),
+                                score,
+                                content_value: seg.to_string(),
+                                shape_value: seg.len(),
+                                header_name: format!("query[{}]", i),
+                            });
+                        }
+                    }
+                }
+            }
+            "path_parts" => {
+                let parts: Vec<&str> = sample.path.split('/').collect();
+                for (i, part) in parts.iter().enumerate() {
+                    let key = format!("path_parts.[{}]", i);
+                    let score = probe_norm(&key);
+                    if score > 1.0 {
+                        hits.push(ProbeHit {
+                            target: ProbeTarget::Position("path_parts", i),
+                            score,
+                            content_value: part.to_string(),
+                            shape_value: part.len(),
+                            header_name: format!("path[{}]", i),
+                        });
+                    }
+                }
+            }
+            "cookies" => {
+                for (i, (ck_name, ck_val)) in sample.cookies.iter().enumerate() {
+                    let val_key = format!("cookies.[{}].[1]", i);
+                    let score = probe_norm(&val_key);
+                    if score > 1.0 {
+                        hits.push(ProbeHit {
+                            target: ProbeTarget::Nested("cookies", i, 1),
+                            score,
+                            content_value: ck_val.clone(),
+                            shape_value: ck_val.len(),
+                            header_name: ck_name.clone(),
+                        });
+                    }
+                }
+            }
+            _ => {
+                let score = top_score;
+                hits.push(ProbeHit {
+                    target: ProbeTarget::TopLevel(top_name),
+                    score,
+                    content_value: String::new(),
+                    shape_value: 0,
+                    header_name: top_name.to_string(),
+                });
+            }
+        }
+    }
+
+    // Check for duplicate headers: count how many times each header name appears
+    let mut name_counts: HashMap<&str, usize> = HashMap::new();
+    for (name, _) in &sample.headers {
+        *name_counts.entry(name.as_str()).or_default() += 1;
+    }
+    for (&name, &count) in &name_counts {
+        if count > 1 {
+            hits.push(ProbeHit {
+                target: ProbeTarget::TopLevel("headers"),
+                score: 5.0, // synthetic high score for duplicate anomaly
+                content_value: count.to_string(),
+                shape_value: count,
+                header_name: name.to_string(),
+            });
+        }
+    }
+
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits
+}
+
+// =============================================================================
+// SurpriseHistory — cross-tick consistency for content-before-shape prioritization
+// =============================================================================
+
+use std::collections::VecDeque;
+
+/// Ring buffer of recent anomalous ticks' probe results.
+/// Tracks cross-tick consistency to determine whether a Content or Shape rule
+/// should be generated, without per-key HashMaps.
+pub struct SurpriseHistory {
+    recent: VecDeque<Vec<ProbeHit>>,
+    capacity: usize,
+}
+
+impl SurpriseHistory {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            recent: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Push a new tick's probe hits into the ring buffer.
+    pub fn push(&mut self, hits: Vec<ProbeHit>) {
+        if self.recent.len() >= self.capacity {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(hits);
+    }
+
+    /// Clear the history (e.g., when an attack ends).
+    pub fn clear(&mut self) {
+        self.recent.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.recent.len()
+    }
+
+    /// Derive detections from cross-tick consistency.
+    ///
+    /// For each header position that appears in the top-N hits across
+    /// `min_ticks`+ recent ticks, determine:
+    ///   - Content: same literal value across all appearances → surgical rule
+    ///   - Shape: different values but same length → structural rule (fallback)
+    ///   - Duplicate: header name appears multiple times → count rule
+    ///
+    /// Returns detections ordered: Content first, then Shape, then Duplicate.
+    pub fn derive_detections(&self, min_ticks: usize, rate_factor: f64) -> Vec<SurpriseDetection> {
+        if self.recent.len() < min_ticks {
+            return Vec::new();
+        }
+
+        let top_n = 5;
+        let mut detections = Vec::new();
+
+        // Collect header_name → [(content_value, shape_value, detection_kind_hint)] across ticks.
+        // We key on (top_level_name, header_name) to group positional hits for the same field.
+        let mut field_hits: HashMap<(String, String), Vec<(String, usize)>> = HashMap::new();
+        // Track duplicate header entries separately
+        let mut duplicate_hits: HashMap<String, Vec<usize>> = HashMap::new();
+
+        for tick in &self.recent {
+            let mut seen_in_tick: HashMap<(String, String), bool> = HashMap::new();
+
+            for hit in tick.iter().take(top_n) {
+                let top_name = match &hit.target {
+                    ProbeTarget::TopLevel(n) => n.to_string(),
+                    ProbeTarget::Position(n, _) => n.to_string(),
+                    ProbeTarget::Nested(n, _, _) => n.to_string(),
+                };
+
+                // Duplicate header detection: stored as TopLevel("headers") with count in content_value
+                if top_name == "headers"
+                    && matches!(&hit.target, ProbeTarget::TopLevel(_))
+                    && hit.content_value.parse::<usize>().is_ok()
+                {
+                    duplicate_hits
+                        .entry(hit.header_name.clone())
+                        .or_default()
+                        .push(hit.shape_value);
+                    continue;
+                }
+
+                let key = (top_name.clone(), hit.header_name.clone());
+                if seen_in_tick.contains_key(&key) {
+                    continue;
+                }
+                seen_in_tick.insert(key.clone(), true);
+
+                field_hits
+                    .entry(key)
+                    .or_default()
+                    .push((hit.content_value.clone(), hit.shape_value));
+            }
+        }
+
+        // Content-before-shape prioritization
+        for ((top_name, header_name), values) in &field_hits {
+            if values.len() < min_ticks {
+                continue;
+            }
+
+            let first_content = &values[0].0;
+            let all_same_content = !first_content.is_empty()
+                && values.iter().all(|(v, _)| v == first_content);
+
+            if all_same_content {
+                let kind = if top_name == "header_shapes" || top_name == "path_shape" || top_name == "query_shape" {
+                    DetectionKind::Shape
+                } else {
+                    DetectionKind::Content
+                };
+                detections.push(SurpriseDetection {
+                    kind,
+                    header_name: header_name.clone(),
+                    value: first_content.clone(),
+                    top_name: top_name.clone(),
+                    rate_factor,
+                });
+                continue;
+            }
+
+            let first_shape = values[0].1;
+            let all_same_shape = values.iter().all(|(_, s)| *s == first_shape);
+
+            if all_same_shape && first_shape > 0 {
+                detections.push(SurpriseDetection {
+                    kind: DetectionKind::Shape,
+                    header_name: header_name.clone(),
+                    value: first_shape.to_string(),
+                    top_name: top_name.clone(),
+                    rate_factor,
+                });
+            }
+        }
+
+        // Duplicate detections
+        for (header_name, counts) in &duplicate_hits {
+            if counts.len() >= min_ticks {
+                let first = counts[0];
+                if counts.iter().all(|&c| c == first) {
+                    detections.push(SurpriseDetection {
+                        kind: DetectionKind::Duplicate,
+                        header_name: header_name.clone(),
+                        value: first.to_string(),
+                        top_name: "headers".to_string(),
+                        rate_factor,
+                    });
+                }
+            }
+        }
+
+        // Order: Content first, then Shape, then Duplicate
+        detections.sort_by_key(|d| match d.kind {
+            DetectionKind::Content => 0,
+            DetectionKind::Shape => 1,
+            DetectionKind::Duplicate => 2,
+        });
+
+        detections
+    }
+}
+
+/// A detection derived from cross-tick surprise consistency.
+#[derive(Debug, Clone)]
+pub struct SurpriseDetection {
+    pub kind: DetectionKind,
+    pub header_name: String,
+    pub value: String,
+    pub top_name: String,
+    pub rate_factor: f64,
+}
+
+// =============================================================================
+// VsaFieldRing — trait boundary for future congestion relief (DEFERRED)
+// =============================================================================
+//
+// When the main subspace's k=64 components over d=4096 dims become congested
+// from rich HTTP traffic, a VsaFieldRing distributes load across N independent
+// subspaces. Each ProbeTarget hashes to a slot, and probing queries that slot's
+// subspace instead of (or alongside) the main one.
+//
+// The detection loop, SurpriseHistory, and Detection::to_expr() remain unchanged
+// because they operate on ProbeTarget + DetectionKind, not on raw subspace references.
+//
+// Memory budget when added: N=32 * (k=32+1) * d=4096 * 8 bytes ≈ 33MB fixed.
+
+/// Trait for field-level anomaly scoring, abstracting over single-subspace and
+/// ring-based implementations so the detection loop is agnostic.
+pub trait FieldAnomalyScorer {
+    /// Feed a vector during warmup/learning.
+    fn learn(&mut self, vec_f64: &[f64]);
+
+    /// Score a vector against the learned baseline.
+    fn score(&self, vec_f64: &[f64]) -> f64;
+
+    /// Extract the anomalous component for probing.
+    fn anomalous_component(&self, vec_f64: &[f64]) -> Vec<f64>;
+
+    /// Current anomaly threshold.
+    fn threshold(&self) -> f64;
+}
+
+impl FieldAnomalyScorer for SubspaceDetector {
+    fn learn(&mut self, vec_f64: &[f64]) {
+        self.baseline.update(vec_f64);
+    }
+
+    fn score(&self, vec_f64: &[f64]) -> f64 {
+        self.baseline.residual(vec_f64)
+    }
+
+    fn anomalous_component(&self, vec_f64: &[f64]) -> Vec<f64> {
+        self.baseline.anomalous_component(vec_f64)
+    }
+
+    fn threshold(&self) -> f64 {
+        self.baseline.threshold()
+    }
+}
+
+// =============================================================================
 // ValueStats — per-field-value tracking with lazy exponential decay
 // =============================================================================
 
@@ -187,5 +628,161 @@ impl Default for ValueStats {
             last_seen: Instant::now(),
             last_decay_req: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_hit(target: ProbeTarget, score: f64, content: &str, shape: usize, header: &str) -> ProbeHit {
+        ProbeHit {
+            target,
+            score,
+            content_value: content.to_string(),
+            shape_value: shape,
+            header_name: header.to_string(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ProbeTarget
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn probe_target_role_key_top_level() {
+        let t = ProbeTarget::TopLevel("headers");
+        assert_eq!(t.role_key(), "headers");
+    }
+
+    #[test]
+    fn probe_target_role_key_position() {
+        let t = ProbeTarget::Position("headers", 2);
+        assert_eq!(t.role_key(), "headers.[2]");
+    }
+
+    #[test]
+    fn probe_target_role_key_nested() {
+        let t = ProbeTarget::Nested("headers", 2, 1);
+        assert_eq!(t.role_key(), "headers.[2].[1]");
+    }
+
+    // -----------------------------------------------------------------------
+    // SurpriseHistory — content-before-shape prioritization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn surprise_history_push_and_len() {
+        let mut sh = SurpriseHistory::new(3);
+        assert_eq!(sh.len(), 0);
+        sh.push(vec![]);
+        assert_eq!(sh.len(), 1);
+        sh.push(vec![]);
+        sh.push(vec![]);
+        sh.push(vec![]);
+        assert_eq!(sh.len(), 3);
+    }
+
+    #[test]
+    fn derive_detections_needs_min_ticks() {
+        let mut sh = SurpriseHistory::new(5);
+        sh.push(vec![make_hit(
+            ProbeTarget::Nested("headers", 0, 1), 10.0, "bot/1.0", 7, "user-agent",
+        )]);
+        sh.push(vec![make_hit(
+            ProbeTarget::Nested("headers", 0, 1), 10.0, "bot/1.0", 7, "user-agent",
+        )]);
+        let dets = sh.derive_detections(3, 0.1);
+        assert!(dets.is_empty(), "should need 3 ticks but only have 2");
+    }
+
+    #[test]
+    fn derive_content_detection_same_value() {
+        let mut sh = SurpriseHistory::new(5);
+        for _ in 0..3 {
+            sh.push(vec![make_hit(
+                ProbeTarget::Nested("headers", 0, 1), 10.0, "bot/1.0", 7, "user-agent",
+            )]);
+        }
+        let dets = sh.derive_detections(3, 0.1);
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].kind, DetectionKind::Content);
+        assert_eq!(dets[0].header_name, "user-agent");
+        assert_eq!(dets[0].value, "bot/1.0");
+    }
+
+    #[test]
+    fn derive_shape_detection_different_values_same_length() {
+        let mut sh = SurpriseHistory::new(5);
+        let values = ["abcdefghijklmnopqrstuvwxyz", "zyxwvutsrqponmlkjihgfedcba", "qwertyuiopasdfghjklzxcvbnm"];
+        for v in &values {
+            sh.push(vec![make_hit(
+                ProbeTarget::Nested("headers", 0, 1), 10.0, v, 26, "user-agent",
+            )]);
+        }
+        let dets = sh.derive_detections(3, 0.1);
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].kind, DetectionKind::Shape);
+        assert_eq!(dets[0].value, "26");
+    }
+
+    #[test]
+    fn derive_duplicate_detection() {
+        let mut sh = SurpriseHistory::new(5);
+        for _ in 0..3 {
+            sh.push(vec![make_hit(
+                ProbeTarget::TopLevel("headers"), 5.0, "2", 2, "host",
+            )]);
+        }
+        let dets = sh.derive_detections(3, 0.1);
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].kind, DetectionKind::Duplicate);
+        assert_eq!(dets[0].header_name, "host");
+        assert_eq!(dets[0].value, "2");
+    }
+
+    #[test]
+    fn content_before_shape_ordering() {
+        let mut sh = SurpriseHistory::new(5);
+        for _ in 0..3 {
+            sh.push(vec![
+                make_hit(ProbeTarget::Nested("header_shapes", 1, 1), 8.0, "abc", 26, "accept"),
+                make_hit(ProbeTarget::Nested("headers", 0, 1), 10.0, "bot/1.0", 7, "user-agent"),
+            ]);
+        }
+        let dets = sh.derive_detections(3, 0.1);
+        assert!(dets.len() >= 2);
+        assert_eq!(dets[0].kind, DetectionKind::Content);
+        assert_eq!(dets[1].kind, DetectionKind::Shape);
+    }
+
+    #[test]
+    fn surprise_history_clear() {
+        let mut sh = SurpriseHistory::new(5);
+        for _ in 0..3 {
+            sh.push(vec![make_hit(
+                ProbeTarget::Nested("headers", 0, 1), 10.0, "bot/1.0", 7, "user-agent",
+            )]);
+        }
+        sh.clear();
+        assert_eq!(sh.len(), 0);
+        let dets = sh.derive_detections(3, 0.1);
+        assert!(dets.is_empty());
+    }
+
+    #[test]
+    fn no_detection_when_values_and_shapes_differ() {
+        let mut sh = SurpriseHistory::new(5);
+        sh.push(vec![make_hit(
+            ProbeTarget::Nested("headers", 0, 1), 10.0, "abc", 3, "user-agent",
+        )]);
+        sh.push(vec![make_hit(
+            ProbeTarget::Nested("headers", 0, 1), 10.0, "defghi", 6, "user-agent",
+        )]);
+        sh.push(vec![make_hit(
+            ProbeTarget::Nested("headers", 0, 1), 10.0, "jk", 2, "user-agent",
+        )]);
+        let dets = sh.derive_detections(3, 0.1);
+        assert!(dets.is_empty(), "both content and shape differ — no actionable detection");
     }
 }

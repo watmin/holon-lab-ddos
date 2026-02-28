@@ -3,8 +3,8 @@
 **Status:** All attack types mitigated — GET floods, credential stuffing, scrapers, TLS-randomized floods
 **Date:** February 2026
 **Latest Update:** February 28, 2026
-**Result:** Autonomous L7 WAF with composable rule expression language integrated end-to-end, Rete-spirit DAG compiler achieving sub-microsecond rule evaluation at million-rule scale, dual-tier VSA detection, adaptive TLS rule generation, engram memory with EDN-serialized rules, per-IP rate limiting, best-match specificity evaluator, per-rule counters, and real-time monitoring dashboard
-**Key Achievement:** The composable rule language is live — detection generates rules like `(= (first (header "content-type")) "application/json")` and cross-layer TLS+HTTP compound rules automatically. Expression tree evaluation is O(tree depth), not O(rule count). 1M rules evaluate in ~1.1µs to ~2.6µs. Miss path: ~50ns. A single core exceeds 900K evals/sec.
+**Result:** Autonomous L7 WAF with VSA surprise-driven rule generation, composable rule expression language, Rete-spirit DAG compiler achieving sub-microsecond evaluation at million-rule scale, three-layer field attribution (concentration + surprise probing + shape detection), engram memory with resilient fast-path deployment, per-IP rate limiting, best-match specificity evaluator, per-rule counters, and real-time monitoring dashboard
+**Key Achievement:** The system autonomously generates surgical, compound rules from raw traffic — no signatures, no training data, no human rules. VSA surprise probing discovers per-header, per-path-segment, and per-shape signals. Rules like `{path + user-agent + (nth path-parts 1) + (count (nth path-parts 2))}` are generated fully autonomously. Every attack in a 7-wave scenario (GET floods, credential stuffing, scrapers, TLS-randomized floods, replays) is mitigated. Expression tree evaluation is O(tree depth), not O(rule count). 1M rules evaluate in ~1.1µs to ~2.6µs. Miss path: ~50ns.
 
 ## Overview
 
@@ -27,8 +27,8 @@ and philosophy at Layer 7. Built in three days of after-hours work.
 | proxy/src/tree.rs | Done | Legacy DAG compiler (12 dimensions, String keys), specificity scoring, rule labels |
 | proxy/src/enforcer.rs | Done | ExprCompiledTree rule check + per-IP token bucket rate limiter, returns (Verdict, rule_id) |
 | runner/src/main.rs | Done | Binary: spawns proxy + sidecar, wires ArcSwap + channels + rate limiter |
-| sidecar/src/detectors.rs | Done | SubspaceDetector (tunable params) + EngramLibrary wrappers |
-| sidecar/src/detection.rs | Done | Detection → RuleExpr compilation via composable expression language |
+| sidecar/src/detectors.rs | Done | SubspaceDetector, EngramLibrary, drilldown_probe, SurpriseHistory, ProbeTarget, DetectionKind |
+| sidecar/src/detection.rs | Done | Detection → RuleExpr: surprise_to_expr, merge_detections_to_exprs, compile_merged_rule_expr |
 | sidecar/src/field_tracker.rs | Done | Per-field value tracking with decay, baseline freezing, concentration detection |
 | sidecar/src/rule_manager.rs | Done | Upsert, expire, redundancy check, compile_expr, ArcSwap<ExprCompiledTree> write |
 | sidecar/src/lib.rs | Done | Dual detection loops (TLS + REQ), concentration + surprise rule gen, engram memory with EDN serialization |
@@ -292,6 +292,90 @@ The system now produces complementary layered rules: an HTTP-path rule catches t
 
 **Result**: the full pipeline from anomaly detection through rule generation to sub-microsecond enforcement now speaks the composable expression language. Legacy `RuleSpec`/`CompiledTree` types remain in the codebase but are no longer in the live path. The only remaining gap is `FieldTracker` coverage — expanding the tracked fields unlocks all 26+ dimensions the language already supports.
 
+### Phase 1q — VSA Surprise-Driven Rule Generation + Engram Resilience COMPLETE
+
+The system now generates surgical, compound rules by combining FieldTracker concentration with VSA-based surprise probing and cross-tick consistency analysis. Two critical design flaws were identified and fixed, completing the autonomous mitigation pipeline.
+
+**VSA Surprise Probing:**
+
+- [x] `detectors.rs` — `ProbeTarget` enum (`TopLevel`, `Position`, `Nested`) for structured field identification without string-concatenated keys
+- [x] `detectors.rs` — `DetectionKind` enum (`Content`, `Shape`, `Duplicate`) for categorizing surprise signals
+- [x] `detectors.rs` — `ProbeHit` struct storing per-probe results (target, score, content value, shape value, header name)
+- [x] `detectors.rs` — `drilldown_probe()`: unbinds anomalous component against role vectors for every walkable field, ranks by residual reduction
+- [x] `detectors.rs` — `SurpriseHistory` ring buffer: tracks `ProbeHit` results across ticks for cross-tick consistency analysis
+- [x] `detectors.rs` — `derive_detections()`: requires a field to appear consistently across `min_ticks` before generating a detection. Content (same literal value) takes priority over Shape (same length, different content) over Duplicate (repeated headers)
+
+**Shape Encoding:**
+
+- [x] `types.rs` — `path_shape`: path segment lengths encoded via `ScalarValue::linear` (e.g., `/api/products/12345` → `[0, 3, 8, 5]`)
+- [x] `types.rs` — `query_shape`: query parameter key/value lengths (e.g., `foo=bar` → `[[3, 3]]`)
+- [x] `types.rs` — `header_shapes`: per-header `[name, value_length]` pairs enabling detection of fixed-length high-cardinality attacks (e.g., random 26-char user agents)
+
+**Merged Rule Compilation:**
+
+- [x] `detection.rs` — `surprise_to_expr()`: converts `SurpriseDetection` into composable `Expr` (Content → literal match, Shape → count/length match, Duplicate → count match)
+- [x] `detection.rs` — `merge_detections_to_exprs()`: combines FieldTracker and surprise detections, deduplicating by header name (FieldTracker takes priority)
+- [x] `detection.rs` — `compile_merged_rule_expr()`: produces a single compound `RuleExpr` from merged detections
+
+**Bug Fix A — Rule Refinement:**
+
+- [x] `rule_manager.rs` — Removed `"subsumed"` check from `is_redundant()`: previously, a more specific rule (superset of existing constraints) was rejected because the broader rule already covered its match space. Now, more specific rules are allowed alongside broader ones. The compiled tree's `Specificity` ranking ensures the most surgical match wins during evaluation, while the broader rule remains as a fallback.
+- [x] Effect: at streak=3 (before surprise data is ready), the system creates a broad rule like `(= path "/api/search")`. At streak=5, when surprise probing matures, it adds the surgical compound rule `{path + user-agent + path-parts}`. Previously the compound rule was silently discarded.
+
+**Bug Fix B — Engram Resilience:**
+
+- [x] `lib.rs` — Engram hit no longer short-circuits `learn_attack()` and fresh rule generation. The `if/else` structure was changed so that engram rules deploy as a fast-path at streak=1 AND the system always falls through to learn the current attack's vectors and generate fresh rules. If the engram's rules match the traffic, the anomaly resolves quickly. If they don't (e.g., engram false-matches due to structural similarity from shape encoding), fresh rules provide the actual mitigation.
+- [x] No poisoning risk: `deploy_engram_rules` adds old rules to `rule_mgr` (enforcement only), while fresh rules go to `attack_rules`. New engrams store only fresh rules from `attack_rules`, never inheriting old engram rules.
+- [x] Both TLS and REQ detection paths updated with the same fix.
+
+**Validation — Full Scenario Results (7 attack waves, all mitigated):**
+
+```
+Wave  Attack                              rate_limit Δ   Result
+────  ──────                              ────────────   ──────
+1     GET flood /api/search (libwww-perl)  0 → 53,990    MITIGATED
+2     Credential stuffing (python-req)     → 119,114     MITIGATED
+3     Scraper (Scrapy)                     → 158,664     MITIGATED (shape detection!)
+4     Shuffled TLS /api/data (bot)         → ~195,272    MITIGATED (was broken before fix)
+5     Replay wave 1                        → 195,272     MITIGATED (existing rules)
+5b    Replay wave 4                        → 222,581     MITIGATED (engram hit)
+6     Replay wave 2                        → 249,889     MITIGATED (engram hit)
+```
+
+Live-generated rules demonstrating the full capability:
+
+```clojure
+;; Surgical compound rule — perl UA captured via surprise probing (Bug A fix)
+{:constraints [(= path "/api/search")
+               (= (nth path-parts 2) "search")
+               (= (nth path-parts 1) "api")
+               (= (first (header "user-agent")) "libwww-perl/6.72")]
+ :actions     [(rate-limit 80)]}
+
+;; Shape detection — scraper hitting 5-char product IDs
+{:constraints [(= tls-ext-types #{"0x0000" "0x0005" ...})
+               (= (first (header "user-agent")) "Scrapy/2.11.0 (+https://scrapy.org)")
+               (= (nth path-parts 1) "products")
+               (= (count (nth path-parts 2)) 5)]
+ :actions     [(rate-limit 80)]}
+
+;; Fresh rules generated despite engram false-match (Bug B fix)
+;; bot_shuffled TLS correctly identified with 0x0010 extension
+{:constraints [(= tls-ext-types #{"0x0000" "0x0005" "0x000a" "0x000b" "0x000d" "0x0010" ...})
+               (= tls-ciphers #{"0x00ff" "0x1301" ...})
+               (= tls-groups #{"0x0017" "0x0018" "0x001d"})]
+ :actions     [(rate-limit 80)]}
+
+;; Fresh compound rule for wave 4 — generated alongside (ineffective) engram rules
+{:constraints [(= path "/api/data")
+               (= (nth path-parts 1) "api")
+               (= (nth path-parts 2) "data")
+               (= (first (header "user-agent")) "libwww-perl/6.72")]
+ :actions     [(rate-limit 80)]}
+```
+
+**Result**: the system now autonomously generates surgical, compound rules that capture the full distinguishing characteristics of each attack. Shape-based detection identifies structural patterns (fixed-length fields) even when content varies. Engram false-matches no longer prevent fresh mitigation. Every attack in the multi-wave scenario is mitigated, including replays handled by engram memory. The gap between "what the system observes" and "what the system acts on" is closed.
+
 ## Key Decisions
 
 ### 2026-02-23
@@ -373,6 +457,18 @@ The system now produces complementary layered rules: an HTTP-path rule catches t
 - Redundancy checker correctly allows complementary rules: `path + method + content-type` and `method + content-type + tls-ext-types` target different surfaces
 - Legacy types (`RuleSpec`, `CompiledTree`, `tree.rs`) retained but no longer in live path — available for reference/comparison
 
+### 2026-02-28 (VSA Surprise Probing + Engram Resilience)
+
+- VSA `drilldown_probe()` unbinds anomalous vector component against every walkable role vector — ranks fields by residual reduction, not magic field lists
+- `ProbeTarget` enum replaces string-concatenated keys for structured field identification — prevents hash collision attacks and key explosions
+- `SurpriseHistory` ring buffer requires cross-tick consistency before emitting a detection — prevents transient noise from becoming rules
+- Content-before-shape priority: if the same field appears with both a consistent literal value and a consistent length, the literal match wins (more surgical)
+- Shape encoding via `ScalarValue::linear` for segment/header lengths — enables detection of fixed-length high-cardinality attacks (random strings of identical length)
+- `is_redundant` subsumed check removed: the compiled tree's `Specificity` ranking handles the prioritization question, not the rule manager. Admitting more specific rules creates a refinement progression.
+- Engram hit decoupled from fresh rule generation: engrams are a fast-path optimization, not a substitute for learning. The system always learns attack vectors and generates fresh rules, even when an engram matches. Engram rules are deployed AND fresh rules are generated in parallel.
+- Engram poisoning prevented by architecture: `deploy_engram_rules` populates `rule_mgr` (enforcement), `attack_rules` accumulates fresh rules (engram minting). These are separate data paths — new engrams never inherit old engram rules.
+- Merged rule compilation: `merge_detections_to_exprs()` combines FieldTracker concentration with surprise probing, deduplicating by header name (concentration takes priority — it has more observations)
+
 ## Performance Observations
 
 - Python mock backend is the throughput bottleneck — proxy serves 429s much faster than forwarding to origin (Rust vs Python, expected)
@@ -394,12 +490,19 @@ The system now produces complementary layered rules: an HTTP-path rule catches t
 - **Warmup duration**: 500 REQ samples (20-30s at 80 rps baseline). Sufficient for HTTP traffic diversity.
 - **ArcSwap vs RwLock**: ArcSwap confirmed as correct choice. RwLock in the stats path caused the only serious performance regression.
 
+## Resolved Questions (continued)
+
+- **Path parts in detection**: Resolved via `drilldown_probe`. Path segments are individually probed by VSA surprise attribution. Segments that deviate from normal traffic become constraints like `(= (nth path-parts 1) "api")`. Shape encoding captures segment length for high-cardinality segments.
+- **Engram false-match strategy**: Engrams are a fast-path, not exclusive. Fresh rules always generated in parallel. If the engram's rules match the traffic, anomaly resolves. If not, fresh rules cover the gap.
+- **Rule refinement vs. redundancy**: Broader rules are fallbacks, not gatekeepers. The tree's Specificity evaluator picks the most surgical match. `is_redundant` only rejects exact duplicates and strictly over-broad candidates.
+
 ## Open Questions
 
 - Query string structure for detection — how to handle malformed/double query strings as attack signals?
-- Path ngram analysis — path_parts are captured but not yet used for detection dimensions
 - Header ordering as detection signal — captured in RequestSample but not yet encoded into detection fields
 - Connection-level metrics (requests per connection, connection duration) for slow-loris type attacks
+- Multi-tenant memory isolation — how to bound per-customer VSA state (VsaFieldRing deferred)
+- H2/H3 field integration — pseudo-headers, SETTINGS, HPACK state as detection dimensions
 
 ## Phase 2 (Future)
 

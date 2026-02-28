@@ -34,8 +34,8 @@ use tracing::{info, warn};
 use http_proxy::expr::RuleExpr;
 use http_proxy::expr_tree::ExprCompiledTree;
 use http_proxy::types::{RequestSample, RuleAction, SampleMessage, TlsSample};
-use crate::detection::{compile_compound_rule_expr, Detection};
-use crate::detectors::SubspaceDetector;
+use crate::detection::{compile_compound_rule_expr, compile_merged_rule_expr, Detection};
+use crate::detectors::{SubspaceDetector, SurpriseHistory, drilldown_probe};
 use crate::field_tracker::FieldTracker;
 use crate::metrics_server::{
     DashboardEvent, MetricsAppState, RuleSummary,
@@ -153,6 +153,10 @@ pub async fn run(
     let mut tls_tick_max_vec: Option<Vec<f64>> = None;
     let mut req_tick_max_residual = 0.0f64;
     let mut req_tick_max_vec: Option<Vec<f64>> = None;
+    let mut req_tick_max_sample: Option<RequestSample> = None;
+
+    // Surprise history for cross-tick consistency (content-before-shape prioritization)
+    let mut surprise_history = SurpriseHistory::new(5);
 
     let mut last_tick = Instant::now();
     let mut req_since_tick = 0usize;
@@ -206,6 +210,7 @@ pub async fn run(
                         &s, &encoder, &mut req_detector, &mut req_tracker,
                         &mut req_warmup_count, req_warmup_done, decay_alpha,
                         &mut req_tick_max_residual, &mut req_tick_max_vec,
+                        &mut req_tick_max_sample,
                     );
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -313,52 +318,52 @@ pub async fn run(
                             });
                             deploy_engram_rules(&tls_detector, &engram_name, &rule_mgr, &tree, &event_tx, baseline_rps).await;
                         }
-                    } else {
-                        tls_detector.learn_attack(max_vec);
+                    }
 
-                        if tls_detector.anomaly_streak >= ANOMALY_STREAK_THRESHOLD {
-                            warn!("[TLS] Anomaly confirmed (streak={}, score={:.3})",
-                                  tls_detector.anomaly_streak, score);
-                            let _ = event_tx.send(DashboardEvent::DetectionEvent {
-                                ts: now_ts(), detector: "TLS".into(), kind: "anomaly_confirmed".into(),
-                                detail: format!("streak={} score={:.3}", tls_detector.anomaly_streak, score),
-                            });
+                    tls_detector.learn_attack(max_vec);
 
-                            let surprise = tls_detector.surprise_fingerprint(max_vec, &encoder, TLS_FIELDS);
-                            let rate_factor = if estimated_rps > 0.0 {
-                                (baseline_rps / estimated_rps).min(1.0)
-                            } else {
-                                1.0
-                            };
-                            let mut seen_fields = std::collections::HashSet::new();
-                            let top_fields: Vec<Detection> = surprise.iter()
-                                .filter_map(|(f, _s)| {
-                                    get_tls_field_top_value(&req_tracker, f)
-                                        .and_then(|(det_field, val)| {
-                                            if seen_fields.insert(det_field.clone()) {
-                                                warn!("  TLS surprise: {} → {}={}", f, det_field, val);
-                                                Some(Detection { field: det_field, value: val, rate_factor })
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                })
-                                .take(3)
-                                .collect();
+                    if tls_detector.anomaly_streak >= ANOMALY_STREAK_THRESHOLD {
+                        warn!("[TLS] Anomaly confirmed (streak={}, score={:.3})",
+                              tls_detector.anomaly_streak, score);
+                        let _ = event_tx.send(DashboardEvent::DetectionEvent {
+                            ts: now_ts(), detector: "TLS".into(), kind: "anomaly_confirmed".into(),
+                            detail: format!("streak={} score={:.3}", tls_detector.anomaly_streak, score),
+                        });
 
-                            if let Some(rule) = compile_compound_rule_expr(&top_fields, true, estimated_rps, false) {
-                                let mut mgr = rule_mgr.lock().await;
-                                if mgr.is_redundant(&rule).is_none() {
-                                    let _ = event_tx.send(DashboardEvent::RuleEvent {
-                                        ts: now_ts(), action: "added".into(),
-                                        summary: rule.to_edn_compact(),
-                                        engram_name: None, rule_count: None,
-                                    });
-                                    tls_detector.attack_rules.push(rule.clone());
-                                    mgr.upsert(&[rule]);
-                                    mgr.recompile_and_deploy(&tree);
-                                    broadcast_dag(&tree, &event_tx);
-                                }
+                        let surprise = tls_detector.surprise_fingerprint(max_vec, &encoder, TLS_FIELDS);
+                        let rate_factor = if estimated_rps > 0.0 {
+                            (baseline_rps / estimated_rps).min(1.0)
+                        } else {
+                            1.0
+                        };
+                        let mut seen_fields = std::collections::HashSet::new();
+                        let top_fields: Vec<Detection> = surprise.iter()
+                            .filter_map(|(f, _s)| {
+                                get_tls_field_top_value(&req_tracker, f)
+                                    .and_then(|(det_field, val)| {
+                                        if seen_fields.insert(det_field.clone()) {
+                                            warn!("  TLS surprise: {} → {}={}", f, det_field, val);
+                                            Some(Detection { field: det_field, value: val, rate_factor })
+                                        } else {
+                                            None
+                                        }
+                                    })
+                            })
+                            .take(3)
+                            .collect();
+
+                        if let Some(rule) = compile_compound_rule_expr(&top_fields, true, estimated_rps, false) {
+                            let mut mgr = rule_mgr.lock().await;
+                            if mgr.is_redundant(&rule).is_none() {
+                                let _ = event_tx.send(DashboardEvent::RuleEvent {
+                                    ts: now_ts(), action: "added".into(),
+                                    summary: rule.to_edn_compact(),
+                                    engram_name: None, rule_count: None,
+                                });
+                                tls_detector.attack_rules.push(rule.clone());
+                                mgr.upsert(&[rule]);
+                                mgr.recompile_and_deploy(&tree);
+                                broadcast_dag(&tree, &event_tx);
                             }
                         }
                     }
@@ -414,45 +419,78 @@ pub async fn run(
                             });
                             deploy_engram_rules(&req_detector, &engram_name, &rule_mgr, &tree, &event_tx, baseline_rps).await;
                         }
-                    } else {
-                        req_detector.learn_attack(max_vec);
+                    }
 
-                        if req_detector.anomaly_streak >= ANOMALY_STREAK_THRESHOLD {
-                            let rate_factor = if estimated_rps > 0.0 {
-                                (baseline_rps / estimated_rps).min(1.0)
-                            } else {
-                                1.0
-                            };
-                            warn!("[REQ] Anomaly confirmed (streak={}, score={:.3}, rps={:.0}, baseline_rps={:.0})",
-                                  req_detector.anomaly_streak, score, estimated_rps, baseline_rps);
-                            let _ = event_tx.send(DashboardEvent::DetectionEvent {
-                                ts: now_ts(), detector: "REQ".into(), kind: "anomaly_confirmed".into(),
-                                detail: format!("streak={} score={:.3} rps={:.0}", req_detector.anomaly_streak, score, estimated_rps),
-                            });
+                    req_detector.learn_attack(max_vec);
 
-                            let concentrated = req_tracker.find_concentrated_values(0.5);
-                            let top_fields: Vec<Detection> = concentrated.iter().take(3).map(|(f, v, conc)| {
-                                warn!("  concentrated: {}={} ({:.1}%)", f, v, conc * 100.0);
-                                Detection {
-                                    field: f.clone(),
-                                    value: v.clone(),
-                                    rate_factor,
+                    if req_detector.anomaly_streak >= ANOMALY_STREAK_THRESHOLD {
+                        let rate_factor = if estimated_rps > 0.0 {
+                            (baseline_rps / estimated_rps).min(1.0)
+                        } else {
+                            1.0
+                        };
+                        warn!("[REQ] Anomaly confirmed (streak={}, score={:.3}, rps={:.0}, baseline_rps={:.0})",
+                              req_detector.anomaly_streak, score, estimated_rps, baseline_rps);
+                        let _ = event_tx.send(DashboardEvent::DetectionEvent {
+                            ts: now_ts(), detector: "REQ".into(), kind: "anomaly_confirmed".into(),
+                            detail: format!("streak={} score={:.3} rps={:.0}", req_detector.anomaly_streak, score, estimated_rps),
+                        });
+
+                        // 1. FieldTracker concentration (existing 12 scalar fields)
+                        let concentrated = req_tracker.find_concentrated_values(0.5);
+                        let top_fields: Vec<Detection> = concentrated.iter().take(3).map(|(f, v, conc)| {
+                            warn!("  concentrated: {}={} ({:.1}%)", f, v, conc * 100.0);
+                            Detection {
+                                field: f.clone(),
+                                value: v.clone(),
+                                rate_factor,
+                            }
+                        }).collect();
+
+                        // 2. Surprise probing: drill-down against anomalous component
+                        if let Some(ref sample) = req_tick_max_sample {
+                            let probe_hits = drilldown_probe(
+                                &req_detector, max_vec, &encoder, sample,
+                            );
+                            if !probe_hits.is_empty() {
+                                for hit in probe_hits.iter().take(3) {
+                                    warn!("  surprise probe: {:?} score={:.2} header={} content={} shape={}",
+                                          hit.target, hit.score, hit.header_name,
+                                          hit.content_value, hit.shape_value);
                                 }
-                            }).collect();
+                            }
 
-                            if let Some(rule) = compile_compound_rule_expr(&top_fields, true, estimated_rps, false) {
-                                let mut mgr = rule_mgr.lock().await;
-                                if mgr.is_redundant(&rule).is_none() {
-                                    let _ = event_tx.send(DashboardEvent::RuleEvent {
-                                        ts: now_ts(), action: "added".into(),
-                                        summary: rule.to_edn_compact(),
-                                        engram_name: None, rule_count: None,
-                                    });
-                                    req_detector.attack_rules.push(rule.clone());
-                                    mgr.upsert(&[rule]);
-                                    mgr.recompile_and_deploy(&tree);
-                                    broadcast_dag(&tree, &event_tx);
-                                }
+                            // 3. Push into SurpriseHistory for cross-tick consistency
+                            surprise_history.push(probe_hits);
+                        }
+
+                        // 4. Derive surprise detections (content-before-shape)
+                        let surprise_dets = surprise_history.derive_detections(
+                            ANOMALY_STREAK_THRESHOLD, rate_factor,
+                        );
+                        if !surprise_dets.is_empty() {
+                            for sd in &surprise_dets {
+                                warn!("  surprise detection: {:?} {}={} ({})",
+                                      sd.kind, sd.header_name, sd.value, sd.top_name);
+                            }
+                        }
+
+                        // 5. Merge FieldTracker + surprise detections, compile rule
+                        if let Some(rule) = compile_merged_rule_expr(
+                            &top_fields, &surprise_dets,
+                            true, estimated_rps, false,
+                        ) {
+                            let mut mgr = rule_mgr.lock().await;
+                            if mgr.is_redundant(&rule).is_none() {
+                                let _ = event_tx.send(DashboardEvent::RuleEvent {
+                                    ts: now_ts(), action: "added".into(),
+                                    summary: rule.to_edn_compact(),
+                                    engram_name: None, rule_count: None,
+                                });
+                                req_detector.attack_rules.push(rule.clone());
+                                mgr.upsert(&[rule]);
+                                mgr.recompile_and_deploy(&tree);
+                                broadcast_dag(&tree, &event_tx);
                             }
                         }
                     }
@@ -472,6 +510,7 @@ pub async fn run(
                     } else {
                         req_detector.cancel_attack();
                     }
+                    surprise_history.clear();
                 }
                 req_detector.anomaly_streak = 0;
                 if let Some(ref max_vec) = req_tick_max_vec {
@@ -487,6 +526,7 @@ pub async fn run(
         tls_tick_max_vec = None;
         req_tick_max_residual = 0.0;
         req_tick_max_vec = None;
+        req_tick_max_sample = None;
 
         // Expire old rules periodically
         {
@@ -645,6 +685,8 @@ fn process_tls_sample(
 }
 
 /// Process a single REQ sample: encode, decay accumulator, learn/score, track fields.
+/// When a sample achieves the max residual for this tick, stores both the f64 vector
+/// AND the original sample (for drill-down probing at detection time).
 fn process_req_sample(
     sample: &RequestSample,
     encoder: &Encoder,
@@ -655,6 +697,7 @@ fn process_req_sample(
     decay_alpha: f64,
     tick_max_residual: &mut f64,
     tick_max_vec: &mut Option<Vec<f64>>,
+    tick_max_sample: &mut Option<RequestSample>,
 ) {
     let req_vec = encoder.encode_walkable(sample);
     let vec_f64: Vec<f64> = req_vec.data().iter()
@@ -669,6 +712,7 @@ fn process_req_sample(
         if residual > *tick_max_residual {
             *tick_max_residual = residual;
             *tick_max_vec = Some(vec_f64);
+            *tick_max_sample = Some(sample.clone());
         }
     }
 

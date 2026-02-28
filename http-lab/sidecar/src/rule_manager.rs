@@ -87,9 +87,6 @@ impl RuleManager {
             if existing_subset && candidate_subset {
                 return Some("duplicate");
             }
-            if existing_subset && candidate.constraints.len() > existing.constraints.len() {
-                return Some("subsumed");
-            }
             if candidate_subset && candidate.constraints.len() < existing.constraints.len() {
                 return Some("over-broad");
             }
@@ -189,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn is_redundant_detects_subsumed() {
+    fn is_redundant_allows_more_specific() {
         let mut mgr = RuleManager::new(300);
         let broad = make_rule(Dimension::src_ip(), "10.0.0.1", RuleAction::block());
         mgr.upsert(&[broad]);
@@ -201,7 +198,7 @@ mod tests {
             ],
             RuleAction::block(),
         );
-        assert_eq!(mgr.is_redundant(&specific), Some("subsumed"));
+        assert_eq!(mgr.is_redundant(&specific), None);
     }
 
     #[test]

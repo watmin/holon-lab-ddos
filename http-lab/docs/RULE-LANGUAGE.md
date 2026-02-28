@@ -1,11 +1,11 @@
 # http-lab Rule Expression Language
 
-**Status:** Design — not yet implemented
-**Date:** February 26, 2026
+**Status:** Implemented — live in detection pipeline
+**Date:** February 28, 2026
 
 ## Overview
 
-The current rule model uses flat `Predicate::Eq(FieldDim, String)` — a closed enum of 12 fixed dimensions, all values are strings, only equality. This document captures the design for a richer lisp-like expression language with parameterized accessors, typed values, and multiple operators.
+A composable Lisp-like expression language for L7 WAF rules. Rules are EDN (Extensible Data Notation) s-expressions with parameterized accessors, typed values, and multiple operators. The detection pipeline generates rules autonomously using this language, and the expression tree compiler evaluates them in sub-microsecond time.
 
 ## Matchable Field Inventory
 
@@ -52,26 +52,59 @@ Every field available on the Walkable structs (`TlsContext` and `RequestSample`)
 | `src_ip` | Scalar(String) | `self.src_ip` | Source IP address |
 | `tls` | **nested Map** | `self.tls_ctx` | Entire TLS context (nested — accessible via tls-* accessors) |
 
-### Current FieldDim Coverage (what rules can match today)
+### Implemented Dimension Coverage
 
-Only 12 of these fields are usable in rules — the gap is significant:
+The composable expression language (`expr.rs`) covers 26 field dimensions with full accessor chain support:
 
-| FieldDim | Maps to | Notes |
+**HTTP Dimensions (11):**
+
+| Dimension | Accessor | Notes |
 |---|---|---|
-| `SrcIp` | `src_ip` | String equality |
-| `Method` | `method` | String equality |
-| `PathPrefix` | `path` | String equality (despite the name, it's exact match) |
-| `Host` | `host` (convenience field) | String equality |
-| `UserAgent` | `user_agent` (convenience field) | String equality |
-| `ContentType` | `content_type` (convenience field) | String equality |
-| `TlsCipherHash` | `cipher_string()` (wire order, comma-joined hex) | String equality on canonical repr |
-| `TlsExtOrderHash` | `ext_order_string()` (wire order, comma-joined hex) | String equality on canonical repr |
-| `TlsGroupHash` | `group_string()` (wire order, comma-joined hex) | String equality on canonical repr |
-| `TlsCipherSet` | `cipher_set_string()` (sorted, comma-joined hex) | String equality on canonical repr |
-| `TlsExtSet` | `ext_set_string()` (sorted, comma-joined hex) | String equality on canonical repr |
-| `TlsGroupSet` | `group_set_string()` (sorted, comma-joined hex) | String equality on canonical repr |
+| `src-ip` | scalar | Source IP address |
+| `method` | scalar | HTTP method (GET, POST, etc.) |
+| `path` | scalar | Full request path |
+| `path-parts` | list, indexed via `(nth path-parts N)` | Path segments, positional |
+| `host` | scalar | Host header |
+| `user-agent` | scalar | User-Agent header |
+| `content-type` | scalar | Content-Type header |
+| `header-order` | list | Header names in wire order |
+| `headers` | map, accessed via `(header "name")` | All headers, returns list of values |
+| `cookies` | map, accessed via `(cookie "name")` | Cookie values, returns list |
+| `query-params` | map, accessed via `(query "name")` | Query parameters, returns list of values |
 
-**Not matchable today**: `path_parts`, `query`, `query_parts`, `header_order`, individual headers by name, cookies by name, `alpn`, `sni`, `sig_algs`, `supported_versions`, `psk_modes`, `key_shares`, `session_id_len`, `body_len`, `header_count`, `http_version`, `extensions` map entries.
+**TLS Dimensions (15):**
+
+| Dimension | Accessor | Notes |
+|---|---|---|
+| `tls-ciphers` | set | Cipher suites (order-independent) |
+| `tls-cipher-order` | list | Cipher suites in wire order |
+| `tls-ext-types` | set | Extension types present |
+| `tls-ext-order` | list | Extension types in wire order |
+| `tls-groups` | set | Key exchange groups |
+| `tls-group-order` | list | Groups in wire order |
+| `tls-sig-algs` | set | Signature algorithms |
+| `tls-alpn` | list | ALPN protocols |
+| `tls-sni` | scalar | SNI hostname |
+| `tls-record-version` | scalar | Outer TLS record version |
+| `tls-handshake-version` | scalar | ClientHello version |
+| `tls-session-id-len` | scalar(numeric) | Session ID length |
+| `tls-supported-versions` | list | Version negotiation list |
+| `tls-psk-modes` | list | PSK key exchange modes |
+| `tls-key-shares` | set | Key share groups |
+
+**Shape dimensions** (`path_shape`, `query_shape`, `header_shapes`) are used internally by the VSA detection pipeline for shape-based anomaly attribution but are not yet exposed as directly matchable rule dimensions. The detection pipeline converts shape detections into `(= (count ...) N)` constraints using existing accessors.
+
+**Not yet implemented**: `body_len`, `header_count`, per-extension values (`tls-extensions` map).
+
+### Legacy FieldDim Coverage (superseded by expr.rs)
+
+The legacy `FieldDim` enum provided 12 fixed dimensions with string equality only. These remain in the codebase for reference but are no longer used in the live detection/enforcement path:
+
+| FieldDim | Maps to | Status |
+|---|---|---|
+| `SrcIp`, `Method`, `PathPrefix`, `Host`, `UserAgent`, `ContentType` | HTTP scalar fields | Superseded by `SimpleDim` |
+| `TlsCipherHash`, `TlsExtOrderHash`, `TlsGroupHash` | TLS ordered fields | Superseded by `tls-cipher-order`, etc. |
+| `TlsCipherSet`, `TlsExtSet`, `TlsGroupSet` | TLS set fields | Superseded by `tls-ciphers`, etc. |
 
 ### HTTP/2 Fields (from future `H2Context`)
 
@@ -649,15 +682,25 @@ The `MatchMode` is determined by the accessor's return type:
 - Collection (List, Set) with `exists` operator → `Membership`
 - Collection with `=` operator → `Exact` (canonicalized to string for HashMap key)
 
-## Detection Pipeline Bridge
+## Detection Pipeline Bridge (Implemented)
 
-The auto-detection pipeline currently produces `Predicate::Eq(FieldDim, String)`. Two options:
+The detection pipeline generates `RuleExpr` values directly using the composable expression language. It uses a controlled subset of the full language:
 
-**Option A: Detection produces new expression types directly.** Rename but same shapes — detection only uses `=` on simple fields anyway.
+**Auto-generated constraints from FieldTracker concentration:**
+- `(= path "/api/search")` — scalar equality on concentrated fields
+- `(= method "POST")` — scalar equality
+- `(= (first (header "user-agent")) "libwww-perl/6.72")` — parameterized header access
+- `(= (first (header "content-type")) "application/json")` — accessor chain composition
+- `(= tls-ext-types #{"0x0000" ...})` — TLS set equality
 
-**Option B: Detection uses a subset dialect.** Auto-generated rules always use `=` on simple/collection dimensions. The richer expressions (`exists`, parameterized headers, `prefix`, guards) are for human-authored or future ML-generated rules. Detection pipeline keeps producing the same shapes with new types.
+**Auto-generated constraints from VSA surprise probing:**
+- `(= (nth path-parts 1) "api")` — positional path segment (Content detection)
+- `(= (count (nth path-parts 2)) 5)` — segment length (Shape detection)
+- `(= (first (header "user-agent")) "Scrapy/2.11.0 ...")` — header content from surprise
 
-**Recommendation:** Option B. The detection pipeline is stable. Let it emit the subset it needs. New expression power is for rules that don't come from concentration detection.
+**Constraint merging:** When both FieldTracker and surprise probing detect the same field (e.g., user-agent), the FieldTracker result takes priority (more observations). Surprise probing fills in fields that FieldTracker doesn't cover (path segments, shape patterns, non-scalar-tracked headers).
+
+The richer expressions (`exists`, `prefix`, `regex`, guards) are available for human-authored rules. The detection pipeline could be extended to use them — e.g., `(prefix path "/api/")` when multiple paths share a prefix — but the current approach of exact matches is more surgical.
 
 ## Extensibility Model
 

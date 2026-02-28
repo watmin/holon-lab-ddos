@@ -142,9 +142,13 @@ Two independent detectors run concurrently:
 
 **Tier 2: EngramLibrary (fast-path re-mitigation)**
 
-When an attack ends, the system mints an **engram**: a snapshot of the attack subspace with associated metadata (surprise fingerprint, active rules, estimated RPS). The engram is stored persistently (JSON on disk).
+When an attack ends, the system mints an **engram**: a snapshot of the attack subspace with associated metadata (surprise fingerprint, active rules, estimated RPS). The engram is stored persistently (JSON on disk, disabled by default, enabled via `--engram-persist` flag).
 
-On subsequent anomalies, the vector is checked against the library *before* waiting for a streak. If a match is found (vector projects well onto a stored attack subspace), the stored rules are deployed immediately — typically 1 tick vs. 3+ ticks for first-time detection.
+On subsequent anomalies, the vector is checked against the library. If a match is found (vector projects well onto a stored attack subspace), the stored rules are deployed immediately — typically 1 tick vs. 3+ ticks for first-time detection.
+
+Critically, engram deployment is a **fast-path optimization, not a substitute for learning**. After deploying engram rules, the system always falls through to `learn_attack()` and fresh rule generation. This ensures resilience against engram false-matches: if shape encoding changes cause a structural similarity between unrelated attacks, the system generates fresh rules on top of the (potentially ineffective) engram rules. The `Specificity` evaluator ensures the most relevant rules win during enforcement.
+
+New engrams only store rules from `attack_rules` (freshly generated during this attack), never inheriting old engram rules from `deploy_engram_rules`. This prevents compounding poisoning where each engram cycle accumulates stale rules.
 
 ### Warmup
 
@@ -157,21 +161,30 @@ During warmup, all samples are fed to `OnlineSubspace::update()` to learn the ba
 
 ## Rule Generation
 
-### Concentration-Based Field Attribution
+### Three-Layer Field Attribution
 
-When an anomaly is confirmed, the system must determine *which* fields characterize the attack. Two complementary mechanisms are used:
+When an anomaly is confirmed, the system determines *which* fields characterize the attack using three complementary mechanisms operating at different granularities:
 
-**For REQ rules: Concentration**
+**Layer 1: FieldTracker Concentration**
 
-The `FieldTracker` records per-field-value frequencies with exponential decay (half-life = 500 requests). When an attack is confirmed, `find_concentrated_values(0.5)` returns fields where a single value accounts for >50% of recent traffic — but only values that *weren't* already dominant during baseline.
+The `FieldTracker` records per-field-value frequencies with exponential decay (half-life = 500 requests) across 12 scalar fields (method, path, host, user-agent, content-type, etc.). When an attack is confirmed, `find_concentrated_values(0.5)` returns fields where a single value accounts for >50% of recent traffic — but only values that *weren't* already dominant during baseline.
 
 Example: If during an attack 90% of requests hit `path=/api/search`, but during baseline `method=GET` was already at 80%, the rule targets `path=/api/search` and ignores `method`.
 
-**For TLS rules: Surprise + Concentration**
+**Layer 2: VSA Surprise Probing (drilldown_probe)**
 
-The surprise fingerprint identifies which Walkable fields contribute most to the anomalous vector component (via role unbinding). The system then maps each Walkable field to its corresponding tracker field and retrieves the concentrated value.
+The `drilldown_probe()` function extracts the anomalous vector component and unbinds it against every walkable role vector, ranking fields by how much each binding explains the anomaly (residual reduction). This discovers signals that concentration tracking misses — particularly nested fields like individual path segments, specific headers not in the scalar tracker, and structural patterns.
 
-The adaptive ordered-vs-set selection works as follows:
+For each probed field, three detection kinds are evaluated:
+- **Content**: the same literal value appears consistently across ticks (e.g., user-agent = `"libwww-perl/6.72"`)
+- **Shape**: different values but identical length (e.g., random 26-char user agents). Detected when content varies but `ScalarValue::linear(length)` is stable.
+- **Duplicate**: a header appears more times than normal (e.g., double `Host` header — an attack technique that confuses proxies)
+
+The `SurpriseHistory` ring buffer stores `ProbeHit` results across ticks. `derive_detections()` requires a field to appear consistently across a minimum number of ticks (`min_ticks`) before emitting a detection, filtering out transient noise. Content detections take priority over shape detections when both exist for the same field.
+
+**Layer 3: TLS Adaptive Selection**
+
+For TLS rules, the surprise fingerprint identifies which Walkable fields contribute most to the anomalous vector component (via role unbinding). The system then applies adaptive ordered-vs-set selection:
 
 1. For each surprised Walkable field (e.g., `cipher_order`), identify both candidates:
    - Ordered: `tls_cipher_hash` (the exact ordering of cipher suites)
@@ -181,6 +194,25 @@ The adaptive ordered-vs-set selection works as follows:
 4. If no: fall back to the set field (attacker randomizes order, but uses the same set)
 
 This makes rule generation adaptive: it catches both fixed-order bots (curl, python-requests) and sophisticated randomizers (bot_shuffled) with the same code path.
+
+### Merged Rule Compilation
+
+The three layers are merged into a single compound `RuleExpr`:
+
+1. `merge_detections_to_exprs()` combines FieldTracker concentration detections with surprise probing detections. When both layers detect the same field (e.g., both identify user-agent), the FieldTracker result takes priority because it has more observations.
+2. TLS detections are added from the separate TLS surprise + concentration path.
+3. `compile_merged_rule_expr()` assembles the final `RuleExpr` with all constraints.
+
+This produces rules like `{path + user-agent + path-parts[1] + path-parts[2]}` — the path and user-agent come from concentration, the individual path segments come from surprise probing. The result is maximally specific without any hardcoded detection templates.
+
+### Rule Refinement Progression
+
+Rules evolve as the system accumulates more data about an ongoing attack:
+
+- **Streak=3** (minimum threshold): FieldTracker concentration produces broad rules (e.g., `(= path "/api/search")`)
+- **Streak=5+**: `SurpriseHistory` has accumulated enough cross-tick consistency to derive surprise detections. These merge with concentration data to produce compound rules that add user-agent, path segments, or shape constraints.
+
+Both the broad and compound rules coexist in the tree. The `Specificity` evaluator ensures the most surgical match wins during evaluation, while the broader rule provides a fallback. This is possible because the `is_redundant()` check only rejects exact duplicates and strictly over-broad candidates — it explicitly allows more specific rules to refine existing broader coverage.
 
 ### EDN Rule Syntax
 

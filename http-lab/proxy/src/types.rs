@@ -631,6 +631,18 @@ impl Walkable for RequestSample {
             self.headers.len() as f64
         ))));
 
+        // Header shapes: [[name, value_len], ...] — structural fingerprint per header.
+        // Encodes the LENGTH of each header value alongside its name so the subspace
+        // learns normal shape distributions (e.g., UA is typically 90-120 chars).
+        items.push(("header_shapes", WalkableValue::List(
+            self.headers.iter()
+                .map(|(k, v)| WalkableValue::List(vec![
+                    scalar_s(k.clone()),
+                    WalkableValue::Scalar(ScalarValue::linear(v.len() as f64)),
+                ]))
+                .collect()
+        )));
+
         // Cookies as List of [key, value] pairs
         if !self.cookies.is_empty() {
             items.push(("cookies", WalkableValue::List(
@@ -646,6 +658,33 @@ impl Walkable for RequestSample {
         // --- Body ---
         if self.body_len > 0 {
             items.push(("body_len", WalkableValue::Scalar(ScalarValue::log(self.body_len as f64))));
+        }
+
+        // --- Structural shapes ---
+        // Path shape: length of each segment. "/foo/bar" → [0, 3, 3].
+        // Captures directory structure as a coordinate in the structural space.
+        items.push(("path_shape", WalkableValue::List(
+            self.path.split('/').map(|p|
+                WalkableValue::Scalar(ScalarValue::linear(p.len() as f64))
+            ).collect()
+        )));
+
+        // Query shape: [key_len, val_len] per param. "bur=baz" → [[3,3]].
+        if let Some(ref q) = self.query {
+            let shape: Vec<WalkableValue> = q.split('&')
+                .filter(|seg| !seg.is_empty())
+                .map(|seg| {
+                    if let Some(eq) = seg.find('=') {
+                        WalkableValue::List(vec![
+                            WalkableValue::Scalar(ScalarValue::linear(seg[..eq].len() as f64)),
+                            WalkableValue::Scalar(ScalarValue::linear(seg[eq + 1..].len() as f64)),
+                        ])
+                    } else {
+                        WalkableValue::Scalar(ScalarValue::linear(seg.len() as f64))
+                    }
+                })
+                .collect();
+            items.push(("query_shape", WalkableValue::List(shape)));
         }
 
         // --- Connection context ---
