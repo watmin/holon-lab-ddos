@@ -1356,7 +1356,7 @@
                 for (const e of (pn.edges || [])) {
                     if (e.target === cur) { edgeLabel = e.label; break; }
                 }
-                ancestry.unshift(`${pn.dim}=${edgeLabel}`);
+                ancestry.unshift(`${pn.dim}=${formatEdnValue(edgeLabel)}`);
             }
             cur = pid;
         }
@@ -1392,6 +1392,23 @@
         'terminal': 'Rule action endpoint',
     };
 
+    function formatEdnValue(raw) {
+        if (raw.startsWith('#{')) {
+            const inner = raw.slice(2, -1);
+            const elems = inner.split(',');
+            return '#{' + elems.map(e => '"' + e + '"').join(' ') + '}';
+        }
+        if (raw.startsWith('[') && raw.endsWith(']')) {
+            const inner = raw.slice(1, -1);
+            const elems = inner.split(',');
+            return '[' + elems.map(e => '"' + e + '"').join(' ') + ']';
+        }
+        if (/^-?\d+(\.\d+)?$/.test(raw)) {
+            return raw;
+        }
+        return '"' + raw + '"';
+    }
+
     function buildRuleExpression(nodeId) {
         const nodes = dagDisplayNodes;
         if (nodes.length === 0) return null;
@@ -1416,7 +1433,7 @@
             seen.add(cur);
             const info = edgeFrom.get(cur);
             if (info && info.dim !== 'terminal') {
-                constraints.push(`(= ${info.dim} "${info.value}")`);
+                constraints.push(`(= ${info.dim} ${formatEdnValue(info.value)})`);
             }
             cur = parentOf.get(cur);
         }
@@ -1443,7 +1460,7 @@
             if (node.wildcard != null) html += ` + wildcard`;
             html += `</div>`;
             for (const e of node.edges.slice(0, 5)) {
-                html += `<div class="tt-row" style="padding-left:8px;color:#8cf;">= ${escHtml(e.label)}</div>`;
+                html += `<div class="tt-row" style="padding-left:8px;color:#8cf;">= ${escHtml(formatEdnValue(e.label))}</div>`;
             }
             if (node.edges.length > 5) {
                 html += `<div class="tt-row" style="color:#666;">\u2026${node.edges.length - 5} more</div>`;
