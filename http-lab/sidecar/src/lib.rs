@@ -91,18 +91,21 @@ const DECAY_HALF_LIFE: usize = 500;
 
 /// Start the sidecar. Runs until the sample_rx channel is closed.
 /// `engram_path`: if `Some`, load/save engram libraries to disk for persistence.
+/// `rule_ttl_secs`: if `Some`, override the default rule TTL (300s).
 pub async fn run(
     mut sample_rx: mpsc::Receiver<SampleMessage>,
     tree: Arc<ArcSwap<ExprCompiledTree>>,
     engram_path: Option<String>,
     metrics_addr: SocketAddr,
+    rule_ttl_secs: Option<u64>,
 ) -> Result<()> {
-    info!("Sidecar starting");
+    let ttl = rule_ttl_secs.unwrap_or(RULE_TTL_SECS);
+    info!("Sidecar starting (rule_ttl={}s)", ttl);
 
     let encoder = Arc::new(Encoder::new(VectorManager::new(VSA_DIM)));
     let stats = new_shared_stats();
     let shared_rules = new_shared_rules();
-    let rule_mgr = Arc::new(Mutex::new(RuleManager::new(RULE_TTL_SECS)));
+    let rule_mgr = Arc::new(Mutex::new(RuleManager::new(ttl)));
 
     let (event_tx, _) = broadcast::channel::<DashboardEvent>(256);
 

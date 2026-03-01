@@ -1,0 +1,9 @@
+{
+  "phases": [
+    { "name": "warmup", "duration_s": 25, "rps": 100, "pattern": "browse", "tls_profiles": ["chrome_120", "firefox_121"] },
+    { "name": "get-flood", "duration_s": 30, "rps": 1500, "pattern": "get_flood", "path": "/api/data", "tls_profiles": ["curl_800"] },
+    { "name": "lull", "duration_s": 15, "rps": 60, "pattern": "browse", "tls_profiles": ["chrome_120", "firefox_121"] },
+    { "name": "get-flood-replay", "duration_s": 20, "rps": 1500, "pattern": "get_flood", "path": "/api/data", "tls_profiles": ["curl_800"] },
+    { "name": "cooldown", "duration_s": 8, "rps": 50, "pattern": "browse", "tls_profiles": ["chrome_120", "firefox_121"] }
+  ]
+}

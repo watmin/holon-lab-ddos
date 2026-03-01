@@ -74,6 +74,11 @@ struct Args {
     /// Metrics server address
     #[arg(long, default_value = "127.0.0.1:9090")]
     metrics_addr: SocketAddr,
+
+    /// Rule time-to-live in seconds (rules expire after this many seconds
+    /// without being refreshed). Lower values useful for demos.
+    #[arg(long)]
+    rule_ttl: Option<u64>,
 }
 
 #[tokio::main]
@@ -131,12 +136,14 @@ async fn main() -> Result<()> {
         None
     };
     let sidecar_metrics_addr = args.metrics_addr;
+    let sidecar_rule_ttl = args.rule_ttl;
     tokio::spawn(async move {
         if let Err(e) = http_sidecar::run(
             sample_rx,
             sidecar_tree,
             sidecar_engram_path,
             sidecar_metrics_addr,
+            sidecar_rule_ttl,
         ).await {
             error!("sidecar error: {}", e);
         }

@@ -1,0 +1,9 @@
+{
+  "phases": [
+    { "name": "warmup", "duration_s": 15, "rps": 80, "pattern": "browse", "tls_profiles": ["chrome_120", "firefox_121"] },
+    { "name": "credential-stuffing", "duration_s": 25, "rps": 1500, "pattern": "credential_stuff", "path": "/api/v1/auth/login", "tls_profiles": ["python_requests"] },
+    { "name": "lull", "duration_s": 8, "rps": 60, "pattern": "browse", "tls_profiles": ["chrome_120", "firefox_121"] },
+    { "name": "scraper", "duration_s": 25, "rps": 1000, "pattern": "scraper", "tls_profiles": ["python_requests"] },
+    { "name": "cooldown", "duration_s": 8, "rps": 50, "pattern": "browse", "tls_profiles": ["chrome_120", "firefox_121"] }
+  ]
+}

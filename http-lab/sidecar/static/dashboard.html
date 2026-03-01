@@ -612,6 +612,12 @@
                 action: agg.action,
             });
         }
+
+        for (const [key, entry] of state.ruleCounters.entries()) {
+            if (!aggregated.has(key)) {
+                entry.rate = 0;
+            }
+        }
         state.lastCountersTs = ts;
 
         // Pick top N rules by rate
