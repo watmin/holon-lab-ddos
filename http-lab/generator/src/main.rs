@@ -74,18 +74,23 @@ fn default_tls_profiles() -> Vec<String> {
 // TLS profiles
 // =============================================================================
 
-/// A named TLS profile controls what cipher suites and ALPN the client advertises.
-/// For DDoS simulation, the key discriminator is using a uniform profile for all
-/// flood connections vs. varied profiles for legitimate traffic.
+/// A named TLS profile controls what cipher suites, protocol versions, and
+/// ALPN the client advertises.  For DDoS simulation the key discriminator is
+/// using a uniform profile for all flood connections vs. varied profiles for
+/// legitimate traffic.
 ///
-/// Profiles with `shuffle_ciphers: true` use the same cipher suite set but
-/// randomize the order per connection, testing set-based (unordered) detection.
+/// Profiles can restrict to TLS 1.2 only (omitting TLS 1.3 ciphers from the
+/// ClientHello) and/or drop ChaCha ciphers, producing a visibly different
+/// fingerprint across cipher_suites, extensions, and supported_versions.
 #[derive(Debug, Clone)]
 struct TlsProfile {
     #[allow(dead_code)]
     name: String,
     alpn: Vec<Vec<u8>>,
     shuffle_ciphers: bool,
+    tls12_only: bool,
+    /// Keep only AES-GCM cipher suites (drop ChaCha20-Poly1305).
+    aes_only: bool,
 }
 
 fn get_tls_profile(name: &str) -> TlsProfile {
@@ -94,49 +99,74 @@ fn get_tls_profile(name: &str) -> TlsProfile {
             name: name.to_string(),
             alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
             shuffle_ciphers: false,
+            tls12_only: false,
+            aes_only: false,
         },
         "firefox_121" => TlsProfile {
             name: name.to_string(),
             alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
             shuffle_ciphers: false,
+            tls12_only: false,
+            aes_only: false,
         },
         "curl_800" => TlsProfile {
             name: name.to_string(),
             alpn: vec![b"http/1.1".to_vec()],
             shuffle_ciphers: false,
+            tls12_only: true,
+            aes_only: true,
         },
         "python_requests" => TlsProfile {
             name: name.to_string(),
             alpn: vec![],
             shuffle_ciphers: false,
+            tls12_only: false,
+            aes_only: true,
         },
         "bot_shuffled" => TlsProfile {
             name: name.to_string(),
             alpn: vec![b"http/1.1".to_vec()],
             shuffle_ciphers: true,
+            tls12_only: true,
+            aes_only: false,
         },
         _ => TlsProfile {
             name: name.to_string(),
             alpn: vec![b"http/1.1".to_vec()],
             shuffle_ciphers: false,
+            tls12_only: false,
+            aes_only: false,
         },
     }
 }
 
 fn build_tls_config(profile: &TlsProfile, insecure: bool) -> Arc<ClientConfig> {
-    let provider = if profile.shuffle_ciphers {
-        let mut p = rustls::crypto::ring::default_provider();
+    let mut p = rustls::crypto::ring::default_provider();
+
+    if profile.aes_only {
+        p.cipher_suites.retain(|cs| {
+            let name = format!("{:?}", cs.suite());
+            !name.contains("CHACHA")
+        });
+    }
+
+    if profile.shuffle_ciphers {
         p.cipher_suites.shuffle(&mut rand::thread_rng());
-        Arc::new(p)
-    } else {
-        Arc::new(rustls::crypto::ring::default_provider())
-    };
+    }
+
+    let provider = Arc::new(p);
 
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
+    let versions: Vec<&'static rustls::SupportedProtocolVersion> = if profile.tls12_only {
+        vec![&rustls::version::TLS12]
+    } else {
+        vec![&rustls::version::TLS13, &rustls::version::TLS12]
+    };
+
     let builder = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(&versions)
         .expect("valid TLS versions")
         .with_root_certificates(root_store);
 
