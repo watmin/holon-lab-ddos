@@ -25,8 +25,10 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use holon::kernel::{Encoder, VectorManager};
 
 use http_proxy::{
+    denial_token::DenialKey,
     enforcer::RateLimiter,
     expr_tree::ExprCompiledTree,
+    manifold::ManifoldState,
     tls::accept_tls,
     types::{ConnectionContext, SampleMessage},
     http::serve_connection,
@@ -79,6 +81,11 @@ struct Args {
     /// without being refreshed). Lower values useful for demos.
     #[arg(long)]
     rule_ttl: Option<u64>,
+
+    /// Enable denial context tokens (X-Denial-Context header) on manifold
+    /// deny/rate-limit responses. Generates a random AES-256-GCM key on startup.
+    #[arg(long, default_value_t = false)]
+    denial_tokens: bool,
 }
 
 #[tokio::main]
@@ -125,11 +132,24 @@ async fn main() -> Result<()> {
     // Shared rule tree (starts empty — all traffic passes until sidecar populates rules)
     let tree: Arc<ArcSwap<ExprCompiledTree>> = Arc::new(ArcSwap::new(Arc::new(ExprCompiledTree::empty())));
 
+    // Shared manifold state (starts empty — all traffic passes until sidecar trains)
+    let manifold: Arc<ArcSwap<ManifoldState>> = Arc::new(ArcSwap::new(Arc::new(ManifoldState::empty())));
+
+    // Denial context tokens (optional — enabled via --denial-tokens)
+    let denial_key: Option<Arc<DenialKey>> = if args.denial_tokens {
+        let key = DenialKey::generate();
+        info!("Denial context tokens enabled (AES-256-GCM)");
+        Some(Arc::new(key))
+    } else {
+        None
+    };
+
     // Bounded sample channel — proxy uses try_send (drop on full)
     let (sample_tx, sample_rx) = mpsc::channel::<SampleMessage>(args.sample_channel_capacity);
 
     // Spawn sidecar tasks in-process
     let sidecar_tree = tree.clone();
+    let sidecar_manifold = manifold.clone();
     let sidecar_engram_path = if args.persist_engrams {
         Some(args.engram_path.clone())
     } else {
@@ -141,6 +161,7 @@ async fn main() -> Result<()> {
         if let Err(e) = http_sidecar::run(
             sample_rx,
             sidecar_tree,
+            sidecar_manifold,
             sidecar_engram_path,
             sidecar_metrics_addr,
             sidecar_rule_ttl,
@@ -170,9 +191,11 @@ async fn main() -> Result<()> {
 
         let acceptor = acceptor.clone();
         let tree = tree.clone();
+        let manifold = manifold.clone();
         let sample_tx = sample_tx.clone();
         let encoder = encoder.clone();
         let rate_limiter = rate_limiter.clone();
+        let denial_key = denial_key.clone();
         let upstream = args.upstream;
 
         tokio::spawn(async move {
@@ -197,6 +220,9 @@ async fn main() -> Result<()> {
                         tree,
                         sample_tx,
                         rate_limiter,
+                        encoder,
+                        manifold,
+                        denial_key,
                     ).await;
                 }
                 Err(e) => {

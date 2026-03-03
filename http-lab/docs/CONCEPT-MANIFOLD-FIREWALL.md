@@ -1,7 +1,7 @@
 # Concept: Manifold Firewall — Surprise as Rule, Normal as Allow List
 
-**Status:** Design concept — not yet implemented
-**Date:** February 28, 2026
+**Status:** Implemented and validated — see [FINDINGS-MANIFOLD-FIREWALL.md](FINDINGS-MANIFOLD-FIREWALL.md)
+**Date:** February 28, 2026 (concept) / March 3, 2026 (validated)
 
 ## The Insight
 
@@ -50,50 +50,79 @@ Layer 3: Symbolic Rule Tree (known patterns)
 
 ## How the Layers Compose
 
-```
-                              Request arrives
-                                    │
-                          ┌─────────▼──────────┐
-                          │  Layer 3: Rule Tree │ ◄── sub-microsecond
-                          │  Known deny list    │     handles known threats instantly
-                          └────────┬───────────┘
-                                   │ no match
-                          ┌────────▼───────────┐
-                          │  Layer 0: Normal    │ ◄── O(k·dim)
-                          │  Allow list         │     "does this look normal?"
-                          └────────┬───────────┘
-                                   │ doesn't match normal
-                          ┌────────▼───────────┐
-                          │  Layer 1: Surprise  │ ◄── O(k·dim), ~0.4ms
-                          │  Score + attribute  │     continuous anomaly score
-                          └────────┬───────────┘     + field-level explanation
-                                   │
-                                   ▼
-                          Rate-limit proportional
-                          to residual magnitude
-                          + audit log with field
-                          attribution
+```mermaid
+flowchart TD
+    Req["Request arrives"] --> L3{"Layer 3: Rule Tree<br/>~50ns"}
+    L3 -->|"known pattern"| Block["Block / Rate-limit"]
+    L3 -->|"no match"| L0{"Layer 0: Normal Allow List<br/>O(k·dim)"}
+    L0 -->|"matches normal"| Allow["Allow (forward)"]
+    L0 -->|"not normal"| L1{"Layer 1: Anomaly Score<br/>O(k·dim)"}
+    L1 -->|"high residual"| Deny["Deny 403 + attribution"]
+    L1 -->|"moderate residual"| RateLimit["Rate-limit 429"]
+    L1 -->|"below threshold"| Allow
 
-  Meanwhile, continuously:
-
-                          ┌────────────────────┐
-                          │  Layer 2: Window    │ ◄── O(n·k) per window
-                          │  Spectrum matching  │     eigenvalue shape comparison
-                          └────────┬───────────┘
-                                   │
-                          Adjusts threat level,
-                          activates/deactivates
-                          layers, pre-filters
-                          engram candidates
+    subgraph Async["Asynchronous (per window)"]
+        L2["Layer 2: Window Spectrum<br/>O(n·k) per window"]
+        L2 -->|"adjusts"| ThreatMode["ThreatMode:<br/>Normal / Volumetric / Targeted"]
+        ThreatMode -->|"tightens/relaxes"| L1
+        L2 -->|"auto-promotes rules"| L3
+    end
 ```
 
 Layer 3 runs first because it's cheapest (~50ns). Known threats are handled without touching the manifold. Only unknown traffic reaches the geometric layers.
 
 Layer 0 runs next — does this look like normal traffic we've seen before? If yes, pass it through. The allow list is the primary defense for legitimate traffic.
 
-Layer 1 runs on traffic that doesn't match normal. The residual score is the continuous enforcement signal — higher residual = more anomalous = more aggressive rate limiting. No symbolic rule needed. The geometry IS the rule.
+Layer 1 runs on traffic that doesn't match normal. The residual score is the continuous enforcement signal — higher residual = more anomalous = more aggressive rate limiting. No symbolic rule needed. The geometry IS the rule. Two distinct responses for two distinct threats:
+- **DDoS** (high concentration, moderate residual) → **rate-limit** (429)
+- **Exploits** (structurally alien, high residual) → **deny** (403)
 
 Layer 2 runs asynchronously on traffic windows, not individual requests. It provides the strategic view: "the shape of traffic is changing" triggers before per-packet anomalies accumulate. It adjusts which normal engrams are active and pre-filters the engram library for per-packet scoring.
+
+## System Architecture
+
+```mermaid
+flowchart LR
+    subgraph Proxy["Proxy (per-request, sync)"]
+        TLS[TLS Accept] --> HTTP[handle_request]
+        HTTP --> TreeEval["Layer 3: tree.load()"]
+        TreeEval -->|no match| ManifoldEval["Layer 0+1: manifold.load()"]
+        ManifoldEval -->|Verdict| Response[Forward / RateLimit / Deny]
+        HTTP -->|try_send| Channel["mpsc channel"]
+    end
+
+    subgraph Sidecar["Sidecar (async, in-process)"]
+        Channel -->|recv| Loop[tick loop]
+        Loop --> WindowTracker["Layer 2: window subspace"]
+        WindowTracker -->|"match_spectrum x match_alignment"| DualSignal[Dual Signal]
+        DualSignal --> ThreatLevel["ThreatMode + candidates"]
+        Loop --> Detect[SubspaceDetector]
+        Detect --> RuleGen[compile rules]
+        RuleGen -->|"tree.store()"| TreeEval
+        Loop -->|"manifold.store()"| ManifoldEval
+    end
+```
+
+The sidecar publishes two shared objects via ArcSwap (wait-free reads):
+
+- `ExprCompiledTree` (Layer 3) — symbolic rules, auto-promoted from detections
+- `ManifoldState` (Layers 0+1+2) — baseline subspace, normal engrams, threat mode
+
+## DDoS vs Exploit: Two Paths Through the Same Geometry
+
+**Example: 100K RPS GET / flood (DDoS)**
+
+1. First ~500ms: Layer 0+1 catches it per-request (moderate residual → rate-limit)
+2. Layer 2 detects collapsed spectrum → sidecar generates rate-limit rules
+3. Rules inject into ExprCompiledTree (Layer 3) — flood now handled at ~50ns
+4. Manifold layers freed up to focus on anything else
+
+**Example: Low-and-slow Nuclei/ZAP/Nikto scan (Exploit)**
+
+1. Each probe is unique — no concentration, no rule ever generated
+2. Layer 0: "this doesn't look like any normal traffic" → fail
+3. Layer 1: high residual (alien structure) → deny (403)
+4. Every single probe caught individually by geometry
 
 ## Why Allow List > Deny List
 
@@ -175,19 +204,22 @@ Everything is explainable. Everything is auditable. Nothing requires human-autho
 
 Most of the machinery already exists:
 
-| Capability | Status | What's needed |
+| Capability | Status | Notes |
 |---|---|---|
-| OnlineSubspace scoring | Implemented (sidecar) | Move to inline enforcement path |
-| drilldown_probe | Implemented (sidecar) | Expose as audit log on enforcement |
-| EngramLibrary | Implemented | Add "normal" engram type alongside "attack" |
-| match_spectrum | Designed (batch 018) | Implement in Python ref, port to Rust |
-| Baseline freeze | Implemented (FieldTracker) | Extend to normal engram library |
-| ExprCompiledTree | Implemented | Already layer 3 — no changes needed |
-| ArcSwap enforcement | Implemented | Extend to share subspace snapshot |
-| Multi-core scoring | Designed (TECH-DEBT.md) | Required for inline O(k·dim) scoring at scale |
+| OnlineSubspace scoring | **Inline in proxy** | ManifoldState via ArcSwap, evaluate_manifold() |
+| drilldown_probe | **Inline in proxy** | drilldown_audit() on deny, logged per request |
+| EngramLibrary (normal) | **Implemented** | baseline-normal minted at warmup, freeze/thaw on threat mode |
+| match_spectrum / WindowTracker | **Implemented** | Layer 2 window classification: Normal/Volumetric/Targeted |
+| Baseline freeze | **Implemented** | Normal engrams freeze during Volumetric/Targeted, thaw on Normal |
+| ExprCompiledTree | **Implemented** | Layer 3, ~50ns miss, auto-promoted from sidecar detections |
+| ArcSwap ManifoldState | **Implemented** | Sidecar publishes, proxy reads wait-free |
+| Denial context tokens | **Implemented** | AES-256-GCM sealed tokens with field attribution |
+| Engram CLI (CI/CD) | **Implemented** | holon-engram binary: list, export, import |
+| Staleness tracking | **Implemented** | Flags drifted normal engrams |
+| Multi-core scoring | Designed | Required for >40K RPS inline scoring |
 
 The critical engineering challenge: inline subspace scoring at request rate. At ~0.4ms per score, single-threaded throughput is ~2,500 RPS. On 16 cores with the scoring path parallelized (read-only subspace snapshot via ArcSwap), throughput reaches ~40K RPS — viable for WAF, not for volumetric DDoS. For DDoS, layer 3 (rule tree) and layer 2 (window matching) handle the volume; layers 0-1 handle the precision.
 
 ---
 
-*This document captures the conceptual architecture. Implementation is future work. The key primitives (OnlineSubspace, EngramLibrary, drilldown_probe, ExprCompiledTree, match_spectrum) are either implemented or designed. The integration is the work.*
+*This document captures the conceptual architecture. Implementation completed March 3, 2026. Experimental validation showed 97-100% scanner denial rate, 0% false positive rate on normal traffic, and 41 microsecond p50 deny-path latency. See [FINDINGS-MANIFOLD-FIREWALL.md](FINDINGS-MANIFOLD-FIREWALL.md) for full results.*

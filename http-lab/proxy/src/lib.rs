@@ -5,10 +5,12 @@
 //! library for types and the tree compiler. The runner crate provides the
 //! main() entry point and links both proxy and sidecar.
 
+pub mod denial_token;
 pub mod enforcer;
 pub mod expr;
 pub mod expr_tree;
 pub mod http;
+pub mod manifold;
 pub mod tls;
 pub mod tls_names;
 pub mod tree;
@@ -24,6 +26,11 @@ pub static ENFORCED_PASS: AtomicU64 = AtomicU64::new(0);
 pub static ENFORCED_BLOCKS: AtomicU64 = AtomicU64::new(0);
 pub static ENFORCED_RATE_LIMITS: AtomicU64 = AtomicU64::new(0);
 pub static ENFORCED_CLOSE_CONN: AtomicU64 = AtomicU64::new(0);
+
+pub static MANIFOLD_ALLOW: AtomicU64 = AtomicU64::new(0);
+pub static MANIFOLD_WARMUP: AtomicU64 = AtomicU64::new(0);
+pub static MANIFOLD_RATE_LIMIT: AtomicU64 = AtomicU64::new(0);
+pub static MANIFOLD_DENY: AtomicU64 = AtomicU64::new(0);
 
 static RULE_COUNTERS: Mutex<Option<HashMap<u32, u64>>> = Mutex::new(None);
 
@@ -46,5 +53,15 @@ pub fn enforcement_counts() -> (u64, u64, u64, u64) {
         ENFORCED_BLOCKS.load(Ordering::Relaxed),
         ENFORCED_RATE_LIMITS.load(Ordering::Relaxed),
         ENFORCED_CLOSE_CONN.load(Ordering::Relaxed),
+    )
+}
+
+/// Snapshot of manifold enforcement counters.
+pub fn manifold_counts() -> (u64, u64, u64, u64) {
+    (
+        MANIFOLD_ALLOW.load(Ordering::Relaxed),
+        MANIFOLD_WARMUP.load(Ordering::Relaxed),
+        MANIFOLD_RATE_LIMIT.load(Ordering::Relaxed),
+        MANIFOLD_DENY.load(Ordering::Relaxed),
     )
 }

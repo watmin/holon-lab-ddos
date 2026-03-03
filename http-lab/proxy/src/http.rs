@@ -28,8 +28,12 @@ use tracing::{debug, warn};
 
 use crate::tls::ReplayStream;
 
+use holon::kernel::Encoder;
+
 use crate::enforcer::{RateLimiter, Verdict};
 use crate::expr_tree::ExprCompiledTree;
+use crate::denial_token::{self, DenialContext, DenialKey};
+use crate::manifold::{ManifoldState, ManifoldVerdict, evaluate_manifold, drilldown_audit};
 use crate::types::{
     ConnectionContext, HttpVersion, RequestSample,
     SampleMessage, TlsSample, now_us,
@@ -47,6 +51,9 @@ pub async fn serve_connection(
     tree: Arc<ArcSwap<ExprCompiledTree>>,
     sample_tx: mpsc::Sender<SampleMessage>,
     rate_limiter: Arc<RateLimiter>,
+    encoder: Arc<Encoder>,
+    manifold: Arc<ArcSwap<ManifoldState>>,
+    denial_key: Option<Arc<DenialKey>>,
 ) {
     // Best-effort: send TLS sample to sidecar
     let tls_sample = TlsSample::from_conn(&conn_ctx);
@@ -56,14 +63,20 @@ pub async fn serve_connection(
     let tree_c = tree.clone();
     let sample_tx_c = sample_tx.clone();
     let rl = rate_limiter.clone();
+    let enc = encoder.clone();
+    let mfld = manifold.clone();
+    let dk = denial_key.clone();
 
     let svc = service_fn(move |req: Request<Incoming>| {
         let conn_ctx = conn_ctx_c.clone();
         let tree = tree_c.clone();
         let sample_tx = sample_tx_c.clone();
         let rate_limiter = rl.clone();
+        let encoder = enc.clone();
+        let manifold = mfld.clone();
+        let denial_key = dk.clone();
         async move {
-            handle_request(req, conn_ctx, upstream_addr, tree, sample_tx, rate_limiter).await
+            handle_request(req, conn_ctx, upstream_addr, tree, sample_tx, rate_limiter, encoder, manifold, denial_key).await
         }
     });
 
@@ -86,10 +99,13 @@ async fn handle_request(
     tree: Arc<ArcSwap<ExprCompiledTree>>,
     sample_tx: mpsc::Sender<SampleMessage>,
     rate_limiter: Arc<RateLimiter>,
+    encoder: Arc<Encoder>,
+    manifold: Arc<ArcSwap<ManifoldState>>,
+    denial_key: Option<Arc<DenialKey>>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let sample = build_request_sample(&req, &conn_ctx);
 
-    // Phase 1: synchronous rule check (wait-free ArcSwap load)
+    // Layer 3: synchronous rule check (wait-free ArcSwap load)
     let compiled = tree.load();
     let (verdict, rule_id) = crate::enforcer::evaluate(&sample, &compiled);
 
@@ -122,16 +138,90 @@ async fn handle_request(
                     .body(Full::new(Bytes::from("Rate limited\n")))
                     .unwrap());
             }
-            crate::ENFORCED_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let _ = sample_tx.try_send(SampleMessage::RequestSample(sample.clone()));
+            // Layer 3 rate-limit allowed through — still forward + sample
         }
-        Verdict::Pass | Verdict::Count => {
-            crate::ENFORCED_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let _ = sample_tx.try_send(SampleMessage::RequestSample(sample.clone()));
-        }
+        Verdict::Pass | Verdict::Count => {}
     }
 
-    // Forward to upstream
+    // Layers 0+1: manifold scoring (only when manifold is trained)
+    let mstate = manifold.load();
+    if mstate.is_ready() {
+        let req_vec = encoder.encode_walkable(&sample);
+        let vec_f64: Vec<f64> = req_vec.data().iter().map(|&b| b as f64).collect();
+        let mverdict = evaluate_manifold(&vec_f64, &mstate);
+
+        match mverdict {
+            ManifoldVerdict::Allow => {
+                crate::MANIFOLD_ALLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            ManifoldVerdict::Warmup => {
+                crate::MANIFOLD_WARMUP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            ManifoldVerdict::RateLimit { rps, residual } => {
+                crate::MANIFOLD_RATE_LIMIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !rate_limiter.allow(sample.src_ip, rps as u32) {
+                    let attribution = drilldown_audit(&vec_f64, &mstate, &encoder, 5);
+                    let fields: Vec<String> = attribution.iter()
+                        .map(|a| format!("{}={:.1}", a.field, a.score))
+                        .collect();
+                    warn!(
+                        src = %sample.src_ip,
+                        residual = format!("{:.3}", residual),
+                        fields = fields.join(","),
+                        "manifold rate-limit"
+                    );
+                    let token = build_denial_token(
+                        "rate_limit", residual, &mstate, &attribution,
+                        &sample, &denial_key,
+                    );
+                    let _ = sample_tx.try_send(SampleMessage::RequestSample(sample));
+                    let mut builder = Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS);
+                    if let Some(t) = &token {
+                        builder = builder.header("X-Denial-Context", t.as_str());
+                    }
+                    return Ok(builder
+                        .body(Full::new(Bytes::from("Manifold rate limited\n")))
+                        .unwrap());
+                }
+            }
+            ManifoldVerdict::Deny { residual } => {
+                crate::MANIFOLD_DENY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let attribution = drilldown_audit(&vec_f64, &mstate, &encoder, 5);
+                let fields: Vec<String> = attribution.iter()
+                    .map(|a| format!("{}={:.1}", a.field, a.score))
+                    .collect();
+                warn!(
+                    src = %sample.src_ip,
+                    method = %sample.method,
+                    path = %sample.path,
+                    residual = format!("{:.3}", residual),
+                    fields = fields.join(","),
+                    "manifold deny"
+                );
+                let token = build_denial_token(
+                    "deny", residual, &mstate, &attribution,
+                    &sample, &denial_key,
+                );
+                let _ = sample_tx.try_send(SampleMessage::RequestSample(sample));
+                let mut builder = Response::builder()
+                    .status(StatusCode::FORBIDDEN);
+                if let Some(t) = &token {
+                    builder = builder.header("X-Denial-Context", t.as_str());
+                }
+                return Ok(builder
+                    .body(Full::new(Bytes::from("Denied by manifold\n")))
+                    .unwrap());
+            }
+        }
+    } else {
+        crate::MANIFOLD_WARMUP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Request passed all layers — send sample to sidecar and forward
+    crate::ENFORCED_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _ = sample_tx.try_send(SampleMessage::RequestSample(sample.clone()));
+
     match forward_to_upstream(req, upstream_addr, &sample).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
@@ -206,6 +296,36 @@ fn build_request_sample(
         tls_ctx: conn_ctx.tls_ctx.clone(),
         tls_vec: conn_ctx.tls_vec.clone(),
         timestamp_us: now_us(),
+    }
+}
+
+fn build_denial_token(
+    verdict: &str,
+    residual: f64,
+    mstate: &ManifoldState,
+    attribution: &[crate::manifold::DrilldownAttribution],
+    sample: &RequestSample,
+    denial_key: &Option<Arc<DenialKey>>,
+) -> Option<String> {
+    let key = denial_key.as_ref()?;
+    let baseline = mstate.baseline.as_ref()?;
+    let ctx = DenialContext {
+        verdict: verdict.to_string(),
+        residual,
+        threshold: baseline.threshold(),
+        deny_threshold: mstate.deny_threshold,
+        top_fields: attribution.iter().map(|a| a.into()).collect(),
+        src_ip: sample.src_ip.to_string(),
+        method: sample.method.clone(),
+        path: sample.path.clone(),
+        timestamp_us: sample.timestamp_us,
+    };
+    match denial_token::seal(&ctx, key) {
+        Ok(token) => Some(token),
+        Err(e) => {
+            warn!("denial token seal error: {}", e);
+            None
+        }
     }
 }
 

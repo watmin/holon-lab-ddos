@@ -1,0 +1,19 @@
+# DVWA backend for manifold firewall live testing.
+# Usage:
+#   docker compose up -d      # start DVWA on :8080
+#   docker compose down -v    # stop and remove volumes
+#
+# Default credentials: admin / password
+# First visit: click "Create / Reset Database" at /setup.php
+
+services:
+  dvwa:
+    image: cytopia/dvwa:latest
+    ports:
+      - "8080:80"
+    environment:
+      - RECAPTCHA_PRIV_KEY=
+      - RECAPTCHA_PUB_KEY=
+      - SECURITY_LEVEL=low
+      - PHPIDS_ENABLED=0
+    restart: unless-stopped

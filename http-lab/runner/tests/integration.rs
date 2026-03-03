@@ -29,6 +29,7 @@ use http_proxy::expr::{Dimension, Expr, RuleExpr, Value};
 use http_proxy::expr_tree::{compile_expr, ExprCompiledTree};
 use http_proxy::http::serve_connection;
 use http_proxy::enforcer::RateLimiter;
+use http_proxy::manifold::ManifoldState;
 
 // =============================================================================
 // TLS config helpers (self-signed certs via rcgen)
@@ -118,6 +119,7 @@ async fn setup() -> (
             let tree = tree_clone.clone();
             let sample_tx = sample_tx.clone();
             let encoder = encoder.clone();
+            let manifold: Arc<ArcSwap<ManifoldState>> = Arc::new(ArcSwap::new(Arc::new(ManifoldState::empty())));
             tokio::spawn(async move {
                 match accept_tls(tcp_stream, &acceptor).await {
                     Ok((tls_stream, tls_ctx)) => {
@@ -135,6 +137,9 @@ async fn setup() -> (
                             tree,
                             sample_tx,
                             rate_limiter,
+                            encoder,
+                            manifold,
+                            None, // no denial tokens in tests
                         ).await;
                     }
                     Err(_) => {}

@@ -33,9 +33,10 @@ use tracing::{info, warn};
 
 use http_proxy::expr::RuleExpr;
 use http_proxy::expr_tree::ExprCompiledTree;
+use http_proxy::manifold::{ManifoldState, NormalSubspace, ThreatMode as ManifoldThreatMode};
 use http_proxy::types::{RequestSample, RuleAction, SampleMessage, TlsSample};
 use crate::detection::{compile_compound_rule_expr, compile_merged_rule_expr, Detection};
-use crate::detectors::{SubspaceDetector, SurpriseHistory, drilldown_probe};
+use crate::detectors::{SubspaceDetector, SurpriseHistory, ThreatMode, WindowTracker, drilldown_probe};
 use crate::field_tracker::FieldTracker;
 use crate::metrics_server::{
     DashboardEvent, MetricsAppState, RuleSummary,
@@ -81,6 +82,16 @@ const WARMUP_SAMPLES_REQ: usize = 500;
 const ANOMALY_STREAK_THRESHOLD: usize = 3;
 const RULE_TTL_SECS: u64 = 300;
 
+/// Window size for Layer 2 spectrum matching (validated in batch 018 experiment 003).
+const WINDOW_SIZE: usize = 100;
+
+/// Staleness limit: normal engrams with drift ratio above this are flagged stale
+/// (from experiment 012 — 15x drift means the engram no longer represents current traffic).
+const STALENESS_LIMIT: f64 = 15.0;
+
+/// How often to check staleness (every N ticks).
+const STALENESS_CHECK_INTERVAL: u64 = 50;
+
 /// Per-sample exponential decay factor: 0.5^(1/DECAY_HALF_LIFE).
 /// At half_life=500 requests, a sample's influence halves every 500 new requests.
 const DECAY_HALF_LIFE: usize = 500;
@@ -95,6 +106,7 @@ const DECAY_HALF_LIFE: usize = 500;
 pub async fn run(
     mut sample_rx: mpsc::Receiver<SampleMessage>,
     tree: Arc<ArcSwap<ExprCompiledTree>>,
+    manifold: Arc<ArcSwap<ManifoldState>>,
     engram_path: Option<String>,
     metrics_addr: SocketAddr,
     rule_ttl_secs: Option<u64>,
@@ -161,6 +173,10 @@ pub async fn run(
     // Surprise history for cross-tick consistency (content-before-shape prioritization)
     let mut surprise_history = SurpriseHistory::new(5);
 
+    // Layer 2: window-level spectrum tracking
+    let mut req_window_tracker = WindowTracker::new(VSA_DIM, VSA_K, WINDOW_SIZE);
+    let mut current_threat_mode = ThreatMode::Normal;
+
     let mut last_tick = Instant::now();
     let mut req_since_tick = 0usize;
     let mut tls_since_tick = 0usize;
@@ -209,12 +225,73 @@ pub async fn run(
                     if warmup_start.is_none() {
                         warmup_start = Some(Instant::now());
                     }
-                    process_req_sample(
+                    let window_result = process_req_sample(
                         &s, &encoder, &mut req_detector, &mut req_tracker,
                         &mut req_warmup_count, req_warmup_done, decay_alpha,
                         &mut req_tick_max_residual, &mut req_tick_max_vec,
                         &mut req_tick_max_sample,
+                        &mut req_window_tracker,
                     );
+                    if let Some(wr) = window_result {
+                        info!(
+                            "[WINDOW] explained={:.3} candidates={} mode={:?}",
+                            wr.explained_ratio, wr.candidates.len(), wr.threat_mode,
+                        );
+                        for (name, score) in wr.candidates.iter().take(3) {
+                            info!("  candidate: {} score={:.4}", name, score);
+                        }
+
+                        // Update strategic threat mode
+                        let num_candidates = wr.candidates.len();
+                        match wr.threat_mode {
+                            ThreatMode::Volumetric { top_engram, .. } => {
+                                let mode = ThreatMode::Volumetric {
+                                    estimated_rps,
+                                    top_engram: top_engram.clone(),
+                                };
+                                warn!("[WINDOW] VOLUMETRIC threat detected: {:?}", mode);
+                                let _ = event_tx.send(DashboardEvent::DetectionEvent {
+                                    ts: now_ts(), detector: "WINDOW".into(),
+                                    kind: "volumetric".into(),
+                                    detail: format!("top={:?} candidates={}", top_engram, num_candidates),
+                                });
+                                current_threat_mode = mode;
+                                req_detector.freeze_normal();
+                                if req_warmup_done {
+                                    manifold.store(Arc::new(build_manifold_state(
+                                        &mut req_detector, &current_threat_mode, baseline_rps,
+                                    )));
+                                }
+                            }
+                            ThreatMode::Targeted { ref top_engram } => {
+                                warn!("[WINDOW] TARGETED threat detected: top={:?}", top_engram);
+                                let _ = event_tx.send(DashboardEvent::DetectionEvent {
+                                    ts: now_ts(), detector: "WINDOW".into(),
+                                    kind: "targeted".into(),
+                                    detail: format!("top={:?}", top_engram),
+                                });
+                                current_threat_mode = wr.threat_mode;
+                                req_detector.freeze_normal();
+                                if req_warmup_done {
+                                    manifold.store(Arc::new(build_manifold_state(
+                                        &mut req_detector, &current_threat_mode, baseline_rps,
+                                    )));
+                                }
+                            }
+                            ThreatMode::Normal => {
+                                if !matches!(current_threat_mode, ThreatMode::Normal) {
+                                    info!("[WINDOW] Threat subsided → Normal");
+                                    current_threat_mode = ThreatMode::Normal;
+                                    req_detector.thaw_normal();
+                                    if req_warmup_done {
+                                        manifold.store(Arc::new(build_manifold_state(
+                                            &mut req_detector, &current_threat_mode, baseline_rps,
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -292,8 +369,14 @@ pub async fn run(
                 .max(0.1);
             baseline_rps = req_warmup_count as f64 / warmup_secs;
             req_tracker.freeze_baseline(0.5);
-            info!("[REQ] Warmup complete ({} samples, threshold={:.2}, baseline_rps={:.0})",
+            req_detector.mint_normal_engram("baseline-normal");
+            info!("[REQ] Warmup complete ({} samples, threshold={:.2}, baseline_rps={:.0}, normal engram minted)",
                   req_warmup_count, req_detector.baseline.threshold(), baseline_rps);
+
+            let mstate = build_manifold_state(&mut req_detector, &current_threat_mode, baseline_rps);
+            manifold.store(Arc::new(mstate));
+            info!("[MANIFOLD] Initial state published (deny_threshold={:.2})",
+                  req_detector.baseline.threshold() * 2.0);
         }
 
         // -------------------------------------------------------------------
@@ -531,6 +614,20 @@ pub async fn run(
         req_tick_max_vec = None;
         req_tick_max_sample = None;
 
+        // Periodic staleness check for normal engrams
+        if req_warmup_done && tick_count % STALENESS_CHECK_INTERVAL == 0 {
+            let stale = req_detector.check_staleness(STALENESS_LIMIT);
+            for (name, drift) in &stale {
+                warn!("[STALENESS] Normal engram '{}' drift={:.1}x (limit={:.0}x)",
+                      name, drift, STALENESS_LIMIT);
+                let _ = event_tx.send(DashboardEvent::DetectionEvent {
+                    ts: now_ts(), detector: "STALENESS".into(),
+                    kind: "stale_engram".into(),
+                    detail: format!("'{}' drift={:.1}x", name, drift),
+                });
+            }
+        }
+
         // Expire old rules periodically
         {
             let mut mgr = rule_mgr.lock().await;
@@ -549,6 +646,7 @@ pub async fn run(
         // Update metrics + emit SSE
         let rules_count;
         let (pass, blocks, rate_limits, close_conn) = http_proxy::enforcement_counts();
+        let (m_allow, m_warmup, m_rate_limit, m_deny) = http_proxy::manifold_counts();
         {
             let mgr = rule_mgr.lock().await;
             rules_count = mgr.rule_count();
@@ -642,7 +740,8 @@ pub async fn run(
                  tls[score={:.2},thr={:.2},streak={}] \
                  req[score={:.2},thr={:.2},streak={}] \
                  rules={} engrams(tls={},req={}) warmup(tls={},req={}) \
-                 enforced(pass={},block={},rate_limit={},close={})",
+                 enforced(pass={},block={},rate_limit={},close={}) \
+                 manifold(allow={},warmup={},rate_limit={},deny={})",
                 s.tick_count,
                 s.tls_samples_received, s.req_samples_received,
                 s.estimated_rps,
@@ -653,6 +752,7 @@ pub async fn run(
                 if s.warmup_tls { format!("{}/{}", s.warmup_samples_tls, WARMUP_SAMPLES_TLS) } else { "done".into() },
                 if s.warmup_req { format!("{}/{}", s.warmup_samples_req, WARMUP_SAMPLES_REQ) } else { "done".into() },
                 s.enforced_pass, s.enforced_blocks, s.enforced_rate_limits, s.enforced_close_conn,
+                m_allow, m_warmup, m_rate_limit, m_deny,
             );
         }
     }
@@ -687,9 +787,10 @@ fn process_tls_sample(
     }
 }
 
-/// Process a single REQ sample: encode, decay accumulator, learn/score, track fields.
-/// When a sample achieves the max residual for this tick, stores both the f64 vector
-/// AND the original sample (for drill-down probing at detection time).
+/// Process a single REQ sample: encode, decay accumulator, learn/score, track fields,
+/// and feed the window tracker.
+///
+/// Returns a `WindowResult` when the window fills (every WINDOW_SIZE samples).
 fn process_req_sample(
     sample: &RequestSample,
     encoder: &Encoder,
@@ -701,7 +802,8 @@ fn process_req_sample(
     tick_max_residual: &mut f64,
     tick_max_vec: &mut Option<Vec<f64>>,
     tick_max_sample: &mut Option<RequestSample>,
-) {
+    window_tracker: &mut WindowTracker,
+) -> Option<detectors::WindowResult> {
     let req_vec = encoder.encode_walkable(sample);
     let vec_f64: Vec<f64> = req_vec.data().iter()
         .map(|&b| b as f64)
@@ -714,10 +816,17 @@ fn process_req_sample(
         let residual = detector.score(&vec_f64);
         if residual > *tick_max_residual {
             *tick_max_residual = residual;
-            *tick_max_vec = Some(vec_f64);
+            *tick_max_vec = Some(vec_f64.clone());
             *tick_max_sample = Some(sample.clone());
         }
     }
+
+    // Feed Layer 2 window tracker (after warmup only)
+    let window_result = if warmup_done {
+        window_tracker.observe(&vec_f64, &mut detector.library)
+    } else {
+        None
+    };
 
     // Track field values for concentration detection (with per-request decay)
     let pairs: Vec<(&str, String)> = vec![
@@ -735,6 +844,8 @@ fn process_req_sample(
         ("tls_group_set", sample.tls_ctx.group_set_string()),
     ];
     tracker.observe_with_decay(&pairs, decay_alpha);
+
+    window_result
 }
 
 // =============================================================================
@@ -852,6 +963,44 @@ fn broadcast_dag(tree: &ArcSwap<ExprCompiledTree>, event_tx: &broadcast::Sender<
         }
     }
     let _ = event_tx.send(DashboardEvent::DagSnapshot { ts: now_ts(), nodes });
+}
+
+/// Build a ManifoldState snapshot from the current sidecar detector state.
+fn build_manifold_state(
+    detector: &mut SubspaceDetector,
+    threat_mode: &ThreatMode,
+    baseline_rps: f64,
+) -> ManifoldState {
+    let baseline = Some(detector.baseline.clone());
+    let threshold = detector.baseline.threshold();
+
+    let names: Vec<String> = detector.normal_library.names()
+        .into_iter().map(|s| s.to_string()).collect();
+    let normal_subspaces: Vec<NormalSubspace> = names.into_iter()
+        .filter_map(|name| {
+            detector.normal_library.get_mut(&name).map(|engram| NormalSubspace {
+                name: name.clone(),
+                subspace: engram.subspace().clone(),
+                threshold,
+            })
+        })
+        .collect();
+
+    let manifold_threat = match threat_mode {
+        ThreatMode::Normal => ManifoldThreatMode::Normal,
+        ThreatMode::Volumetric { estimated_rps, .. } => {
+            ManifoldThreatMode::Volumetric { estimated_rps: *estimated_rps }
+        }
+        ThreatMode::Targeted { .. } => ManifoldThreatMode::Targeted,
+    };
+
+    ManifoldState {
+        normal_subspaces,
+        baseline,
+        threat_mode: manifold_threat,
+        deny_threshold: threshold * 2.0,
+        rate_limit_rps: baseline_rps.max(10.0),
+    }
 }
 
 /// Compute per-sample decay factor from half-life.

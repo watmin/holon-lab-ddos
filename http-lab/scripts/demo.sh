@@ -6,8 +6,9 @@
 #   4. Watch metrics
 #
 # Usage:
-#   ./demo.sh                            # built-in single-wave scenario
-#   ./demo.sh --scenario multi_attack    # multi-wave attack from scenarios/
+#   ./demo.sh                                      # built-in single-wave scenario
+#   ./demo.sh --scenario multi_attack              # multi-wave attack from scenarios/
+#   ./demo.sh --scenario manifold_firewall --denial-tokens  # manifold test with tokens
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,10 +20,12 @@ ENGRAMS_DIR="$LAB_DIR/engrams"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 SCENARIO_ARG=""
-for arg in "$@"; do
-    case "$arg" in
-        --scenario)  shift; SCENARIO_ARG="$1"; shift ;;
-        *)           ;;
+DENIAL_TOKENS=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --scenario)       SCENARIO_ARG="$2"; shift 2 ;;
+        --denial-tokens)  DENIAL_TOKENS="--denial-tokens"; shift ;;
+        *)                shift ;;
     esac
 done
 
@@ -47,7 +50,11 @@ if [[ -f "$PROXY_PID_FILE" ]] && kill -0 "$(cat "$PROXY_PID_FILE")" 2>/dev/null;
     sleep 1
 fi
 
-echo "==> Starting proxy on :8443 (metrics on :9090)"
+TOKENS_MSG=""
+if [[ -n "$DENIAL_TOKENS" ]]; then
+    TOKENS_MSG=" + denial tokens"
+fi
+echo "==> Starting proxy on :8443 (metrics on :9090)${TOKENS_MSG}"
 RUST_LOG=info "$PROXY_BIN" \
     --listen 0.0.0.0:8443 \
     --upstream 127.0.0.1:8080 \
@@ -55,6 +62,7 @@ RUST_LOG=info "$PROXY_BIN" \
     --key "$CERTS_DIR/key.pem" \
     --engram-path "$ENGRAMS_DIR/http" \
     --metrics-addr 127.0.0.1:9090 \
+    $DENIAL_TOKENS \
     > "$PROXY_LOG" 2>&1 &
 echo $! > "$PROXY_PID_FILE"
 sleep 2
@@ -91,9 +99,35 @@ RUST_LOG=info "$GENERATOR_BIN" \
     2>&1 | tee "$GENERATOR_LOG"
 
 echo ""
-echo "==> Demo complete"
-echo "    Proxy log: $PROXY_LOG"
-echo "    Check rules: grep -E 'Rule added|ANOMALY|ENGRAM' $PROXY_LOG"
-echo "    Final metrics: curl -s http://127.0.0.1:9090/metrics | python3 -m json.tool"
+echo "=========================================="
+echo " Demo Complete — Results"
+echo "=========================================="
+echo ""
+echo "--- Generator per-phase results ---"
+grep 'PHASE_RESULT' "$GENERATOR_LOG" || echo "  (no PHASE_RESULT lines found)"
+echo ""
+grep 'FINAL_SUMMARY' "$GENERATOR_LOG" || true
+echo ""
+
+echo "--- Manifold verdict counts ---"
+curl -sf http://127.0.0.1:9090/metrics 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for k in ['manifold_allow','manifold_warmup','manifold_rate_limit','manifold_deny']:
+        v = data.get(k, 'N/A')
+        print(f'  {k}: {v}')
+except:
+    print('  (could not parse metrics)')
+" || echo "  (metrics endpoint not available)"
+
+echo ""
+echo "--- Rule tree activity ---"
+echo "  Rules added: $(grep -c 'Rule added' "$PROXY_LOG" 2>/dev/null || echo 0)"
+echo "  Engrams minted: $(grep -c 'ENGRAM' "$PROXY_LOG" 2>/dev/null || echo 0)"
+
+echo ""
+echo "Proxy log: $PROXY_LOG"
+echo "Generator log: $GENERATOR_LOG"
 echo ""
 echo "To stop everything: $SCRIPT_DIR/teardown.sh"

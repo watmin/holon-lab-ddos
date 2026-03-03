@@ -1,0 +1,75 @@
+{
+  "phases": [
+    {
+      "name": "warmup",
+      "duration_s": 30,
+      "rps": 80,
+      "pattern": "dvwa_browse",
+      "tls_profiles": ["chrome_120", "firefox_121"]
+    },
+    {
+      "name": "normal-steady",
+      "duration_s": 15,
+      "rps": 80,
+      "pattern": "dvwa_browse",
+      "tls_profiles": ["chrome_120", "firefox_121"]
+    },
+    {
+      "name": "scanner-probe",
+      "duration_s": 30,
+      "rps": 10,
+      "pattern": "scanner",
+      "tls_profiles": ["python_requests"]
+    },
+    {
+      "name": "lull-1",
+      "duration_s": 10,
+      "rps": 60,
+      "pattern": "dvwa_browse",
+      "tls_profiles": ["chrome_120", "firefox_121"]
+    },
+    {
+      "name": "smuggle-probe",
+      "duration_s": 20,
+      "rps": 5,
+      "pattern": "smuggle",
+      "tls_profiles": ["python_requests"]
+    },
+    {
+      "name": "lull-2",
+      "duration_s": 10,
+      "rps": 60,
+      "pattern": "dvwa_browse",
+      "tls_profiles": ["chrome_120", "firefox_121"]
+    },
+    {
+      "name": "ddos-flood",
+      "duration_s": 30,
+      "rps": 2000,
+      "pattern": "get_flood",
+      "path": "/api/search",
+      "tls_profiles": ["curl_800"]
+    },
+    {
+      "name": "lull-3",
+      "duration_s": 15,
+      "rps": 60,
+      "pattern": "dvwa_browse",
+      "tls_profiles": ["chrome_120", "firefox_121"]
+    },
+    {
+      "name": "scanner-mixed",
+      "duration_s": 30,
+      "rps": 15,
+      "pattern": "scanner",
+      "tls_profiles": ["python_requests"]
+    },
+    {
+      "name": "cooldown",
+      "duration_s": 15,
+      "rps": 50,
+      "pattern": "dvwa_browse",
+      "tls_profiles": ["chrome_120", "firefox_121"]
+    }
+  ]
+}

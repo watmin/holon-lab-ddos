@@ -7,6 +7,10 @@ edition = "2021"
 name = "http-proxy"
 path = "src/main.rs"
 
+[[bin]]
+name = "holon-engram"
+path = "src/engram_cli.rs"
+
 [dependencies]
 tokio = { workspace = true }
 anyhow = { workspace = true }
@@ -15,6 +19,7 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 clap = { workspace = true }
 chrono = "0.4"
+serde_json = { workspace = true }
 
 # Proxy lib (types, TLS, HTTP, tree, enforcer)
 http-proxy = { path = "../proxy" }

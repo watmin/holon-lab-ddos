@@ -38,6 +38,10 @@ edn-rs = "0.18.0"
 # Shared rule tree swap
 arc-swap = "1"
 
+# Denial context tokens
+ring = "0.17"
+base64 = "0.22"
+
 # Holon VSA
 holon = { path = "../../../holon-rs" }
 
