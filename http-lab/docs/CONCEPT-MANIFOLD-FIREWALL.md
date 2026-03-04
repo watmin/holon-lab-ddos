@@ -1,4 +1,4 @@
-# Concept: Manifold Firewall — Surprise as Rule, Normal as Allow List
+# Concept: Spectral Firewall — Surprise as Rule, Normal as Allow List
 
 **Status:** Implemented and validated — see [FINDINGS-MANIFOLD-FIREWALL.md](FINDINGS-MANIFOLD-FIREWALL.md)
 **Date:** February 28, 2026 (concept) / March 3, 2026 (validated)
@@ -189,7 +189,7 @@ Traditional WAF: human writes rules → engine checks rules → block/allow. The
 
 Current http-lab: system detects anomaly → generates symbolic rules → engine checks rules. The detection is the bottleneck. The rules are still discrete. But the system generates them autonomously.
 
-Manifold firewall: system learns normal → scores everything against the manifold → the geometry IS the rule. No bottleneck. No discretization. The attacker must be *inside* the normal manifold to pass — which means being genuinely normal.
+Spectral firewall: system learns normal → scores everything against the manifold → the geometry IS the rule. No bottleneck. No discretization. The attacker must be *inside* the normal manifold to pass — which means being genuinely normal.
 
 The symbolic rules (layer 3) become the *fast path for known threats*, not the primary defense. The manifold (layers 0-1) is the primary defense. The spectrum (layer 2) is the strategic awareness layer. Together:
 

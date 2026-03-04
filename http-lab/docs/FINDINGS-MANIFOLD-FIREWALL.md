@@ -1,4 +1,4 @@
-# Manifold Firewall — Experimental Findings
+# Spectral Firewall — Experimental Findings
 
 **Date:** March 3, 2026
 **Status:** Validated — all layers operational, exceeding targets
@@ -10,7 +10,7 @@ A WAF with no attack signatures, no rules, no CVE database, and no prior knowled
 ## Experiment Setup
 
 **Backend:** Mock HTTP echo server on :8080
-**Proxy:** holon http-proxy on :8443 with manifold firewall + denial tokens enabled
+**Proxy:** holon http-proxy on :8443 with spectral firewall + denial tokens enabled
 **Generator:** http-generator with configurable traffic patterns and per-phase instrumentation
 
 Three traffic patterns:
@@ -21,7 +21,7 @@ Three traffic patterns:
 
 - **get_flood**: Volumetric GET flood on a single path with uniform TLS fingerprint (curl_800).
 
-## Results — Manifold Firewall Scenario (10 phases, 205 seconds, 64,678 requests)
+## Results — Spectral Firewall Scenario (10 phases, 205 seconds, 64,678 requests)
 
 ```
 PHASE_RESULT name=warmup         total=2396  2xx=2396 403=0    429=0     | 2xx%=100.0  403%=0.0   429%=0.0
@@ -54,7 +54,7 @@ FINAL_SUMMARY sent=64678 errors=0 2xx=7147 403=5355 429=52174
 
 ## Latency
 
-All latencies are end-to-end (TLS + HTTP parse + manifold scoring + upstream + response).
+All latencies are end-to-end (TLS + HTTP parse + spectral scoring + upstream + response).
 
 | Phase | p50 | p95 | p99 |
 |-------|-----|-----|-----|
@@ -63,9 +63,9 @@ All latencies are end-to-end (TLS + HTTP parse + manifold scoring + upstream + r
 | DDoS (rate-limited) | **41us** | 3.0ms | 6.4ms |
 | Cooldown (normal) | 5.8ms | 9.5ms | 11.6ms |
 
-The 41 microsecond p50 during DDoS flood is the full deny-path latency: HTTP parse, Layer 3 rule tree evaluation, manifold encoding + projection + scoring, and 429 response generation. Denied requests never reach upstream, so the manifold inspection overhead itself is a subset of that 41us.
+The 41 microsecond p50 during DDoS flood is the full deny-path latency: HTTP parse, Layer 3 rule tree evaluation, spectral encoding + projection + scoring, and 429 response generation. Denied requests never reach upstream, so the spectral inspection overhead itself is a subset of that 41us.
 
-Normal traffic latency (~5-6ms) is dominated by the upstream round-trip to the mock backend. The manifold adds no measurable overhead on the allow path.
+Normal traffic latency (~5-6ms) is dominated by the upstream round-trip to the mock backend. The spectral layer adds no measurable overhead on the allow path.
 
 ## What Happened Inside
 
@@ -101,7 +101,7 @@ Normal traffic latency (~5-6ms) is dominated by the upstream round-trip to the m
 
 ### The Allow List Inverts the Attacker's Problem
 Traditional WAF: attacker must avoid being on the deny list (infinite attack surface, finite rules).
-Manifold firewall: attacker must be on the allow list (they must make their traffic geometrically indistinguishable from real users across all dimensions simultaneously). This is fundamentally harder.
+Spectral firewall: attacker must be on the allow list (they must make their traffic geometrically indistinguishable from real users across all dimensions simultaneously). This is fundamentally harder.
 
 ### Every Dimension Fires Simultaneously
 The scanner traffic is anomalous on path, path_parts, path_shape, query, query_parts, query_shape, headers, header_order, header_shapes, header_count, user_agent, and cookie presence — all at once. The residual captures the joint deviation across all dimensions. An attacker who fixes one dimension (e.g., uses a browser UA) still fails on all the others.
@@ -123,7 +123,7 @@ Each layer feeds the others: Layer 2 adjusts threat mode for Layer 1, Layer 1 an
 
 ## Why the Normal Baseline Matters
 
-The `dvwa_browse` traffic pattern creates a subspace with real geometric structure — not a trivial "just GET /" distribution. The manifold learns variance across every encoded dimension:
+The `dvwa_browse` traffic pattern creates a subspace with real geometric structure — not a trivial "just GET /" distribution. The spectral layer learns variance across every encoded dimension:
 
 | Dimension | Normal (dvwa_browse) | Scanner |
 |-----------|---------------------|---------|
@@ -174,11 +174,25 @@ flowchart TD
 
 All 11 implementation tasks completed March 3, 2026. 309 unit tests passing across proxy (247) and sidecar (62) crates.
 
+## Live Validation: DVWA + Real Nikto (March 4, 2026)
+
+Validated against a live DVWA (Damn Vulnerable Web Application) with a real Nikto scanner.
+Full details in [EXPERIMENT-DVWA-NIKTO.md](EXPERIMENT-DVWA-NIKTO.md).
+
+- **Backend:** DVWA (Apache/PHP/MariaDB) — intentionally vulnerable, full of SQLi/XSS/RCE
+- **Warmup:** 94.4% 2xx with real authenticated sessions (real PHPSESSID cookies)
+- **Result:** 10,121 Nikto requests denied, 0 exploitable vulnerabilities found through the proxy
+- **Anomaly score:** 61.54 (threshold 25.34) — 2.4x above normal, 236-window streak
+- **17 rules auto-generated**, 11,783 enforcement rate-limits
+- **Denial tokens:** sealed, persistent, unsealable offline with full request context
+
 ## What's Next
 
-- [ ] Live test against DVWA with real Nikto scan (Docker setup ready)
-- [ ] Measure manifold scoring overhead in isolation (microbenchmark without upstream)
-- [ ] Test with holon-lab-baseline LLM-driven traffic generator for richer normal baseline
+- [x] Live test against DVWA with real Nikto scan — **Done. 10,121 denies, 0 vulns found.**
+- [ ] Slow Nikto test (`-Pause 1`) — pure geometric detection without rate-limit triggers
+- [ ] Mimicry attack — real browser submitting SQLi through DVWA forms (find the boundary)
+- [ ] Multi-source-IP — baseline lab Squid proxy with 23 ipvlan addresses
+- [ ] Measure spectral scoring overhead in isolation (microbenchmark without upstream)
 - [ ] Multi-core scaling measurement (ArcSwap read path under contention)
 - [ ] Engram CI/CD pipeline: train engrams in pre-production, promote to production
-- [ ] Dashboard integration for real-time manifold verdict visualization
+- [ ] Dashboard integration for real-time spectral verdict visualization

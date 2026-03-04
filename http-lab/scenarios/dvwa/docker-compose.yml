@@ -1,6 +1,6 @@
-# DVWA backend for manifold firewall live testing.
+# DVWA backend for spectral firewall live testing.
 # Usage:
-#   docker compose up -d      # start DVWA on :8080
+#   docker compose up -d      # start DVWA on :8888
 #   docker compose down -v    # stop and remove volumes
 #
 # Default credentials: admin / password
@@ -8,12 +8,39 @@
 
 services:
   dvwa:
-    image: cytopia/dvwa:latest
+    image: cytopia/dvwa:php-8.1
     ports:
-      - "8080:80"
+      - "8888:80"
     environment:
       - RECAPTCHA_PRIV_KEY=
       - RECAPTCHA_PUB_KEY=
       - SECURITY_LEVEL=low
       - PHPIDS_ENABLED=0
+      - MYSQL_HOSTNAME=db
+      - MYSQL_DATABASE=dvwa
+      - MYSQL_USERNAME=dvwa
+      - MYSQL_PASSWORD=dvwa
+    depends_on:
+      - db
     restart: unless-stopped
+    networks:
+      - dvwa-net
+
+  db:
+    image: mariadb:10.11
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: dvwa
+      MYSQL_USER: dvwa
+      MYSQL_PASSWORD: dvwa
+    volumes:
+      - dvwa_db:/var/lib/mysql
+    restart: unless-stopped
+    networks:
+      - dvwa-net
+
+networks:
+  dvwa-net:
+
+volumes:
+  dvwa_db:

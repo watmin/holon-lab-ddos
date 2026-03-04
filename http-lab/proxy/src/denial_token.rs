@@ -1,6 +1,6 @@
 //! Sealed denial context tokens.
 //!
-//! When the manifold firewall denies or rate-limits a request, a denial context
+//! When the spectral firewall denies or rate-limits a request, a denial context
 //! is built (verdict, residual, threshold, top anomalous fields, engram matches)
 //! and sealed via AES-256-GCM encryption. The resulting base64 token is attached
 //! as an `X-Denial-Context` response header.
@@ -34,6 +34,18 @@ pub struct DenialContext {
     pub method: String,
     /// Request path.
     pub path: String,
+    /// Query string (if present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// User-Agent header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    /// Header names in wire order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub header_names: Vec<String>,
+    /// Cookie keys present (values omitted for size).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cookie_keys: Vec<String>,
     /// Timestamp (microseconds since epoch).
     pub timestamp_us: u64,
 }
@@ -63,6 +75,11 @@ impl DenialKey {
     /// Create a key from raw bytes.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self { key_bytes: bytes }
+    }
+
+    /// Access the raw key bytes (for persistence).
+    pub fn raw_bytes(&self) -> &[u8; 32] {
+        &self.key_bytes
     }
 
     /// Generate a random key.
@@ -147,6 +164,10 @@ mod tests {
             src_ip: "10.0.0.1".to_string(),
             method: "GET".to_string(),
             path: "/admin/../../../etc/passwd".to_string(),
+            query: Some("cmd=cat%20/etc/shadow".to_string()),
+            user_agent: Some("Nikto/2.1.6".to_string()),
+            header_names: vec!["Host".into(), "User-Agent".into(), "Accept".into()],
+            cookie_keys: vec![],
             timestamp_us: 1700000000000000,
         }
     }
@@ -213,6 +234,10 @@ mod tests {
             src_ip: "192.168.1.1".to_string(),
             method: "POST".to_string(),
             path: "/api/login".to_string(),
+            query: None,
+            user_agent: None,
+            header_names: vec![],
+            cookie_keys: vec![],
             timestamp_us: 1700000000000000,
         };
         let token = seal(&ctx, &key).unwrap();

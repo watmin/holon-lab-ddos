@@ -1,4 +1,4 @@
-# Significance: What the Manifold Firewall Actually Is
+# Significance: What the Spectral Firewall Actually Is
 
 **Date:** March 3, 2026
 
@@ -69,7 +69,7 @@ The closest conceptual relatives are Kanerva's Sparse Distributed Memory (theore
 
 Traditional WAF: "here are the bad things, block them." The attacker's job is to not be on the list. The attack surface is infinite. The rule list is finite. The attacker always wins eventually.
 
-Manifold firewall: "here is what normal looks like, allow it." The attacker's job is to make their traffic geometrically indistinguishable from real users — across TLS fingerprint, HTTP structure, header ordering, cookie shape, path patterns, query structure, temporal distribution — all simultaneously, all consistently, across the entire attack. This is not evasion. This is becoming a legitimate user. If they succeed, they aren't attacking anymore.
+Spectral firewall: "here is what normal looks like, allow it." The attacker's job is to make their traffic geometrically indistinguishable from real users — across TLS fingerprint, HTTP structure, header ordering, cookie shape, path patterns, query structure, temporal distribution — all simultaneously, all consistently, across the entire attack. This is not evasion. This is becoming a legitimate user. If they succeed, they aren't attacking anymore.
 
 The geometry makes the allow list work because it captures the joint distribution. Matching any single field is easy. Matching all fields simultaneously while carrying an attack payload is a contradiction — the payload itself is what makes the vector alien.
 

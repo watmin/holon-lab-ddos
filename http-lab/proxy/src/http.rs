@@ -318,6 +318,10 @@ fn build_denial_token(
         src_ip: sample.src_ip.to_string(),
         method: sample.method.clone(),
         path: sample.path.clone(),
+        query: sample.query.clone(),
+        user_agent: sample.user_agent.clone(),
+        header_names: sample.headers.iter().map(|(k, _)| k.clone()).collect(),
+        cookie_keys: sample.cookies.iter().map(|(k, _)| k.clone()).collect(),
         timestamp_us: sample.timestamp_us,
     };
     match denial_token::seal(&ctx, key) {

@@ -1,4 +1,4 @@
-//! Manifold firewall — Layers 0, 1, and 2 shared state and evaluation.
+//! Spectral firewall — Layers 0, 1, and 2 shared state and evaluation.
 //!
 //! The sidecar trains subspaces and publishes a `ManifoldState` via ArcSwap.
 //! The proxy loads it (wait-free) and scores every request that passes Layer 3
@@ -98,7 +98,7 @@ pub fn evaluate_manifold(vec_f64: &[f64], state: &ManifoldState) -> ManifoldVerd
     // Layer 0: Normal allow list
     for normal in &state.normal_subspaces {
         let residual = normal.subspace.residual(vec_f64);
-        if residual <= normal.threshold {
+        if !residual.is_nan() && residual <= normal.threshold {
             return ManifoldVerdict::Allow;
         }
     }
@@ -106,6 +106,12 @@ pub fn evaluate_manifold(vec_f64: &[f64], state: &ManifoldState) -> ManifoldVerd
     // Layer 1: Anomaly scoring against baseline
     let baseline = state.baseline.as_ref().unwrap();
     let residual = baseline.residual(vec_f64);
+
+    // NaN residual = encoding or subspace error — deny defensively
+    if residual.is_nan() {
+        return ManifoldVerdict::Deny { residual: f64::INFINITY };
+    }
+
     let threshold = baseline.threshold();
 
     if residual <= threshold {
@@ -184,7 +190,12 @@ pub fn drilldown_audit(
         })
         .collect();
 
-    scores.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scores.sort_by(|a, b| {
+        b.score.partial_cmp(&a.score).unwrap_or_else(|| {
+            // Push NaN scores to the end
+            if a.score.is_nan() { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less }
+        })
+    });
     scores.truncate(limit);
     scores
 }

@@ -8,7 +8,7 @@
 # Usage:
 #   ./demo.sh                                      # built-in single-wave scenario
 #   ./demo.sh --scenario multi_attack              # multi-wave attack from scenarios/
-#   ./demo.sh --scenario manifold_firewall --denial-tokens  # manifold test with tokens
+#   ./demo.sh --scenario manifold_firewall --denial-tokens  # spectral test with tokens
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -109,7 +109,7 @@ echo ""
 grep 'FINAL_SUMMARY' "$GENERATOR_LOG" || true
 echo ""
 
-echo "--- Manifold verdict counts ---"
+echo "--- Spectral verdict counts ---"
 curl -sf http://127.0.0.1:9090/metrics 2>/dev/null | python3 -c "
 import sys, json
 try:

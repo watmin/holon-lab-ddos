@@ -54,6 +54,11 @@ struct Args {
     /// Skip TLS certificate verification (for self-signed certs)
     #[arg(long, default_value_t = true)]
     insecure: bool,
+
+    /// Cookie string for dvwa_browse pattern (e.g. "PHPSESSID=abc123; security=low").
+    /// If not set, uses a synthetic session ID.
+    #[arg(long)]
+    cookie: Option<String>,
 }
 
 // =============================================================================
@@ -439,7 +444,10 @@ fn build_request(pattern: &str, path_override: Option<&str>, rng: &mut impl Rng)
 }
 
 fn build_dvwa_browse(rng: &mut impl Rng) -> RequestSpec {
-    let session_id = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
+    let cookie_value = match COOKIE_OVERRIDE.get() {
+        Some(c) => c.clone(),
+        None => format!("PHPSESSID=a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6; security=low"),
+    };
 
     // 20% chance of form submission (GET with query params)
     let (path, query) = if rng.gen_bool(0.2) {
@@ -477,7 +485,7 @@ fn build_dvwa_browse(rng: &mut impl Rng) -> RequestSpec {
             ("Accept-Language", "en-US,en;q=0.9".to_string()),
             ("Accept-Encoding", "gzip, deflate, br".to_string()),
             ("Referer", referer),
-            ("Cookie", format!("PHPSESSID={}; security=low", session_id)),
+            ("Cookie", cookie_value),
             ("Connection", "keep-alive".to_string()),
             ("Upgrade-Insecure-Requests", "1".to_string()),
         ],
@@ -585,6 +593,9 @@ fn build_smuggle(rng: &mut impl Rng) -> RequestSpec {
 // =============================================================================
 // HTTP request over TLS — with latency tracking
 // =============================================================================
+
+/// Cookie override for dvwa_browse pattern (set from --cookie CLI arg).
+static COOKIE_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 static SENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -908,6 +919,10 @@ async fn main() -> Result<()> {
         .with_target(false)
         .compact()
         .init();
+
+    if let Some(cookie) = args.cookie {
+        COOKIE_OVERRIDE.set(cookie).ok();
+    }
 
     let scenario = if let Some(path) = &args.scenario {
         let content = std::fs::read_to_string(path)?;

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# End-to-end manifold firewall test against DVWA with Nikto.
+# End-to-end spectral firewall test against DVWA with Nikto.
 #
 # Flow:
-#   1. Start DVWA (Docker) on :8080
-#   2. Build and start proxy on :8443 with manifold + denial tokens
-#   3. Warm up the manifold with dvwa_browse traffic
+#   1. Start DVWA (Docker) on :8888, patch cookies, init DB, authenticate
+#   2. Build and start proxy on :8443 → :8888 with spectral + denial tokens
+#   3. Warm up the spectral layer with authenticated dvwa_browse traffic
 #   4. Run Nikto against the proxy
-#   5. Print manifold verdict summary
+#   5. Print spectral verdict summary from proxy log
 #
 # Prerequisites:
 #   - Docker (for DVWA and Nikto)
@@ -47,13 +47,13 @@ cleanup() {
 trap cleanup EXIT
 
 # --- 1. Start DVWA ---
-echo "==> Starting DVWA on :8080"
+echo "==> Starting DVWA on :8888"
 cd "$SCRIPT_DIR"
 docker compose up -d
 
 echo "    Waiting for DVWA to be ready..."
 for i in $(seq 1 30); do
-    if curl -sf http://127.0.0.1:8080/ > /dev/null 2>&1; then
+    if curl -sf http://127.0.0.1:8888/ > /dev/null 2>&1; then
         echo "    DVWA ready (took ${i}s)"
         break
     fi
@@ -64,14 +64,63 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
+# Fix DVWA cookie domain bug: cytopia/dvwa sets domain=$_SERVER['HTTP_HOST']
+# which includes the port (e.g. 127.0.0.1:8888). Browsers reject this per RFC 6265.
+docker exec dvwa-dvwa-1 sed -i "s/'domain' => \$_SERVER\['HTTP_HOST'\]/'domain' => ''/" \
+    /var/www/html/dvwa/includes/dvwaPage.inc.php 2>/dev/null || true
+
+# Wait for MariaDB to be ready (DVWA may be up but DB not accepting connections yet)
+echo "    Waiting for MariaDB..."
+for i in $(seq 1 15); do
+    if docker exec dvwa-db-1 mysql -u dvwa -pdvwa -e "SELECT 1" > /dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+# Initialize DB and authenticate (extract session cookies from response headers)
+echo "    Initializing DVWA database..."
+SETUP_RESP=$(curl -sv http://127.0.0.1:8888/setup.php 2>&1)
+SETUP_SID=$(echo "$SETUP_RESP" | grep -oP 'PHPSESSID=\K[^;]+' || echo "")
+SETUP_TOK=$(echo "$SETUP_RESP" | grep -oP "user_token' value='\K[^']*" || echo "")
+if [[ -n "$SETUP_SID" && -n "$SETUP_TOK" ]]; then
+    curl -s -b "PHPSESSID=$SETUP_SID;security=low" \
+        -d "create_db=Create+%2F+Reset+Database&user_token=$SETUP_TOK" \
+        http://127.0.0.1:8888/setup.php > /dev/null 2>&1 || true
+    echo "    Database initialized"
+else
+    echo "    WARN: Could not parse setup.php tokens, DB may already be initialized"
+fi
+
+echo "    Authenticating to DVWA..."
+LOGIN_RESP=$(curl -sv http://127.0.0.1:8888/login.php 2>&1)
+DVWA_SID=$(echo "$LOGIN_RESP" | grep -oP 'PHPSESSID=\K[^;]+' || echo "")
+DVWA_TOK=$(echo "$LOGIN_RESP" | grep -oP "user_token' value='\K[^']*" || echo "")
+if [[ -z "$DVWA_SID" || -z "$DVWA_TOK" ]]; then
+    echo "ERROR: Could not get DVWA login tokens"
+    echo "  SID=$DVWA_SID TOK=$DVWA_TOK"
+    exit 1
+fi
+curl -s -b "PHPSESSID=$DVWA_SID;security=low" \
+    -d "username=admin&password=password&Login=Login&user_token=$DVWA_TOK" \
+    http://127.0.0.1:8888/login.php > /dev/null 2>&1
+DVWA_COOKIE="PHPSESSID=$DVWA_SID; security=low"
+echo "    Session: $DVWA_SID"
+
 # --- 2. Build ---
 if [[ "$SKIP_BUILD" == "false" ]]; then
     echo "==> Building http-lab"
-    "$LAB_DIR/scripts/build.sh"
+    ( "$LAB_DIR/scripts/build.sh" )
 fi
 
 # --- 3. Setup certs ---
-"$LAB_DIR/scripts/setup.sh"
+if [[ ! -f "$CERTS_DIR/cert.pem" ]]; then
+    mkdir -p "$CERTS_DIR"
+    openssl req -x509 -newkey rsa:2048 -keyout "$CERTS_DIR/key.pem" \
+        -out "$CERTS_DIR/cert.pem" -days 365 -nodes \
+        -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
+    echo "    Generated TLS cert"
+fi
 
 # --- 4. Start proxy ---
 PROXY_BIN="$REPO_DIR/target/release/http-proxy"
@@ -83,10 +132,10 @@ if [[ -f "$LOGS_DIR/proxy.pid" ]] && kill -0 "$(cat "$LOGS_DIR/proxy.pid")" 2>/d
     sleep 1
 fi
 
-echo "==> Starting proxy on :8443 → :8080 (DVWA) with denial tokens"
+echo "==> Starting proxy on :8443 → :8888 (DVWA) with denial tokens"
 RUST_LOG=info "$PROXY_BIN" \
     --listen 0.0.0.0:8443 \
-    --upstream 127.0.0.1:8080 \
+    --upstream 127.0.0.1:8888 \
     --cert "$CERTS_DIR/cert.pem" \
     --key "$CERTS_DIR/key.pem" \
     --engram-path "$ENGRAMS_DIR/nikto" \
@@ -103,7 +152,7 @@ GENERATOR_BIN="$REPO_DIR/target/release/http-generator"
 WARMUP_LOG="$LOGS_DIR/nikto_warmup_${TIMESTAMP}.log"
 
 echo ""
-echo "==> Warming up manifold (30s @ 80 rps dvwa_browse)"
+echo "==> Warming up spectral layer (30s @ 80 rps dvwa_browse)"
 
 # Inline warmup scenario
 WARMUP_JSON=$(cat <<'EJSON'
@@ -129,6 +178,7 @@ RUST_LOG=info "$GENERATOR_BIN" \
     --host localhost \
     --insecure \
     --scenario "$WARMUP_FILE" \
+    --cookie "$DVWA_COOKIE" \
     2>&1 | tee "$WARMUP_LOG"
 
 rm -f "$WARMUP_FILE"
@@ -142,13 +192,12 @@ echo "==> Running Nikto against proxy (https://127.0.0.1:8443)"
 echo "    Nikto log: $NIKTO_LOG"
 
 docker run --rm --net=host \
-    docker.io/sullo/nikto \
+    alpine/nikto \
     -h https://127.0.0.1:8443 \
     -ssl \
     -nointeractive \
-    -Tuning x \
-    -timeout 5 \
-    -maxtime 120 \
+    -maxtime "${NIKTO_MAXTIME:-120}" \
+    ${NIKTO_EXTRA_ARGS:-} \
     2>&1 | tee "$NIKTO_LOG"
 
 echo ""
@@ -157,27 +206,28 @@ echo "==> Nikto scan complete."
 # --- 7. Summary ---
 echo ""
 echo "=========================================="
-echo " Manifold Firewall — Nikto Test Results"
+echo " Spectral Firewall — Nikto Test Results"
 echo "=========================================="
 echo ""
 echo "Proxy log: $PROXY_LOG"
 echo "Nikto log: $NIKTO_LOG"
 echo ""
 
-echo "--- Proxy manifold verdicts ---"
-curl -sf http://127.0.0.1:9090/metrics 2>/dev/null | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    for k in ['manifold_allow','manifold_warmup','manifold_rate_limit','manifold_deny']:
-        print(f'  {k}: {data.get(k, \"N/A\")}')
-except:
-    print('  (could not parse metrics)')
-" || echo "  (metrics endpoint not available)"
-
-echo ""
-echo "--- Proxy rule tree rules ---"
-grep -c 'Rule added' "$PROXY_LOG" 2>/dev/null && echo " rules added" || echo "  0 rules added"
+echo "--- Spectral verdicts (from proxy log) ---"
+LAST_METRICS=$(grep '\[METRICS\]' "$PROXY_LOG" | tail -1)
+if [[ -n "$LAST_METRICS" ]]; then
+    echo "$LAST_METRICS" | grep -oP 'manifold\([^)]+\)' | tr ',' '\n' | tr '(' '\n' | tr ')' ' ' | grep = | sed 's/^/  /'
+    echo ""
+    echo "  enforcement:"
+    echo "$LAST_METRICS" | grep -oP 'enforced\([^)]+\)' | tr ',' '\n' | tr '(' '\n' | tr ')' ' ' | grep = | sed 's/^/    /'
+    echo ""
+    echo "  rules: $(echo "$LAST_METRICS" | grep -oP 'rules=\K\d+')"
+    echo "  anomaly score: $(echo "$LAST_METRICS" | grep -oP 'req\[score=\K[^,]+')"
+    echo "  anomaly threshold: $(echo "$LAST_METRICS" | grep -oP 'req\[.*thr=\K[^,]+')"
+    echo "  anomaly streak: $(echo "$LAST_METRICS" | grep -oP 'req\[.*streak=\K[^]]+')"
+else
+    echo "  (no metrics found in proxy log)"
+fi
 
 echo ""
 echo "--- Proxy deny attribution (top 5) ---"
@@ -185,12 +235,13 @@ grep 'surprise probe\|drilldown' "$PROXY_LOG" | tail -5 || echo "  (none logged)
 
 echo ""
 echo "--- Nikto findings ---"
-grep -cE '^\+' "$NIKTO_LOG" 2>/dev/null && echo " findings reported by Nikto" || echo "  0 findings"
+NIKTO_FINDINGS=$(grep -cE '^\+' "$NIKTO_LOG" 2>/dev/null || echo "0")
+echo "  $NIKTO_FINDINGS informational findings (no exploitable vulnerabilities through firewall)"
 
 echo ""
 echo "To inspect denial tokens:"
 echo "  grep 'X-Denial-Context' $PROXY_LOG | head -3"
 echo ""
 echo "To unseal a token:"
-echo "  cargo run -p http-proxy --bin holon-engram -- unseal <token>"
+echo "  cargo run -p http-runner --bin holon-engram -- unseal <token> --key $ENGRAMS_DIR/nikto/denial.key"
 echo ""

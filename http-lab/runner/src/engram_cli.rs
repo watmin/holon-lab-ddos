@@ -9,6 +9,7 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use holon::memory::EngramLibrary;
+use http_proxy::denial_token::{self, DenialKey};
 
 #[derive(Parser)]
 #[command(name = "holon-engram", about = "Engram library management for CI/CD promotion")]
@@ -46,6 +47,14 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         overwrite: bool,
     },
+    /// Unseal a denial context token to see why a request was denied.
+    Unseal {
+        /// The base64 token from the X-Denial-Context header.
+        token: String,
+        /// Path to the denial key file (hex-encoded, 32 bytes).
+        #[arg(long, default_value = "http-lab/engrams/nikto/denial.key")]
+        key: String,
+    },
 }
 
 fn main() {
@@ -55,6 +64,7 @@ fn main() {
         Commands::List { path } => cmd_list(&path),
         Commands::Export { path, output } => cmd_export(&path, output.as_deref()),
         Commands::Import { path, input, overwrite } => cmd_import(&path, &input, overwrite),
+        Commands::Unseal { token, key } => cmd_unseal(&token, &key),
     }
 }
 
@@ -170,4 +180,60 @@ fn cmd_import(path: &str, input: &str, overwrite: bool) {
 
     eprintln!("imported {} engrams, skipped {} → '{}' (total: {})",
              imported, skipped, path, target.len());
+}
+
+fn cmd_unseal(token: &str, key_path: &str) {
+    let hex = match std::fs::read_to_string(key_path) {
+        Ok(h) => h.trim().to_string(),
+        Err(e) => {
+            eprintln!("error: cannot read key '{}': {}", key_path, e);
+            eprintln!("hint: the proxy saves the key to <engram-path>/denial.key on first run");
+            process::exit(1);
+        }
+    };
+
+    let mut bytes = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate().take(32) {
+        bytes[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or("00"), 16).unwrap_or(0);
+    }
+    let key = DenialKey::from_bytes(bytes);
+
+    match denial_token::unseal(token, &key) {
+        Ok(ctx) => {
+            println!("Denial Context (unsealed):");
+            println!();
+            println!("  verdict:         {}", ctx.verdict);
+            println!("  residual:        {:.4}  (threshold: {:.4}, deny: {:.4})",
+                     ctx.residual, ctx.threshold, ctx.deny_threshold);
+            println!("  deviation:       {:.1}x above normal",
+                     ctx.residual / ctx.threshold);
+            println!();
+            println!("  request:");
+            println!("    {} {} {}", ctx.method, ctx.path,
+                     ctx.query.as_deref().map(|q| format!("?{}", q)).unwrap_or_default());
+            println!("    src:        {}", ctx.src_ip);
+            println!("    user-agent: {}", ctx.user_agent.as_deref().unwrap_or("(none)"));
+            println!("    headers:    [{}]", ctx.header_names.join(", "));
+            if !ctx.cookie_keys.is_empty() {
+                println!("    cookies:    [{}]", ctx.cookie_keys.join(", "));
+            } else {
+                println!("    cookies:    (none)");
+            }
+            println!();
+            if !ctx.top_fields.is_empty() {
+                println!("  anomalous dimensions:");
+                for f in &ctx.top_fields {
+                    println!("    {:<20} {:.2}", f.field, f.score);
+                }
+            }
+            println!();
+            let ts_secs = ctx.timestamp_us / 1_000_000;
+            let ts_us = ctx.timestamp_us % 1_000_000;
+            println!("  timestamp:       {}.{:06} ({} us)", ts_secs, ts_us, ctx.timestamp_us);
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    }
 }

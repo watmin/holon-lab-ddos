@@ -137,8 +137,26 @@ async fn main() -> Result<()> {
 
     // Denial context tokens (optional — enabled via --denial-tokens)
     let denial_key: Option<Arc<DenialKey>> = if args.denial_tokens {
-        let key = DenialKey::generate();
-        info!("Denial context tokens enabled (AES-256-GCM)");
+        let key_path = format!("{}/denial.key", args.engram_path);
+        let key = if let Ok(hex) = std::fs::read_to_string(&key_path) {
+            let hex = hex.trim();
+            let mut bytes = [0u8; 32];
+            for (i, chunk) in hex.as_bytes().chunks(2).enumerate().take(32) {
+                bytes[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or("00"), 16).unwrap_or(0);
+            }
+            info!("Denial context tokens enabled (loaded key from {})", key_path);
+            DenialKey::from_bytes(bytes)
+        } else {
+            let key = DenialKey::generate();
+            let hex: String = key.raw_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+            std::fs::create_dir_all(&args.engram_path).ok();
+            if let Err(e) = std::fs::write(&key_path, &hex) {
+                warn!("Could not persist denial key to {}: {}", key_path, e);
+            } else {
+                info!("Denial context tokens enabled (new key saved to {})", key_path);
+            }
+            key
+        };
         Some(Arc::new(key))
     } else {
         None

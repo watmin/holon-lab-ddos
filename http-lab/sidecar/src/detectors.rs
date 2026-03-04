@@ -345,34 +345,26 @@ impl WindowTracker {
         let eigenvalues = self.subspace.eigenvalues();
         let explained_ratio = self.subspace.explained_ratio();
 
-        if library.is_empty() {
-            return WindowResult {
-                threat_mode: ThreatMode::Normal,
-                candidates: vec![],
-                eigenvalues,
-                explained_ratio,
-            };
-        }
+        let candidates = if library.is_empty() {
+            vec![]
+        } else {
+            let spec_matches = library.match_spectrum(&eigenvalues, 5);
+            let align_matches = library.match_alignment(&self.subspace, 5);
 
-        let spec_matches = library.match_spectrum(&eigenvalues, 5);
-        let align_matches = library.match_alignment(&self.subspace, 5);
+            let mut combined: HashMap<String, f64> = HashMap::new();
+            for (name, spec_score) in &spec_matches {
+                combined.insert(name.clone(), *spec_score);
+            }
+            for (name, align_score) in &align_matches {
+                let entry = combined.entry(name.clone()).or_insert(0.0);
+                *entry *= align_score;
+            }
 
-        // Build combined scores: spectrum * alignment
-        let mut combined: HashMap<String, f64> = HashMap::new();
-        for (name, spec_score) in &spec_matches {
-            combined.insert(name.clone(), *spec_score);
-        }
-        for (name, align_score) in &align_matches {
-            let entry = combined.entry(name.clone()).or_insert(0.0);
-            *entry *= align_score;
-        }
+            let mut c: Vec<(String, f64)> = combined.into_iter().collect();
+            c.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            c
+        };
 
-        let mut candidates: Vec<(String, f64)> = combined.into_iter().collect();
-        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Classify threat mode from spectrum shape.
-        // Low explained_ratio with few dominant eigenvalues = collapsed = volumetric.
-        // High explained_ratio with spread eigenvalues = diverse = targeted/exploit.
         let threat_mode = self.classify_threat(&eigenvalues, explained_ratio, &candidates);
 
         WindowResult {
@@ -384,6 +376,10 @@ impl WindowTracker {
     }
 
     /// Classify the threat mode from the eigenvalue spectrum shape.
+    ///
+    /// Spectrum shape alone determines Volumetric vs Targeted — engram matches
+    /// only provide the `top_engram` label. This runs even when the engram
+    /// library is empty so that first-contact attacks are still classified.
     fn classify_threat(
         &self,
         eigenvalues: &[f64],
@@ -391,24 +387,19 @@ impl WindowTracker {
         candidates: &[(String, f64)],
     ) -> ThreatMode {
         let top_engram = candidates.first().map(|(n, _)| n.clone());
-        let top_score = candidates.first().map(|(_, s)| *s).unwrap_or(0.0);
 
-        // No strong match — normal
-        if top_score < 0.3 && candidates.is_empty() {
-            return ThreatMode::Normal;
-        }
-
-        // Measure spectrum concentration: ratio of top eigenvalue to sum.
-        // High concentration = collapsed = volumetric (DDoS).
-        // Low concentration = spread = targeted (exploit/scan).
         let eig_sum: f64 = eigenvalues.iter().sum();
         let eig_max: f64 = eigenvalues.iter().cloned().fold(0.0f64, f64::max);
         let concentration = if eig_sum > 1e-10 { eig_max / eig_sum } else { 0.0 };
 
-        // Count how many eigenvalues carry >5% of total variance
         let active_dims = eigenvalues.iter()
             .filter(|&&e| eig_sum > 1e-10 && e / eig_sum > 0.05)
             .count();
+
+        // Insufficient variance — not enough signal to classify
+        if eig_sum < 1e-10 {
+            return ThreatMode::Normal;
+        }
 
         // Collapsed: few active dimensions, high concentration
         // Typical DDoS: all requests look the same → 1-3 dominant eigenvalues
