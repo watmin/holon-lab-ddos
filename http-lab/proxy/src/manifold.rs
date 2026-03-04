@@ -1,8 +1,8 @@
 //! Spectral firewall — Layers 0, 1, and 2 shared state and evaluation.
 //!
-//! The sidecar trains subspaces and publishes a `ManifoldState` via ArcSwap.
-//! The proxy loads it (wait-free) and scores every request that passes Layer 3
-//! (the symbolic rule tree).
+//! The sidecar trains striped subspaces and publishes a `ManifoldState`
+//! via ArcSwap.  The proxy loads it (wait-free) and scores every request
+//! that passes Layer 3 (the symbolic rule tree).
 //!
 //! Layer 0 — Normal Allow List: pass if the request projects well onto any
 //!   normal engram subspace. This is the primary defense for legitimate traffic.
@@ -14,8 +14,9 @@
 //! Layer 2 — Window Spectrum: strategic threat mode set by the sidecar's
 //!   WindowTracker. Adjusts thresholds for Layer 1 decisions.
 
-use holon::kernel::{Encoder, Primitives, Vector};
-use holon::memory::OnlineSubspace;
+use holon::kernel::Encoder;
+use holon::{Walkable, WalkableValue};
+use holon::memory::StripedSubspace;
 
 /// Strategic threat classification from Layer 2 (window spectrum analysis).
 #[derive(Debug, Clone)]
@@ -33,19 +34,19 @@ pub enum ThreatMode {
 /// A normal-traffic engram subspace for Layer 0 allow-list matching.
 pub struct NormalSubspace {
     pub name: String,
-    pub subspace: OnlineSubspace,
+    pub subspace: StripedSubspace,
     pub threshold: f64,
 }
 
 /// Shared manifold state published by the sidecar, consumed by the proxy.
 ///
-/// All `OnlineSubspace` fields are read-only clones — `residual()` takes
+/// All `StripedSubspace` fields are read-only clones — `residual()` takes
 /// `&self`, so multiple proxy threads can score concurrently.
 pub struct ManifoldState {
     /// Layer 0: normal engram subspaces. Pass if residual < threshold for any.
     pub normal_subspaces: Vec<NormalSubspace>,
-    /// Layer 1: baseline subspace for anomaly scoring.
-    pub baseline: Option<OnlineSubspace>,
+    /// Layer 1: baseline striped subspace for anomaly scoring.
+    pub baseline: Option<StripedSubspace>,
     /// Layer 2: current strategic threat assessment.
     pub threat_mode: ThreatMode,
     /// Layer 1 threshold: residual above this → deny (exploit).
@@ -76,7 +77,7 @@ impl ManifoldState {
 #[derive(Debug)]
 pub enum ManifoldVerdict {
     /// Layer 0: matches a normal engram — allow.
-    Allow,
+    Allow { residual: f64 },
     /// Manifold not yet trained — no opinion.
     Warmup,
     /// Layer 1: moderate residual — rate-limit (DDoS variant).
@@ -85,40 +86,41 @@ pub enum ManifoldVerdict {
     Deny { residual: f64 },
 }
 
-/// Score a request vector against the manifold state.
+/// Score a striped request vector against the manifold state.
 ///
 /// Evaluation order:
-///   1. Layer 0: check normal subspaces — if any match, Allow.
-///   2. Layer 1: score against baseline — classify as rate-limit or deny.
-pub fn evaluate_manifold(vec_f64: &[f64], state: &ManifoldState) -> ManifoldVerdict {
+///   1. Compute baseline residual (once — all decisions use this value).
+///   2. Layer 0: if residual ≤ threshold, Allow.  Also check any additional
+///      normal engram subspaces.
+///   3. Layer 1: classify as rate-limit or deny based on residual magnitude.
+pub fn evaluate_manifold(stripe_vecs: &[Vec<f64>], state: &ManifoldState) -> ManifoldVerdict {
     if !state.is_ready() {
         return ManifoldVerdict::Warmup;
     }
 
-    // Layer 0: Normal allow list
-    for normal in &state.normal_subspaces {
-        let residual = normal.subspace.residual(vec_f64);
-        if !residual.is_nan() && residual <= normal.threshold {
-            return ManifoldVerdict::Allow;
-        }
-    }
-
-    // Layer 1: Anomaly scoring against baseline
     let baseline = state.baseline.as_ref().unwrap();
-    let residual = baseline.residual(vec_f64);
+    let residual = baseline.residual(stripe_vecs);
 
-    // NaN residual = encoding or subspace error — deny defensively
     if residual.is_nan() {
         return ManifoldVerdict::Deny { residual: f64::INFINITY };
     }
 
     let threshold = baseline.threshold();
 
+    // Layer 0: baseline is the primary normal reference
     if residual <= threshold {
-        return ManifoldVerdict::Allow;
+        return ManifoldVerdict::Allow { residual };
     }
 
-    // Adjust deny threshold based on threat mode
+    // Layer 0 (continued): check additional normal engram subspaces
+    for normal in &state.normal_subspaces {
+        let nr = normal.subspace.residual(stripe_vecs);
+        if !nr.is_nan() && nr <= normal.threshold {
+            return ManifoldVerdict::Allow { residual };
+        }
+    }
+
+    // Layer 1: anomaly classification
     let deny_threshold = match &state.threat_mode {
         ThreatMode::Targeted => state.deny_threshold * 0.8,
         _ => state.deny_threshold,
@@ -136,15 +138,8 @@ pub fn evaluate_manifold(vec_f64: &[f64], state: &ManifoldState) -> ManifoldVerd
 }
 
 // =============================================================================
-// Post-verdict drilldown attribution
+// Post-verdict drilldown attribution (flat, per-stripe)
 // =============================================================================
-
-/// Top-level Walkable fields to sweep during post-verdict drilldown.
-const DRILLDOWN_FIELDS: &[&str] = &[
-    "method", "path", "headers", "header_shapes",
-    "path_shape", "query_shape", "path_parts", "query_parts",
-    "header_order", "cookies", "src_ip",
-];
 
 /// A single field's anomaly attribution from the drilldown.
 #[derive(Debug, Clone)]
@@ -153,15 +148,26 @@ pub struct DrilldownAttribution {
     pub score: f64,
 }
 
-/// Lightweight post-verdict drilldown: unbind the anomalous component against
-/// each top-level Walkable field to identify which structural elements caused
-/// the deny/rate-limit. Runs after the verdict is decided — not blocking.
+/// Flat drilldown: walk the Walkable to find every leaf path, unbind each
+/// from its stripe's anomalous component, and score.
 ///
-/// Returns the top `limit` fields sorted by surprise score (descending).
+/// With striped encoding, each leaf binding lives in exactly one stripe
+/// (determined by `Encoder::field_stripe(path, n_stripes)`).
+///
+/// Attribution uses **cosine similarity** between the real-valued anomalous
+/// component and each leaf's bipolar binding vector.  This is the correct
+/// MAP-algebra probe:  if the binding contributed to the anomaly, the
+/// cosine is high (the binding's direction is present in the residual);
+/// if it was reconstructed by the subspace, the cosine is ≈ 0.
+///
+/// Runs after the verdict is decided — not on the critical path.
+/// Returns all attributions sorted by score descending, truncated to `limit`.
 pub fn drilldown_audit(
-    vec_f64: &[f64],
+    stripe_vecs: &[Vec<f64>],
     state: &ManifoldState,
     encoder: &Encoder,
+    walkable: &dyn Walkable,
+    n_stripes: usize,
     limit: usize,
 ) -> Vec<DrilldownAttribution> {
     let baseline = match &state.baseline {
@@ -169,30 +175,25 @@ pub fn drilldown_audit(
         None => return vec![],
     };
 
-    let anomaly = baseline.anomalous_component(vec_f64);
-    let anomaly_vec = Vector::from_f64(&anomaly);
-
-    let mut scores: Vec<DrilldownAttribution> = DRILLDOWN_FIELDS
-        .iter()
-        .map(|&field| {
-            let role = encoder.get_vector(field);
-            let unbound = Primitives::bind(&anomaly_vec, &role);
-            let norm = unbound
-                .data()
-                .iter()
-                .map(|&x| (x as f64).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            DrilldownAttribution {
-                field: field.to_string(),
-                score: norm,
-            }
-        })
+    // Real-valued anomalous components per stripe (x - reconstruct(x))
+    let anomalies: Vec<Vec<f64>> = (0..n_stripes)
+        .map(|i| baseline.anomalous_component(stripe_vecs, i))
         .collect();
+
+    // Pre-compute anomaly norms for the cosine denominator
+    let anomaly_norms: Vec<f64> = anomalies.iter()
+        .map(|a| a.iter().map(|x| x * x).sum::<f64>().sqrt())
+        .collect();
+
+    let walk_items = walkable.walk_map_items();
+    let mut scores: Vec<DrilldownAttribution> = Vec::with_capacity(256);
+
+    for (key, value) in &walk_items {
+        collect_leaf_scores(value, key, n_stripes, encoder, &anomalies, &anomaly_norms, &mut scores);
+    }
 
     scores.sort_by(|a, b| {
         b.score.partial_cmp(&a.score).unwrap_or_else(|| {
-            // Push NaN scores to the end
             if a.score.is_nan() { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less }
         })
     });
@@ -200,37 +201,105 @@ pub fn drilldown_audit(
     scores
 }
 
+/// Recursively walk the Walkable structure, scoring each leaf via cosine
+/// similarity between the stripe's anomalous component and the leaf binding.
+fn collect_leaf_scores(
+    value: &WalkableValue,
+    path: &str,
+    n_stripes: usize,
+    encoder: &Encoder,
+    anomalies: &[Vec<f64>],
+    anomaly_norms: &[f64],
+    results: &mut Vec<DrilldownAttribution>,
+) {
+    match value {
+        WalkableValue::Scalar(_) | WalkableValue::Set(_) => {
+            let stripe_idx = Encoder::field_stripe(path, n_stripes);
+            let binding = encoder.leaf_binding(value, path);
+            let score = cosine_f64_i8(&anomalies[stripe_idx], anomaly_norms[stripe_idx], binding.data());
+            results.push(DrilldownAttribution { field: path.to_string(), score });
+        }
+        WalkableValue::Map(items) => {
+            if items.is_empty() {
+                let stripe_idx = Encoder::field_stripe(path, n_stripes);
+                let binding = encoder.leaf_binding(value, path);
+                let score = cosine_f64_i8(&anomalies[stripe_idx], anomaly_norms[stripe_idx], binding.data());
+                results.push(DrilldownAttribution { field: path.to_string(), score });
+                return;
+            }
+            for (key, val) in items {
+                let sub = format!("{}.{}", path, key);
+                collect_leaf_scores(val, &sub, n_stripes, encoder, anomalies, anomaly_norms, results);
+            }
+        }
+        WalkableValue::List(items) => {
+            if items.is_empty() {
+                let stripe_idx = Encoder::field_stripe(path, n_stripes);
+                let binding = encoder.leaf_binding(value, path);
+                let score = cosine_f64_i8(&anomalies[stripe_idx], anomaly_norms[stripe_idx], binding.data());
+                results.push(DrilldownAttribution { field: path.to_string(), score });
+                return;
+            }
+            for (i, item) in items.iter().enumerate() {
+                let sub = format!("{}.[{}]", path, i);
+                collect_leaf_scores(item, &sub, n_stripes, encoder, anomalies, anomaly_norms, results);
+            }
+        }
+    }
+}
+
+/// Cosine similarity between a real-valued anomaly vector and a bipolar
+/// binding vector (i8).  Returns the absolute value — higher means the
+/// binding's direction is more present in the anomaly.
+#[inline]
+fn cosine_f64_i8(anomaly: &[f64], anomaly_norm: f64, binding: &[i8]) -> f64 {
+    if anomaly_norm < 1e-10 {
+        return 0.0;
+    }
+    let dot: f64 = anomaly.iter().zip(binding.iter())
+        .map(|(&a, &b)| a * (b as f64))
+        .sum();
+    let binding_norm: f64 = (binding.len() as f64).sqrt();
+    let cos = dot / (anomaly_norm * binding_norm);
+    cos.abs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn trained_subspace(dim: usize, k: usize) -> OnlineSubspace {
-        let mut sub = OnlineSubspace::new(dim, k);
+    fn trained_striped(dim: usize, k: usize, n_stripes: usize) -> StripedSubspace {
+        let mut striped = StripedSubspace::new(dim, k, n_stripes);
         let mut rng = 42u64;
         for _ in 0..200 {
-            rng = rng
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let coeff = (rng >> 33) as f64 / u32::MAX as f64 * 2.0 - 1.0;
-            let v: Vec<f64> = (0..dim)
-                .map(|i| if i % 2 == 0 { coeff } else { 0.0 })
+            let stripe_vecs: Vec<Vec<f64>> = (0..n_stripes)
+                .map(|_| {
+                    rng = rng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let coeff = (rng >> 33) as f64 / u32::MAX as f64 * 2.0 - 1.0;
+                    (0..dim)
+                        .map(|i| if i % 2 == 0 { coeff } else { 0.0 })
+                        .collect()
+                })
                 .collect();
-            sub.update(&v);
+            striped.update(&stripe_vecs);
         }
-        sub
+        striped
     }
 
     #[test]
     fn empty_state_returns_warmup() {
         let state = ManifoldState::empty();
-        let v = vec![0.0; 256];
-        assert!(matches!(evaluate_manifold(&v, &state), ManifoldVerdict::Warmup));
+        let v = vec![vec![0.0; 256]; 8];
+        assert!(matches!(evaluate_manifold(&v, &state), ManifoldVerdict::Warmup), "{:?}", evaluate_manifold(&v, &state));
     }
 
     #[test]
     fn in_distribution_returns_allow() {
         let dim = 256;
-        let sub = trained_subspace(dim, 8);
+        let n = 8;
+        let sub = trained_striped(dim, 8, n);
         let threshold = sub.threshold();
         let state = ManifoldState {
             normal_subspaces: vec![NormalSubspace {
@@ -245,21 +314,26 @@ mod tests {
         };
 
         let mut rng = 999u64;
-        rng = rng
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let coeff = (rng >> 33) as f64 / u32::MAX as f64 * 2.0 - 1.0;
-        let v: Vec<f64> = (0..dim)
-            .map(|i| if i % 2 == 0 { coeff } else { 0.0 })
+        let stripe_vecs: Vec<Vec<f64>> = (0..n)
+            .map(|_| {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let coeff = (rng >> 33) as f64 / u32::MAX as f64 * 2.0 - 1.0;
+                (0..dim)
+                    .map(|i| if i % 2 == 0 { coeff } else { 0.0 })
+                    .collect()
+            })
             .collect();
 
-        assert!(matches!(evaluate_manifold(&v, &state), ManifoldVerdict::Allow));
+        assert!(matches!(evaluate_manifold(&stripe_vecs, &state), ManifoldVerdict::Allow { .. }));
     }
 
     #[test]
     fn out_of_distribution_returns_deny() {
         let dim = 256;
-        let sub = trained_subspace(dim, 8);
+        let n = 8;
+        let sub = trained_striped(dim, 8, n);
         let threshold = sub.threshold();
         let state = ManifoldState {
             normal_subspaces: vec![],
@@ -269,18 +343,21 @@ mod tests {
             rate_limit_rps: 100.0,
         };
 
-        // Completely random vector — should be far from the learned subspace
         let mut rng = 777u64;
-        let v: Vec<f64> = (0..dim)
+        let stripe_vecs: Vec<Vec<f64>> = (0..n)
             .map(|_| {
-                rng = rng
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (rng >> 33) as f64 / u32::MAX as f64 * 2.0 - 1.0
+                (0..dim)
+                    .map(|_| {
+                        rng = rng
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        (rng >> 33) as f64 / u32::MAX as f64 * 2.0 - 1.0
+                    })
+                    .collect()
             })
             .collect();
 
-        let verdict = evaluate_manifold(&v, &state);
+        let verdict = evaluate_manifold(&stripe_vecs, &state);
         assert!(
             matches!(verdict, ManifoldVerdict::Deny { .. } | ManifoldVerdict::RateLimit { .. }),
             "OOD vector should not be allowed: {:?}",
@@ -291,7 +368,8 @@ mod tests {
     #[test]
     fn targeted_mode_lowers_deny_threshold() {
         let dim = 256;
-        let sub = trained_subspace(dim, 8);
+        let n = 8;
+        let sub = trained_striped(dim, 8, n);
         let threshold = sub.threshold();
         let normal_state = ManifoldState {
             normal_subspaces: vec![],
@@ -308,25 +386,26 @@ mod tests {
             rate_limit_rps: 100.0,
         };
 
-        // Vector that's somewhat anomalous
         let mut rng = 555u64;
-        let v: Vec<f64> = (0..dim)
+        let stripe_vecs: Vec<Vec<f64>> = (0..n)
             .map(|_| {
-                rng = rng
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (rng >> 33) as f64 / u32::MAX as f64 * 2.0 - 1.0
+                (0..dim)
+                    .map(|_| {
+                        rng = rng
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        (rng >> 33) as f64 / u32::MAX as f64 * 2.0 - 1.0
+                    })
+                    .collect()
             })
             .collect();
 
-        let v_normal = evaluate_manifold(&v, &normal_state);
-        let v_targeted = evaluate_manifold(&v, &targeted_state);
+        let v_normal = evaluate_manifold(&stripe_vecs, &normal_state);
+        let v_targeted = evaluate_manifold(&stripe_vecs, &targeted_state);
 
-        // Targeted mode should be at least as aggressive
         match (&v_normal, &v_targeted) {
             (ManifoldVerdict::RateLimit { .. }, ManifoldVerdict::Deny { .. }) => {}
             (a, b) => {
-                // Both same verdict is also acceptable
                 assert!(
                     std::mem::discriminant(a) == std::mem::discriminant(b)
                         || matches!(b, ManifoldVerdict::Deny { .. }),

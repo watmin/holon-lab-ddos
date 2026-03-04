@@ -221,9 +221,30 @@ fn cmd_unseal(token: &str, key_path: &str) {
             }
             println!();
             if !ctx.top_fields.is_empty() {
-                println!("  anomalous dimensions:");
-                for f in &ctx.top_fields {
-                    println!("    {:<20} {:.2}", f.field, f.score);
+                let top_level: Vec<_> = ctx.top_fields.iter()
+                    .filter(|f| !f.field.contains('.'))
+                    .collect();
+                let nested: Vec<_> = ctx.top_fields.iter()
+                    .filter(|f| f.field.contains('.'))
+                    .collect();
+
+                if !top_level.is_empty() {
+                    println!("  anomalous dimensions:");
+                    let max_w = top_level.iter().map(|f| f.field.len()).max().unwrap_or(12);
+                    for f in &top_level {
+                        println!("    {:<w$} {:.2}", f.field, f.score, w = max_w);
+                    }
+                }
+                if !nested.is_empty() {
+                    println!();
+                    println!("  standout sub-fields:");
+                    let max_w = nested.iter().map(|f| f.field.len()).max().unwrap_or(20);
+                    for f in &nested {
+                        let depth = f.field.matches('.').count();
+                        let indent = "  ".repeat(depth);
+                        println!("    {}{:<w$} {:.2}", indent, f.field, f.score,
+                                 w = max_w.saturating_sub(indent.len()));
+                    }
                 }
             }
             println!();

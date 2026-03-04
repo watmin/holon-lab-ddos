@@ -47,7 +47,6 @@ fn make_req(method: &str, path: &str, ip: &str, ua: Option<&str>, ct: Option<&st
         content_length: None,
         cookies: vec![],
         body: None,
-        body_len: 0,
         src_ip: ip.parse().unwrap(),
         conn_id: 0,
         tls_ctx,

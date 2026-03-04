@@ -50,6 +50,10 @@ pub enum DashboardEvent {
         warmup_req: bool,
         active_rules: usize,
         tick_count: u64,
+        manifold_allow: u64,
+        manifold_warmup: u64,
+        manifold_rate_limit: u64,
+        manifold_deny: u64,
     },
     RuleEvent {
         ts: f64,
@@ -72,9 +76,32 @@ pub enum DashboardEvent {
         ts: f64,
         counters: Vec<RuleCounter>,
     },
+    Verdict {
+        ts: f64,
+        src_ip: String,
+        method: String,
+        path: String,
+        query: Option<String>,
+        user_agent: Option<String>,
+        residual: f64,
+        threshold: f64,
+        deny_threshold: f64,
+        verdict: String,
+        /// Full Walkable representation of the request as JSON.
+        request_walk: serde_json::Value,
+        /// Drilldown attribution — empty for allow/warmup verdicts.
+        attribution: Vec<DenyField>,
+    },
     Heartbeat {
         ts: f64,
     },
+}
+
+/// Field-level anomaly attribution sent in deny events.
+#[derive(Debug, Clone, Serialize)]
+pub struct DenyField {
+    pub field: String,
+    pub score: f64,
 }
 
 /// Per-rule hit counter sent to the dashboard.
@@ -170,6 +197,7 @@ pub async fn run_metrics_server(
 ) {
     let app = Router::new()
         .route("/", get(serve_dashboard))
+        .route("/waf", get(serve_waf_dashboard))
         .route("/api/metrics/events", get(sse_handler))
         .route("/api/rules", get(rules_handler))
         .route("/metrics", get(metrics_handler))
@@ -188,6 +216,10 @@ pub async fn run_metrics_server(
 
 async fn serve_dashboard() -> impl IntoResponse {
     Html(include_str!("../static/dashboard.html"))
+}
+
+async fn serve_waf_dashboard() -> impl IntoResponse {
+    Html(include_str!("../static/waf_dashboard.html"))
 }
 
 async fn sse_handler(

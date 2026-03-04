@@ -186,13 +186,28 @@ Full details in [EXPERIMENT-DVWA-NIKTO.md](EXPERIMENT-DVWA-NIKTO.md).
 - **17 rules auto-generated**, 11,783 enforcement rate-limits
 - **Denial tokens:** sealed, persistent, unsealable offline with full request context
 
+## Attribution Fix: Cosine Similarity (March 4, 2026)
+
+The original drilldown attribution used L2-norm of `unbind(anomaly, role)` to score each
+field. Review against Holon's MAP algebra primers revealed this was fundamentally broken:
+for bipolar vectors, `||bind(A, R)|| = ||A||` — every field in a stripe received the
+identical score, providing **zero attribution information**.
+
+**Fix:** Switched to cosine similarity between the real-valued anomalous component
+(preserving PCA magnitude) and each leaf's bipolar `bind(role, filler)` vector. This is
+the correct MAP-algebra probe. Fields whose bindings are present in the anomaly direction
+score high; fields reconstructed by the subspace score near zero.
+
+Combined with 32-stripe encoding (reducing crosstalk) and k=8 per stripe (restoring
+throughput), the system now produces meaningful per-field attribution at WAF throughput.
+
 ## What's Next
 
 - [x] Live test against DVWA with real Nikto scan — **Done. 10,121 denies, 0 vulns found.**
+- [x] Dashboard integration for real-time spectral verdict visualization — **Done. /waf dashboard with SSE streaming.**
 - [ ] Slow Nikto test (`-Pause 1`) — pure geometric detection without rate-limit triggers
 - [ ] Mimicry attack — real browser submitting SQLi through DVWA forms (find the boundary)
 - [ ] Multi-source-IP — baseline lab Squid proxy with 23 ipvlan addresses
 - [ ] Measure spectral scoring overhead in isolation (microbenchmark without upstream)
 - [ ] Multi-core scaling measurement (ArcSwap read path under contention)
 - [ ] Engram CI/CD pipeline: train engrams in pre-production, promote to production
-- [ ] Dashboard integration for real-time spectral verdict visualization

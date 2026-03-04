@@ -1,0 +1,1097 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spectral Firewall — WAF</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Consolas', monospace;
+            background: #0a0a0f;
+            color: #e0e0e0;
+            overflow: hidden;
+        }
+
+        #container {
+            display: grid;
+            grid-template-rows: 54px minmax(200px, 280px) 1fr;
+            grid-template-columns: 1fr;
+            width: 100vw;
+            height: 100vh;
+            gap: 4px;
+            padding: 4px;
+        }
+
+        /* -- Header ------------------------------------------------- */
+        #header {
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 4px;
+            padding: 8px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        #header-left {
+            display: flex;
+            gap: 24px;
+            align-items: center;
+        }
+        #header-title {
+            font-size: 17px;
+            font-weight: bold;
+            color: #f84;
+        }
+        #status {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            font-size: 13px;
+        }
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #555;
+        }
+        .status-dot.connected {
+            background: #4f4;
+            box-shadow: 0 0 8px #4f4;
+        }
+        #counters {
+            display: flex;
+            gap: 18px;
+            font-size: 13px;
+        }
+        .ctr {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .ctr-label {
+            font-size: 9px;
+            color: #888;
+            text-transform: uppercase;
+        }
+        .ctr-value {
+            font-size: 15px;
+            font-weight: bold;
+        }
+
+        /* -- Middle row: chart + sidebar ---------------------------- */
+        #middle {
+            display: grid;
+            grid-template-columns: 1fr 300px;
+            gap: 4px;
+            min-height: 0;
+        }
+        #chart-panel {
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 4px;
+            position: relative;
+            overflow: hidden;
+            min-height: 180px;
+        }
+        .chart-legend {
+            position: absolute;
+            top: 8px;
+            left: 8px;
+            background: rgba(0,0,0,0.85);
+            padding: 8px 10px;
+            border-radius: 4px;
+            font-size: 11px;
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            border: 1px solid #333;
+            pointer-events: none;
+            z-index: 10;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-height: 16px;
+        }
+        .legend-color {
+            width: 18px;
+            height: 3px;
+            flex-shrink: 0;
+        }
+        .legend-name { color: #ccc; }
+        .legend-value {
+            font-weight: bold;
+            margin-left: auto;
+            white-space: nowrap;
+        }
+
+        /* -- Sidebar: anomaly gauge + aggregated field spectrum ------ */
+        #sidebar {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            min-height: 0;
+            overflow: hidden;
+        }
+        .side-panel {
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .side-header {
+            background: #181818;
+            padding: 6px 14px;
+            border-bottom: 1px solid #333;
+            font-size: 11px;
+            font-weight: bold;
+            color: #aaa;
+            text-transform: uppercase;
+        }
+        .side-body {
+            padding: 10px 14px;
+        }
+
+        /* Anomaly gauge */
+        #anomaly-gauge { flex: 0 0 auto; }
+        .gauge-wrap {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+        .gauge-bar-bg {
+            flex: 1;
+            height: 18px;
+            background: #1a1a2e;
+            border-radius: 9px;
+            position: relative;
+            overflow: hidden;
+        }
+        .gauge-bar-fill {
+            height: 100%;
+            border-radius: 9px;
+            transition: width 0.3s ease, background 0.3s ease;
+        }
+        .gauge-bar-threshold {
+            position: absolute;
+            top: 0;
+            height: 100%;
+            width: 2px;
+            background: #ff0;
+        }
+        .gauge-val {
+            font-size: 18px;
+            font-weight: bold;
+            min-width: 60px;
+            text-align: right;
+        }
+        .gauge-meta {
+            margin-top: 6px;
+            display: flex;
+            justify-content: space-between;
+            font-size: 10px;
+            color: #666;
+        }
+
+        /* Aggregated field spectrum */
+        #agg-spectrum { flex: 1; min-height: 0; overflow: hidden; }
+        #agg-spectrum .side-body { padding: 6px 10px; overflow-y: auto; max-height: 100%; }
+        .spec-row {
+            display: flex;
+            align-items: center;
+            padding: 2px 0;
+            font-size: 11px;
+            gap: 6px;
+        }
+        .spec-name {
+            color: #8af;
+            font-family: 'Consolas', monospace;
+            min-width: 100px;
+            text-align: right;
+            flex-shrink: 0;
+        }
+        .spec-bar-bg {
+            flex: 1;
+            height: 6px;
+            background: #1a1a2e;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .spec-bar-fill {
+            height: 100%;
+            border-radius: 3px;
+        }
+        .spec-score {
+            font-weight: bold;
+            font-family: 'Consolas', monospace;
+            min-width: 40px;
+            text-align: right;
+            flex-shrink: 0;
+        }
+
+        /* -- Deny log ----------------------------------------------- */
+        #deny-log {
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 4px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+        #deny-log-header {
+            background: #181818;
+            padding: 6px 14px;
+            border-bottom: 1px solid #333;
+            font-size: 11px;
+            font-weight: bold;
+            color: #aaa;
+            text-transform: uppercase;
+            flex-shrink: 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        #deny-log-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 4px;
+        }
+
+        /* -- Deny card ---------------------------------------------- */
+        .deny-card {
+            margin-bottom: 6px;
+            background: #131318;
+            border-left: 3px solid;
+            border-radius: 3px;
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+            overflow: hidden;
+        }
+        .deny-card.v-deny { border-left-color: #f44; }
+        .deny-card.v-rate_limit { border-left-color: #fa4; }
+        .deny-card.v-allow { border-left-color: #4f4; }
+        .deny-card.v-warmup { border-left-color: #48f; }
+
+        .deny-card-head {
+            display: flex;
+            align-items: baseline;
+            gap: 10px;
+            padding: 8px 12px 4px;
+            font-size: 13px;
+        }
+        .deny-verdict {
+            font-weight: bold;
+            font-size: 10px;
+            text-transform: uppercase;
+            padding: 2px 6px;
+            border-radius: 2px;
+            flex-shrink: 0;
+        }
+        .deny-verdict.v-deny { background: rgba(255,68,68,0.2); color: #f66; }
+        .deny-verdict.v-rate_limit { background: rgba(255,170,68,0.2); color: #fa4; }
+        .deny-verdict.v-allow { background: rgba(68,255,68,0.15); color: #4f4; }
+        .deny-verdict.v-warmup { background: rgba(68,136,255,0.15); color: #48f; }
+        .deny-time { color: #666; flex-shrink: 0; font-size: 12px; }
+        .deny-deviation {
+            font-weight: bold;
+            flex-shrink: 0;
+            white-space: nowrap;
+            font-size: 14px;
+        }
+
+        .deny-card-meta {
+            padding: 0 12px 6px;
+            font-size: 11px;
+            color: #666;
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+        .deny-card-meta span { white-space: nowrap; }
+        .deny-card-meta b { color: #999; }
+
+        /* Request JSON block */
+        .deny-section-label {
+            font-size: 9px;
+            font-weight: bold;
+            color: #555;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            padding: 4px 12px 2px;
+        }
+        .deny-request {
+            padding: 2px 12px 6px;
+            overflow-x: auto;
+        }
+        .deny-request pre {
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+            font-size: 11px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-break: break-all;
+            margin: 0;
+        }
+        .json-punct { color: #555; }
+        .json-key { font-weight: bold; }
+        .json-str { color: #8a8; }
+        .json-num { color: #8af; }
+        .json-null { color: #666; font-style: italic; }
+        .json-bool { color: #fa8; }
+        .scored .json-str,
+        .scored .json-num,
+        .scored .json-null,
+        .scored .json-bool { color: inherit; }
+
+        /* Attribution compact list */
+        .deny-attr {
+            padding: 4px 12px 8px;
+            font-size: 11px;
+            font-family: 'Consolas', monospace;
+            line-height: 1.6;
+        }
+        .attr-item {
+            display: inline-block;
+            margin-right: 6px;
+            padding: 1px 6px;
+            border-radius: 3px;
+            background: #1a1a2e;
+        }
+
+        .no-data-msg {
+            color: #555;
+            font-size: 12px;
+            text-align: center;
+            padding: 20px;
+        }
+
+        /* -- Scrollbar ---------------------------------------------- */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #0a0a0f; }
+        ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #555; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <!-- Header -->
+        <div id="header">
+            <div id="header-left">
+                <div id="header-title">Spectral Firewall — WAF</div>
+                <div id="status">
+                    <div class="status-dot" id="status-dot"></div>
+                    <span id="status-text">Connecting...</span>
+                </div>
+            </div>
+            <div id="counters">
+                <div class="ctr">
+                    <div class="ctr-label">Allow</div>
+                    <div class="ctr-value" id="c-allow" style="color:#4f4;">0</div>
+                </div>
+                <div class="ctr">
+                    <div class="ctr-label">Warmup</div>
+                    <div class="ctr-value" id="c-warmup" style="color:#8af;">0</div>
+                </div>
+                <div class="ctr">
+                    <div class="ctr-label">Rate-Ltd</div>
+                    <div class="ctr-value" id="c-ratelimit" style="color:#fa4;">0</div>
+                </div>
+                <div class="ctr">
+                    <div class="ctr-label">Deny</div>
+                    <div class="ctr-value" id="c-deny" style="color:#f44;">0</div>
+                </div>
+                <div class="ctr">
+                    <div class="ctr-label">RPS</div>
+                    <div class="ctr-value" id="c-rps">0</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Middle: trendline chart + sidebar -->
+        <div id="middle">
+            <div id="chart-panel">
+                <div class="chart-legend" id="chart-legend"></div>
+            </div>
+
+            <div id="sidebar">
+                <div class="side-panel" id="anomaly-gauge">
+                    <div class="side-header">Anomaly Score</div>
+                    <div class="side-body">
+                        <div class="gauge-wrap">
+                            <div class="gauge-bar-bg">
+                                <div class="gauge-bar-fill" id="gauge-fill" style="width:0%;background:#4f4;"></div>
+                                <div class="gauge-bar-threshold" id="gauge-thr" style="left:50%;"></div>
+                            </div>
+                            <div class="gauge-val" id="gauge-val">0.00</div>
+                        </div>
+                        <div class="gauge-meta">
+                            <span>threshold: <b id="gauge-thr-val">0.00</b></span>
+                            <span>streak: <b id="gauge-streak">0</b></span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="side-panel" id="agg-spectrum">
+                    <div class="side-header">Aggregated Anomaly Spectrum</div>
+                    <div class="side-body" id="agg-spectrum-body">
+                        <div class="no-data-msg">Waiting for deny events...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Request log -->
+        <div id="deny-log">
+            <div id="deny-log-header">
+                <span>Sampled Requests <span style="color:#666;font-weight:normal;">(latest 50)</span></span>
+                <span id="deny-count" style="color:#aaa;">0</span>
+            </div>
+            <div id="deny-log-body">
+                <div class="no-data-msg">No requests yet — waiting for traffic</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    const WINDOW_SECS = 120;
+    const MAX_DENY_LOG = 50;
+
+    const state = {
+        connected: false,
+        ts: [],
+        allowRate: [],
+        warmupRate: [],
+        rateLimitRate: [],
+        denyRate: [],
+        lastMetrics: null,
+        denies: [],
+        totalDenies: 0,
+        reqScore: 0,
+        reqThreshold: 0,
+        reqStreak: 0,
+        fieldAccum: new Map(),
+        denyLogDirty: false,
+        denyLogNew: 0,
+        aggSpectrumDirty: false,
+    };
+
+    let trendChart = null;
+
+    // =========================================================================
+    // SSE
+    // =========================================================================
+    let es = null;
+    function connectSSE() {
+        if (es) es.close();
+        es = new EventSource('/api/metrics/events');
+        es.onopen = () => { state.connected = true; updateStatus(); };
+        es.onerror = () => {
+            state.connected = false;
+            updateStatus();
+            setTimeout(connectSSE, 3000);
+        };
+        es.onmessage = (e) => {
+            try { handleEvent(JSON.parse(e.data)); }
+            catch (err) { console.error('SSE parse error:', err); }
+        };
+    }
+
+    function handleEvent(d) {
+        switch (d.type) {
+            case 'metrics': handleMetrics(d); break;
+            case 'verdict': handleVerdict(d); break;
+        }
+    }
+
+    // =========================================================================
+    // Metrics
+    // =========================================================================
+    function handleMetrics(d) {
+        const now = Date.now() / 1000;
+        let allowR = 0, warmupR = 0, rlR = 0, denyR = 0;
+
+        if (state.lastMetrics) {
+            const dt = Math.max(d.ts - state.lastMetrics.ts, 0.01);
+            allowR  = Math.max(0, (d.manifold_allow - state.lastMetrics.manifold_allow) / dt);
+            warmupR = Math.max(0, (d.manifold_warmup - state.lastMetrics.manifold_warmup) / dt);
+            rlR     = Math.max(0, (d.manifold_rate_limit - state.lastMetrics.manifold_rate_limit) / dt);
+            denyR   = Math.max(0, (d.manifold_deny - state.lastMetrics.manifold_deny) / dt);
+        }
+        state.lastMetrics = d;
+
+        state.ts.push(now);
+        state.allowRate.push(allowR);
+        state.warmupRate.push(warmupR);
+        state.rateLimitRate.push(rlR);
+        state.denyRate.push(denyR);
+        trimTimeline();
+
+        state.reqScore = d.req_score;
+        state.reqThreshold = d.req_threshold;
+        state.reqStreak = d.anomaly_streak_req;
+
+        updateCounters(d);
+        updateTrendChart();
+        updateLegend(allowR, warmupR, rlR, denyR);
+        updateGauge();
+    }
+
+    function trimTimeline() {
+        const cutoff = Date.now() / 1000 - WINDOW_SECS;
+        while (state.ts.length > 0 && state.ts[0] < cutoff) {
+            state.ts.shift();
+            state.allowRate.shift();
+            state.warmupRate.shift();
+            state.rateLimitRate.shift();
+            state.denyRate.shift();
+        }
+    }
+
+    // =========================================================================
+    // Verdict event (allow / warmup / rate_limit / deny)
+    // =========================================================================
+    let pendingRender = false;
+
+    function handleVerdict(d) {
+        state.totalDenies++;
+
+        if (d.attribution && d.attribution.length > 0) {
+            for (const a of d.attribution) {
+                const prev = state.fieldAccum.get(a.field) || { total: 0, count: 0 };
+                prev.total += a.score;
+                prev.count += 1;
+                state.fieldAccum.set(a.field, prev);
+            }
+            state.aggSpectrumDirty = true;
+        }
+
+        state.denies.unshift(d);
+        if (state.denies.length > MAX_DENY_LOG) state.denies.pop();
+        state.denyLogNew++;
+        state.denyLogDirty = true;
+
+        if (!pendingRender) {
+            pendingRender = true;
+            requestAnimationFrame(flushRender);
+        }
+    }
+
+    function flushRender() {
+        pendingRender = false;
+        if (state.denyLogDirty) {
+            state.denyLogDirty = false;
+            renderDenyLogIncremental();
+        }
+        if (state.aggSpectrumDirty) {
+            state.aggSpectrumDirty = false;
+            updateAggSpectrum();
+        }
+    }
+
+    // =========================================================================
+    // Counters + status
+    // =========================================================================
+    function updateCounters(d) {
+        el('c-allow').textContent = fmt(d.manifold_allow);
+        el('c-warmup').textContent = fmt(d.manifold_warmup);
+        el('c-ratelimit').textContent = fmt(d.manifold_rate_limit);
+        el('c-deny').textContent = fmt(d.manifold_deny);
+        el('c-rps').textContent = fmt(Math.round(d.estimated_rps));
+        el('deny-count').textContent = fmt(d.manifold_deny + d.manifold_rate_limit);
+    }
+
+    function updateStatus() {
+        const dot = el('status-dot');
+        const txt = el('status-text');
+        if (state.connected) {
+            dot.classList.add('connected');
+            txt.textContent = 'Connected';
+        } else {
+            dot.classList.remove('connected');
+            txt.textContent = 'Disconnected';
+        }
+    }
+
+    // =========================================================================
+    // Legend
+    // =========================================================================
+    const SERIES = [
+        { name: 'allow',      color: '#4f4' },
+        { name: 'warmup',     color: '#8af' },
+        { name: 'rate-limit', color: '#fa4' },
+        { name: 'deny',       color: '#f44' },
+    ];
+
+    function updateLegend(allowR, warmupR, rlR, denyR) {
+        const vals = [allowR, warmupR, rlR, denyR];
+        el('chart-legend').innerHTML = SERIES.map((s, i) =>
+            `<div class="legend-item">` +
+            `<div class="legend-color" style="background:${s.color};"></div>` +
+            `<span class="legend-name">${s.name}</span>` +
+            `<span class="legend-value" style="color:${s.color};">${fmt(Math.round(vals[i]))}/s</span>` +
+            `</div>`
+        ).join('');
+    }
+
+    // =========================================================================
+    // Trendline chart
+    // =========================================================================
+    function initTrendChart() {
+        const wrap = el('chart-panel');
+        const r = wrap.getBoundingClientRect();
+        const opts = {
+            title: "",
+            width: r.width, height: r.height,
+            pxAlign: false,
+            scales: {
+                x: { time: true, range: () => { const n = Date.now()/1000; return [n - WINDOW_SECS, n]; } },
+                y: { range: (_, __, mx) => [0, Math.max((mx||1)*1.1, 1)] },
+            },
+            axes: [
+                { stroke:"#666", grid:{show:true,stroke:"#1a1a1a",width:1}, font:"10px monospace",
+                  values: (_, ticks) => ticks.map(v => new Date(v*1000).toLocaleTimeString()) },
+                { stroke:"#666", grid:{show:true,stroke:"#1a1a1a",width:1}, font:"10px monospace",
+                  values:(_,t)=>t.map(v=>fmt(Math.round(v))+'/s'), size:60 },
+            ],
+            series: [
+                {},
+                { label:"allow",      stroke:"#4f4", fill:"rgba(68,255,68,0.06)",  width:2 },
+                { label:"warmup",     stroke:"#8af", fill:"rgba(136,170,255,0.04)", width:1, dash:[4,4] },
+                { label:"rate-limit", stroke:"#fa4", fill:"rgba(255,170,68,0.08)",  width:2 },
+                { label:"deny",       stroke:"#f44", fill:"rgba(255,68,68,0.10)",   width:2 },
+            ],
+            cursor: {
+                drag: { x: false, y: false },
+                focus: { prox: 30 },
+                points: { size: 6, width: 2 },
+            },
+            legend: { show: false },
+        };
+        trendChart = new uPlot(opts, [[],[],[],[],[]], wrap);
+    }
+
+    function updateTrendChart() {
+        if (!trendChart || state.ts.length === 0) return;
+        trendChart.setData([
+            state.ts,
+            state.allowRate,
+            state.warmupRate,
+            state.rateLimitRate,
+            state.denyRate,
+        ]);
+    }
+
+    // =========================================================================
+    // Anomaly gauge
+    // =========================================================================
+    function updateGauge() {
+        const score = state.reqScore;
+        const thr = state.reqThreshold;
+        const streak = state.reqStreak;
+        const maxDisplay = Math.max(thr * 3, score * 1.2, 1);
+        const pct = Math.min(100, (score / maxDisplay) * 100);
+        const thrPct = Math.min(100, (thr / maxDisplay) * 100);
+
+        let color;
+        if (thr > 0 && score > thr * 2) color = '#f44';
+        else if (thr > 0 && score > thr) color = '#fa4';
+        else color = '#4f4';
+
+        el('gauge-fill').style.width = pct + '%';
+        el('gauge-fill').style.background = color;
+        el('gauge-thr').style.left = thrPct + '%';
+        el('gauge-val').textContent = score.toFixed(2);
+        el('gauge-val').style.color = color;
+        el('gauge-thr-val').textContent = thr.toFixed(2);
+        el('gauge-streak').textContent = streak;
+        el('gauge-streak').style.color = streak >= 3 ? '#f44' : '#ccc';
+    }
+
+    // =========================================================================
+    // Aggregated anomaly spectrum (sidebar)
+    // =========================================================================
+    function updateAggSpectrum() {
+        const all = [...state.fieldAccum.entries()]
+            .map(([field, { total, count }]) => ({ field, avg: total / count, count }))
+            .sort((a, b) => b.avg - a.avg);
+
+        // Show only top-level and first-level fields in the aggregate (cap at 15)
+        const sorted = all.filter(f => (f.field.match(/\./g) || []).length <= 1).slice(0, 15);
+
+        if (sorted.length === 0) return;
+
+        const maxScore = sorted[0].avg;
+        const body = el('agg-spectrum-body');
+        body.innerHTML = sorted.map(f => {
+            const barPct = maxScore > 0 ? (f.avg / maxScore) * 100 : 0;
+            const hot = barPct > 80;
+            const color = hot ? '#f84' : '#4a6a8a';
+            const depth = (f.field.match(/\./g) || []).length;
+            const indent = depth > 0 ? 'padding-left:10px;font-size:10px;' : '';
+            return `<div class="spec-row">` +
+                `<span class="spec-name" style="${indent}">${esc(f.field)}</span>` +
+                `<div class="spec-bar-bg"><div class="spec-bar-fill" style="width:${barPct}%;background:${color};"></div></div>` +
+                `<span class="spec-score" style="color:${color};">${f.avg.toFixed(1)}</span>` +
+                `</div>`;
+        }).join('');
+    }
+
+    // =========================================================================
+    // Request log — each entry is a verdict card
+    // =========================================================================
+    let firstRender = true;
+
+    function renderDenyLogIncremental() {
+        const body = el('deny-log-body');
+        const newCount = state.denyLogNew;
+        state.denyLogNew = 0;
+
+        if (state.denies.length === 0) {
+            body.innerHTML = '<div class="no-data-msg">No requests yet — waiting for traffic</div>';
+            firstRender = true;
+            return;
+        }
+
+        if (newCount === 0) return;
+
+        // If the user has scrolled down, skip DOM updates to avoid
+        // fighting their scroll position. Data keeps accumulating in
+        // state.denies; we'll catch up when they scroll back to top.
+        const scrolledAway = body.scrollTop > 40;
+        if (scrolledAway && !firstRender) return;
+
+        if (firstRender || newCount > 10) {
+            body.innerHTML = state.denies.map(renderVerdictCard).join('');
+            firstRender = false;
+        } else {
+            const frag = document.createDocumentFragment();
+            for (let i = newCount - 1; i >= 0; i--) {
+                const div = document.createElement('div');
+                div.innerHTML = renderVerdictCard(state.denies[i]);
+                frag.appendChild(div.firstElementChild);
+            }
+            body.insertBefore(frag, body.firstChild);
+
+            while (body.children.length > MAX_DENY_LOG) {
+                body.removeChild(body.lastChild);
+            }
+        }
+    }
+
+    function renderDenyLog() { renderDenyLogIncremental(); }
+
+    // When the user scrolls back to the top, catch up with any missed updates
+    el('deny-log-body').addEventListener('scroll', function() {
+        if (this.scrollTop <= 40 && !firstRender) {
+            this.innerHTML = state.denies.map(renderVerdictCard).join('');
+        }
+    });
+
+    const VERDICT_LABELS = {
+        deny: 'DENY', rate_limit: 'RATE-LTD',
+        allow: 'ALLOW', warmup: 'WARMUP'
+    };
+
+    function renderVerdictCard(d) {
+        const time = fmtTime(d.ts);
+        const hasAttribution = d.attribution && d.attribution.length > 0;
+        const isAnomalous = d.verdict === 'deny' || d.verdict === 'rate_limit';
+
+        const attrs = d.attribution || [];
+        const rawScoreMap = {};
+        for (const a of attrs) {
+            rawScoreMap[a.field] = a.score;
+        }
+        const scoreMap = buildPropagatedScores(rawScoreMap);
+
+        const sortedScores = attrs.map(a => a.score).sort((a, b) => a - b);
+        const p25 = sortedScores.length > 0 ? sortedScores[Math.floor(sortedScores.length * 0.25)] : 0;
+        const maxAttrScore = sortedScores.length > 0 ? sortedScores[sortedScores.length - 1] : 0;
+        const minAttrScore = p25;
+
+        let deviationHtml = '';
+        if (isAnomalous && d.threshold > 0) {
+            const deviation = (d.residual / d.threshold).toFixed(1) + 'x';
+            const deviationColor = d.residual > d.deny_threshold ? '#f44' : '#fa4';
+            deviationHtml = `<span class="deny-deviation" style="color:${deviationColor};">${deviation}</span>`;
+        }
+
+        const headHtml = `<div class="deny-card-head">` +
+            `<span class="deny-verdict v-${d.verdict}">${VERDICT_LABELS[d.verdict] || d.verdict.toUpperCase()}</span>` +
+            `<span class="deny-time">${time}</span>` +
+            deviationHtml +
+            `</div>`;
+
+        let metaHtml = '';
+        if (isAnomalous) {
+            metaHtml = `<div class="deny-card-meta">` +
+                `<span>residual: <b>${d.residual.toFixed(2)}</b></span>` +
+                `<span>thr: <b>${d.threshold.toFixed(2)}</b></span>` +
+                `<span>deny: <b>${d.deny_threshold.toFixed(2)}</b></span>` +
+                `<span>src: <b>${esc(d.src_ip)}</b></span>` +
+                `</div>`;
+        } else {
+            metaHtml = `<div class="deny-card-meta">` +
+                `<span>${esc(d.method)} ${esc(d.path)}</span>` +
+                `<span>src: <b>${esc(d.src_ip)}</b></span>` +
+                `</div>`;
+        }
+
+        const jsonHtml = renderRequestJson(d.request_walk, scoreMap, minAttrScore, maxAttrScore);
+
+        let attrSection = '';
+        if (hasAttribution) {
+            const attrHtml = renderAttributionCompact(attrs, minAttrScore, maxAttrScore);
+            attrSection = `<div class="deny-section-label">Spectral Attribution</div>` + attrHtml;
+        }
+
+        return `<div class="deny-card v-${d.verdict}">` +
+            headHtml + metaHtml +
+            `<div class="deny-section-label">Request</div>` +
+            `<div class="deny-request"><pre>${jsonHtml}</pre></div>` +
+            attrSection +
+            `</div>`;
+    }
+
+    // =========================================================================
+    // JSON rendering with color-coded keys (recursive path-aware)
+    // =========================================================================
+    function renderRequestJson(walk, scoreMap, minScore, maxScore) {
+        if (!walk || typeof walk !== 'object') {
+            return `<span class="json-null">null</span>`;
+        }
+        return jsonObjectKeyed(walk, scoreMap, minScore, maxScore, '', 0);
+    }
+
+    function buildPropagatedScores(scoreMap) {
+        const propagated = Object.assign({}, scoreMap);
+        for (const key in scoreMap) {
+            const score = scoreMap[key];
+            let pos = 0;
+            while (pos < key.length) {
+                const dotIdx = key.indexOf('.', pos + 1);
+                if (dotIdx === -1) break;
+                const ancestor = key.substring(0, dotIdx);
+                if (propagated[ancestor] === undefined || score > propagated[ancestor]) {
+                    propagated[ancestor] = score;
+                }
+                pos = dotIdx;
+            }
+        }
+        return propagated;
+    }
+
+    function resolveScore(scoreMap, fieldPath) {
+        return scoreMap[fieldPath];
+    }
+
+    function jsonObjectKeyed(obj, scoreMap, minScore, maxScore, pathPrefix, depth) {
+        const keys = Object.keys(obj);
+        if (keys.length === 0) return `<span class="json-punct">{}</span>`;
+
+        keys.sort((a, b) => {
+            const pa = pathPrefix ? pathPrefix + '.' + a : a;
+            const pb = pathPrefix ? pathPrefix + '.' + b : b;
+            return (resolveScore(scoreMap, pb) || 0) - (resolveScore(scoreMap, pa) || 0);
+        });
+
+        const pad = '  '.repeat(depth + 1);
+        let out = `<span class="json-punct">{</span>\n`;
+        for (let i = 0; i < keys.length; i++) {
+            const key = keys[i];
+            const val = obj[key];
+            const fieldPath = pathPrefix ? pathPrefix + '.' + key : key;
+            const score = resolveScore(scoreMap, fieldPath);
+            const keyColor = score !== undefined
+                ? scoreToColor(score, minScore, maxScore)
+                : '#666';
+            const comma = i < keys.length - 1 ? '<span class="json-punct">,</span>' : '';
+            const valHtml = jsonValueKeyed(val, scoreMap, minScore, maxScore, fieldPath, depth + 1);
+            out += `${pad}<span class="json-key" style="color:${keyColor};">"${esc(key)}"</span>` +
+                   `<span class="json-punct">: </span>${valHtml}${comma}\n`;
+        }
+        out += `${'  '.repeat(depth)}<span class="json-punct">}</span>`;
+        return out;
+    }
+
+    function jsonValueKeyed(val, scoreMap, minScore, maxScore, path, depth) {
+        if (val === null || val === undefined) {
+            return `<span class="json-null">null</span>`;
+        }
+        if (typeof val === 'string') {
+            const display = val.length > 120 ? val.substring(0, 117) + '...' : val;
+            return `<span class="json-str">"${esc(display)}"</span>`;
+        }
+        if (typeof val === 'number') {
+            const display = Number.isInteger(val) ? String(val) : val.toFixed(2);
+            return `<span class="json-num">${display}</span>`;
+        }
+        if (typeof val === 'boolean') {
+            return `<span class="json-bool">${val}</span>`;
+        }
+        if (Array.isArray(val)) {
+            return jsonArrayKeyed(val, scoreMap, minScore, maxScore, path, depth);
+        }
+        if (typeof val === 'object') {
+            return jsonObjectKeyed(val, scoreMap, minScore, maxScore, path, depth);
+        }
+        return esc(String(val));
+    }
+
+    function jsonArrayKeyed(arr, scoreMap, minScore, maxScore, path, depth) {
+        if (arr.length === 0) return `<span class="json-punct">[]</span>`;
+
+        const allScalar = arr.every(v => v === null || typeof v !== 'object');
+
+        // Estimate inline width: scalars ~4 chars each + separators
+        const estWidth = allScalar ? arr.reduce((w, v) => w + String(v).length + 2, 2) : 999;
+
+        if (allScalar && estWidth <= 100) {
+            const items = arr.map((v, i) => {
+                const iPath = path + '.[' + i + ']';
+                const iScore = resolveScore(scoreMap, iPath);
+                const html = jsonValueKeyed(v, scoreMap, minScore, maxScore, iPath, depth + 1);
+                return iScore !== undefined
+                    ? `<span class="scored" style="color:${scoreToColor(iScore, minScore, maxScore)};">${html}</span>`
+                    : html;
+            }).join('<span class="json-punct">, </span>');
+            return `<span class="json-punct">[</span>${items}<span class="json-punct">]</span>`;
+        }
+
+        const allShortPairs = arr.every(v => Array.isArray(v) && v.length === 2 &&
+            v.every(x => x === null || typeof x !== 'object'));
+
+        if (allShortPairs) {
+            // Estimate pair widths for inline decision
+            const pairWidth = arr.reduce((w, v) => w + String(v[0]).length + String(v[1]).length + 6, 2);
+            if (arr.length <= 4 && pairWidth <= 100) {
+                // Inline pairs: [[k, v], [k, v]]
+                const items = arr.map((v, i) => {
+                    const iPath = path + '.[' + i + ']';
+                    const iScore = resolveScore(scoreMap, iPath);
+                    const lineColor = iScore !== undefined ? ` class="scored" style="color:${scoreToColor(iScore, minScore, maxScore)};"` : '';
+                    const inner = v.map((x, j) => {
+                        const jPath = iPath + '.[' + j + ']';
+                        return jsonValueKeyed(x, scoreMap, minScore, maxScore, jPath, depth + 2);
+                    }).join('<span class="json-punct">, </span>');
+                    return `<span${lineColor}><span class="json-punct">[</span>${inner}<span class="json-punct">]</span></span>`;
+                }).join('<span class="json-punct">, </span>');
+                return `<span class="json-punct">[</span>${items}<span class="json-punct">]</span>`;
+            }
+
+            if (arr.length <= 20) {
+                const pad = '  '.repeat(depth + 1);
+                const items = arr.map((v, i) => {
+                    const iPath = path + '.[' + i + ']';
+                    const iScore = resolveScore(scoreMap, iPath);
+                    const lineColor = iScore !== undefined ? ` class="scored" style="color:${scoreToColor(iScore, minScore, maxScore)};"` : '';
+                    const inner = v.map((x, j) => {
+                        const jPath = iPath + '.[' + j + ']';
+                        return jsonValueKeyed(x, scoreMap, minScore, maxScore, jPath, depth + 2);
+                    }).join('<span class="json-punct">, </span>');
+                    return `${pad}<span${lineColor}><span class="json-punct">[</span>${inner}<span class="json-punct">]</span></span>`;
+                });
+                return `<span class="json-punct">[</span>\n${items.join('<span class="json-punct">,</span>\n')}\n${'  '.repeat(depth)}<span class="json-punct">]</span>`;
+            }
+        }
+
+        if (depth >= 3 && arr.length > 4) {
+            const preview = arr.slice(0, 3).map((v, i) => {
+                const iPath = path + '.[' + i + ']';
+                return jsonValueKeyed(v, scoreMap, minScore, maxScore, iPath, depth + 1);
+            }).join('<span class="json-punct">, </span>');
+            return `<span class="json-punct">[</span>${preview}<span class="json-punct">, </span><span class="json-null">... +${arr.length - 3}</span><span class="json-punct">]</span>`;
+        }
+
+        const pad = '  '.repeat(depth + 1);
+        const items = arr.map((v, i) => {
+            const iPath = path + '.[' + i + ']';
+            const iScore = resolveScore(scoreMap, iPath);
+            const html = jsonValueKeyed(v, scoreMap, minScore, maxScore, iPath, depth + 1);
+            if (iScore !== undefined) {
+                return `${pad}<span class="scored" style="color:${scoreToColor(iScore, minScore, maxScore)};">${html}</span>`;
+            }
+            return `${pad}${html}`;
+        });
+        return `<span class="json-punct">[</span>\n${items.join('<span class="json-punct">,</span>\n')}\n${'  '.repeat(depth)}<span class="json-punct">]</span>`;
+    }
+
+    function scoreToColor(score, minScore, maxScore) {
+        if (score < minScore) return '#555';
+        const range = maxScore - minScore;
+        if (range <= 0) return '#555';
+        const t = Math.max(0, Math.min(1, (score - minScore) / range));
+        // Below noise floor → grey; above → #fa4 (warm) → #f44 (hot)
+        if (t < 0.5) {
+            const u = t * 2;
+            const r = Math.round(0x88 + (0xff - 0x88) * u);
+            const g = Math.round(0x88 + (0xaa - 0x88) * u);
+            const b = Math.round(0x44);
+            return `rgb(${r},${g},${b})`;
+        } else {
+            const u = (t - 0.5) * 2;
+            const r = 0xff;
+            const g = Math.round(0xaa - (0xaa - 0x44) * u);
+            const b = 0x44;
+            return `rgb(${r},${g},${b})`;
+        }
+    }
+
+    // =========================================================================
+    // Attribution compact list (top fields as inline tags)
+    // =========================================================================
+    function renderAttributionCompact(attrs, minScore, maxScore) {
+        if (attrs.length === 0) return '';
+
+        const tags = attrs.slice(0, 12).map(a => {
+            const color = scoreToColor(a.score, minScore, maxScore);
+            return `<span class="attr-item" style="color:${color};border:1px solid ${color}33;">${esc(a.field)} <b>${a.score.toFixed(1)}</b></span>`;
+        }).join('');
+
+        const extra = attrs.length > 12 ? `<span style="color:#555;font-size:10px;"> +${attrs.length - 12} more</span>` : '';
+
+        return `<div class="deny-attr">${tags}${extra}</div>`;
+    }
+
+    // =========================================================================
+    // Utilities
+    // =========================================================================
+    function el(id) { return document.getElementById(id); }
+    function fmt(n) {
+        if (n >= 1e6) return (n/1e6).toFixed(1)+'M';
+        if (n >= 1e3) return (n/1e3).toFixed(1)+'K';
+        return String(n);
+    }
+    function fmtTime(ts) {
+        return new Date(ts * 1000).toLocaleTimeString();
+    }
+    function esc(s) {
+        if (!s) return '';
+        const d = document.createElement('div');
+        d.textContent = s;
+        return d.innerHTML;
+    }
+
+    // =========================================================================
+    // Resize
+    // =========================================================================
+    function onResize() {
+        if (trendChart) {
+            const r = el('chart-panel').getBoundingClientRect();
+            trendChart.setSize({ width: r.width, height: r.height });
+        }
+    }
+    window.addEventListener('resize', onResize);
+
+    // =========================================================================
+    // Init
+    // =========================================================================
+    initTrendChart();
+    connectSSE();
+    </script>
+</body>
+</html>

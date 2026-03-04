@@ -18,6 +18,10 @@ pub mod types;
 
 pub use types::*;
 
+/// Number of independent vector stripes for FQDN leaf-hashed encoding.
+/// Each leaf binding's full dotted path is hashed to pick one of N stripes.
+pub const N_STRIPES: usize = 32;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;

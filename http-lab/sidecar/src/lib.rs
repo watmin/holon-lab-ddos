@@ -27,19 +27,20 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
-use holon::kernel::{Encoder, VectorManager};
+use holon::kernel::{Encoder, Primitives, VectorManager};
+use holon::memory::StripedSubspace;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{info, warn};
 
 use http_proxy::expr::RuleExpr;
 use http_proxy::expr_tree::ExprCompiledTree;
-use http_proxy::manifold::{ManifoldState, NormalSubspace, ThreatMode as ManifoldThreatMode};
+use http_proxy::manifold::{ManifoldState, ThreatMode as ManifoldThreatMode};
 use http_proxy::types::{RequestSample, RuleAction, SampleMessage, TlsSample};
 use crate::detection::{compile_compound_rule_expr, compile_merged_rule_expr, Detection};
 use crate::detectors::{SubspaceDetector, SurpriseHistory, ThreatMode, WindowTracker, drilldown_probe};
 use crate::field_tracker::FieldTracker;
 use crate::metrics_server::{
-    DashboardEvent, MetricsAppState, RuleSummary,
+    DashboardEvent, DenyField, MetricsAppState, RuleSummary,
     new_shared_stats, new_shared_rules, now_ts, run_metrics_server,
 };
 use crate::rule_manager::RuleManager;
@@ -69,6 +70,14 @@ const TLS_FIELDS: &[&str] = &[
 
 const VSA_DIM: usize = 4096;
 const VSA_K: usize = 64;
+
+/// PCA components per stripe. With N_STRIPES=32 and ~100 total leaf bindings,
+/// each stripe holds ~3 bindings — k=8 captures the variance with headroom
+/// while avoiding the 8× overhead of k=64.
+const STRIPED_K: usize = 8;
+
+/// Number of independent vector stripes for FQDN leaf-hashed encoding.
+const N_STRIPES: usize = http_proxy::N_STRIPES;
 
 /// Hybrid tick trigger: fire after this many REQ samples OR ANALYSIS_MAX_MS, whichever first.
 const ANALYSIS_INTERVAL: usize = 200;
@@ -149,6 +158,7 @@ pub async fn run(
         500,   // reorth_interval
     );
     let mut req_detector = SubspaceDetector::new(VSA_DIM, VSA_K);
+    let mut req_striped_baseline = StripedSubspace::new(VSA_DIM, STRIPED_K, N_STRIPES);
     let mut req_tracker = FieldTracker::new(decay_factor(DECAY_HALF_LIFE));
 
     if let Some(ref path) = engram_path {
@@ -189,6 +199,10 @@ pub async fn run(
 
     let analysis_max_dur = Duration::from_millis(ANALYSIS_MAX_MS);
 
+    // Rate-limit verdict events to ~10/sec for the WAF dashboard SSE stream
+    let mut last_verdict_broadcast = Instant::now();
+    let verdict_broadcast_interval = Duration::from_millis(100);
+
     info!("  Analysis trigger: every {} REQ samples or {}ms (hybrid)", ANALYSIS_INTERVAL, ANALYSIS_MAX_MS);
     info!("  Decay half-life: {} requests (factor={:.6})", DECAY_HALF_LIFE, decay_alpha);
     info!("  Warmup: {} TLS samples, {} REQ samples", WARMUP_SAMPLES_TLS, WARMUP_SAMPLES_REQ);
@@ -217,6 +231,27 @@ pub async fn run(
                         &mut tls_tick_max_residual, &mut tls_tick_max_vec,
                     );
                 }
+                Ok(SampleMessage::DenyEvent(deny)) => {
+                    if last_verdict_broadcast.elapsed() >= verdict_broadcast_interval {
+                        last_verdict_broadcast = Instant::now();
+                        let _ = event_tx.send(DashboardEvent::Verdict {
+                            ts: now_ts(),
+                            src_ip: deny.src_ip,
+                            method: deny.method,
+                            path: deny.path,
+                            query: deny.query,
+                            user_agent: deny.user_agent,
+                            residual: deny.residual,
+                            threshold: deny.threshold,
+                            deny_threshold: deny.deny_threshold,
+                            verdict: deny.verdict,
+                            request_walk: deny.request_walk,
+                            attribution: deny.attribution.into_iter()
+                                .map(|(field, score)| DenyField { field, score })
+                                .collect(),
+                        });
+                    }
+                }
                 Ok(SampleMessage::RequestSample(s)) => {
                     req_received_this_drain += 1;
                     got_sample = true;
@@ -226,7 +261,9 @@ pub async fn run(
                         warmup_start = Some(Instant::now());
                     }
                     let window_result = process_req_sample(
-                        &s, &encoder, &mut req_detector, &mut req_tracker,
+                        &s, &encoder, &mut req_detector,
+                        &mut req_striped_baseline,
+                        &mut req_tracker,
                         &mut req_warmup_count, req_warmup_done, decay_alpha,
                         &mut req_tick_max_residual, &mut req_tick_max_vec,
                         &mut req_tick_max_sample,
@@ -259,7 +296,7 @@ pub async fn run(
                                 req_detector.freeze_normal();
                                 if req_warmup_done {
                                     manifold.store(Arc::new(build_manifold_state(
-                                        &mut req_detector, &current_threat_mode, baseline_rps,
+                                        &req_striped_baseline, &current_threat_mode, baseline_rps,
                                     )));
                                 }
                             }
@@ -274,7 +311,7 @@ pub async fn run(
                                 req_detector.freeze_normal();
                                 if req_warmup_done {
                                     manifold.store(Arc::new(build_manifold_state(
-                                        &mut req_detector, &current_threat_mode, baseline_rps,
+                                        &req_striped_baseline, &current_threat_mode, baseline_rps,
                                     )));
                                 }
                             }
@@ -285,7 +322,7 @@ pub async fn run(
                                     req_detector.thaw_normal();
                                     if req_warmup_done {
                                         manifold.store(Arc::new(build_manifold_state(
-                                            &mut req_detector, &current_threat_mode, baseline_rps,
+                                            &req_striped_baseline, &current_threat_mode, baseline_rps,
                                         )));
                                     }
                                 }
@@ -370,13 +407,13 @@ pub async fn run(
             baseline_rps = req_warmup_count as f64 / warmup_secs;
             req_tracker.freeze_baseline(0.5);
             req_detector.mint_normal_engram("baseline-normal");
-            info!("[REQ] Warmup complete ({} samples, threshold={:.2}, baseline_rps={:.0}, normal engram minted)",
-                  req_warmup_count, req_detector.baseline.threshold(), baseline_rps);
+            info!("[REQ] Warmup complete ({} samples, striped_threshold={:.2}, baseline_rps={:.0}, normal engram minted)",
+                  req_warmup_count, req_striped_baseline.threshold(), baseline_rps);
 
-            let mstate = build_manifold_state(&mut req_detector, &current_threat_mode, baseline_rps);
+            let mstate = build_manifold_state(&req_striped_baseline, &current_threat_mode, baseline_rps);
             manifold.store(Arc::new(mstate));
             info!("[MANIFOLD] Initial state published (deny_threshold={:.2})",
-                  req_detector.baseline.threshold() * 2.0);
+                  req_striped_baseline.threshold() * 2.0);
         }
 
         // -------------------------------------------------------------------
@@ -485,9 +522,10 @@ pub async fn run(
         if req_warmup_done && req_tick_max_residual > 0.0 {
             let score = req_tick_max_residual;
             let threshold = req_detector.baseline.threshold();
+            let striped_threshold = req_striped_baseline.threshold();
             let is_anomalous = score > threshold;
             tick_req_score = score;
-            tick_req_threshold = threshold;
+            tick_req_threshold = striped_threshold;
 
             info!("[REQ] score={:.4} threshold={:.4} anomalous={}", score, threshold, is_anomalous);
 
@@ -706,6 +744,10 @@ pub async fn run(
             warmup_req: !req_warmup_done,
             active_rules: rules_count,
             tick_count,
+            manifold_allow: m_allow,
+            manifold_warmup: m_warmup,
+            manifold_rate_limit: m_rate_limit,
+            manifold_deny: m_deny,
         });
 
         // Emit per-rule counters
@@ -787,7 +829,9 @@ fn process_tls_sample(
     }
 }
 
-/// Process a single REQ sample: encode, decay accumulator, learn/score, track fields,
+/// Process a single REQ sample: encode with striped FQDN hashing,
+/// train both the striped baseline (for manifold) and the single-vector
+/// detector (for sidecar-internal rule generation), track fields,
 /// and feed the window tracker.
 ///
 /// Returns a `WindowResult` when the window fills (every WINDOW_SIZE samples).
@@ -795,6 +839,7 @@ fn process_req_sample(
     sample: &RequestSample,
     encoder: &Encoder,
     detector: &mut SubspaceDetector,
+    striped_baseline: &mut StripedSubspace,
     tracker: &mut FieldTracker,
     warmup_count: &mut usize,
     warmup_done: bool,
@@ -804,26 +849,38 @@ fn process_req_sample(
     tick_max_sample: &mut Option<RequestSample>,
     window_tracker: &mut WindowTracker,
 ) -> Option<detectors::WindowResult> {
-    let req_vec = encoder.encode_walkable(sample);
-    let vec_f64: Vec<f64> = req_vec.data().iter()
-        .map(|&b| b as f64)
+    // Encode into N stripes via FQDN leaf hashing
+    let stripe_vecs_raw = encoder.encode_walkable_striped(sample, N_STRIPES);
+    let stripe_vecs: Vec<Vec<f64>> = stripe_vecs_raw.iter()
+        .map(|v| v.data().iter().map(|&b| b as f64).collect())
         .collect();
 
+    // Bundle all stripes into a single aggregate vector for sidecar-internal
+    // detection (anomaly streaks, rule generation, window tracker, engram library)
+    let refs: Vec<&holon::kernel::Vector> = stripe_vecs_raw.iter().collect();
+    let aggregate_vec = Primitives::bundle(&refs);
+    let agg_f64: Vec<f64> = aggregate_vec.data().iter().map(|&b| b as f64).collect();
+
     if !warmup_done {
-        detector.learn(&vec_f64);
+        striped_baseline.update(&stripe_vecs);
+        detector.learn(&agg_f64);
         *warmup_count += 1;
     } else {
-        let residual = detector.score(&vec_f64);
+        // Score via striped baseline (used for manifold verdicts)
+        let residual = striped_baseline.residual(&stripe_vecs);
+        // Also feed the single-vector detector for sidecar rule generation
+        let _ = detector.score(&agg_f64);
+
         if residual > *tick_max_residual {
             *tick_max_residual = residual;
-            *tick_max_vec = Some(vec_f64.clone());
+            *tick_max_vec = Some(agg_f64.clone());
             *tick_max_sample = Some(sample.clone());
         }
     }
 
     // Feed Layer 2 window tracker (after warmup only)
     let window_result = if warmup_done {
-        window_tracker.observe(&vec_f64, &mut detector.library)
+        window_tracker.observe(&agg_f64, &mut detector.library)
     } else {
         None
     };
@@ -965,26 +1022,23 @@ fn broadcast_dag(tree: &ArcSwap<ExprCompiledTree>, event_tx: &broadcast::Sender<
     let _ = event_tx.send(DashboardEvent::DagSnapshot { ts: now_ts(), nodes });
 }
 
-/// Build a ManifoldState snapshot from the current sidecar detector state.
+/// Build a ManifoldState snapshot from the striped baseline.
+///
+/// The striped baseline is trained in parallel with the sidecar's own
+/// single-vector detector. It provides the manifold enforcement layer
+/// with per-stripe residuals and crosstalk-free drilldown.
 fn build_manifold_state(
-    detector: &mut SubspaceDetector,
+    striped_baseline: &StripedSubspace,
     threat_mode: &ThreatMode,
     baseline_rps: f64,
 ) -> ManifoldState {
-    let baseline = Some(detector.baseline.clone());
-    let threshold = detector.baseline.threshold();
+    let threshold = striped_baseline.threshold();
+    let baseline = Some(striped_baseline.clone());
 
-    let names: Vec<String> = detector.normal_library.names()
-        .into_iter().map(|s| s.to_string()).collect();
-    let normal_subspaces: Vec<NormalSubspace> = names.into_iter()
-        .filter_map(|name| {
-            detector.normal_library.get_mut(&name).map(|engram| NormalSubspace {
-                name: name.clone(),
-                subspace: engram.subspace().clone(),
-                threshold,
-            })
-        })
-        .collect();
+    // Layer 0: baseline threshold check is handled directly in evaluate_manifold.
+    // Additional normal engrams would go here; an empty vec avoids cloning the
+    // baseline a second time and the redundant residual computation it caused.
+    let normal_subspaces = vec![];
 
     let manifold_threat = match threat_mode {
         ThreatMode::Normal => ManifoldThreatMode::Normal,

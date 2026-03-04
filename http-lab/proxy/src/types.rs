@@ -473,7 +473,6 @@ pub struct RequestSample {
     // --- Body (phase 2 — None during phase 1 header inspection) ---
     /// Full body bytes for small payloads; None when body is absent or large.
     pub body: Option<Bytes>,
-    pub body_len: u64,
 
     // --- Connection context (cheap Arc clone) ---
     pub src_ip: IpAddr,
@@ -655,11 +654,6 @@ impl Walkable for RequestSample {
             )));
         }
 
-        // --- Body ---
-        if self.body_len > 0 {
-            items.push(("body_len", WalkableValue::Scalar(ScalarValue::log(self.body_len as f64))));
-        }
-
         // --- Structural shapes ---
         // Path shape: length of each segment. "/foo/bar" → [0, 3, 3].
         // Captures directory structure as a coordinate in the structural space.
@@ -698,8 +692,104 @@ impl Walkable for RequestSample {
 }
 
 // =============================================================================
+// Walkable → JSON serialization
+// =============================================================================
+
+/// Convert a `WalkableValue` to a `serde_json::Value` for lossless JSON output.
+/// Numeric encoding metadata (log scale, linear scale) is stripped — only the
+/// raw value is emitted.
+pub fn walkable_value_to_json(val: &WalkableValue) -> serde_json::Value {
+    match val {
+        WalkableValue::Scalar(sv) => match sv {
+            ScalarValue::String(s) => serde_json::Value::String(s.clone()),
+            ScalarValue::Int(i) => serde_json::json!(*i),
+            ScalarValue::Float(f) => serde_json::json!(*f),
+            ScalarValue::Bool(b) => serde_json::Value::Bool(*b),
+            ScalarValue::Null => serde_json::Value::Null,
+            ScalarValue::LogFloat { value, .. } => serde_json::json!(*value),
+            ScalarValue::LinearFloat { value, .. } => serde_json::json!(*value),
+            ScalarValue::TimeFloat { value, .. } => serde_json::json!(*value),
+        },
+        WalkableValue::Map(items) => {
+            let obj: serde_json::Map<String, serde_json::Value> = items
+                .iter()
+                .map(|(k, v)| (k.clone(), walkable_value_to_json(v)))
+                .collect();
+            serde_json::Value::Object(obj)
+        }
+        WalkableValue::List(items) => {
+            serde_json::Value::Array(items.iter().map(walkable_value_to_json).collect())
+        }
+        WalkableValue::Set(items) => {
+            serde_json::Value::Array(items.iter().map(walkable_value_to_json).collect())
+        }
+    }
+}
+
+/// Serialize a `Walkable` implementor's `walk_map_items()` output to a JSON object.
+pub fn walk_to_json(w: &dyn Walkable) -> serde_json::Value {
+    let items = w.walk_map_items();
+    let obj: serde_json::Map<String, serde_json::Value> = items
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), walkable_value_to_json(&v)))
+        .collect();
+    serde_json::Value::Object(obj)
+}
+
+/// Like `walk_to_json`, but ensures all conditional fields from `RequestSample`
+/// are present in the output — even when the request lacks a query string,
+/// cookies, or body. This prevents the "attribution says query_shape is hot but
+/// the JSON doesn't show it" problem: the absence IS the signal.
+pub fn request_walk_full_json(sample: &RequestSample) -> serde_json::Value {
+    let mut obj = match walk_to_json(sample) {
+        serde_json::Value::Object(m) => m,
+        other => return other,
+    };
+
+    // Fields that walk_map_items() skips when absent — insert explicit nulls/empties
+    // so the viewer sees what the system scored against.
+    if !obj.contains_key("query") {
+        obj.insert("query".into(), serde_json::Value::Null);
+    }
+    if !obj.contains_key("query_parts") {
+        obj.insert("query_parts".into(), serde_json::json!([]));
+    }
+    if !obj.contains_key("query_shape") {
+        obj.insert("query_shape".into(), serde_json::Value::Null);
+    }
+    if !obj.contains_key("cookies") {
+        obj.insert("cookies".into(), serde_json::json!([]));
+    }
+    serde_json::Value::Object(obj)
+}
+
+// =============================================================================
 // Sidecar sample channel messages
 // =============================================================================
+
+/// Lightweight deny event sent to the sidecar for dashboard streaming.
+///
+/// `request_walk` carries the full Walkable JSON representation of the request
+/// so the frontend can display exactly what the system examined.
+/// `attribution` carries the generic drilldown scores (the "why").
+#[derive(Debug, Clone)]
+pub struct DenyEventData {
+    pub src_ip: String,
+    pub method: String,
+    pub path: String,
+    pub query: Option<String>,
+    pub user_agent: Option<String>,
+    pub residual: f64,
+    pub threshold: f64,
+    pub deny_threshold: f64,
+    pub verdict: String,
+    /// Full Walkable representation as JSON — lossless view of what was scored.
+    pub request_walk: serde_json::Value,
+    /// Full drilldown attribution: (walkable_field_name, anomaly_score).
+    /// All probed fields included, sorted by score descending.
+    pub attribution: Vec<(String, f64)>,
+    pub timestamp_us: u64,
+}
 
 /// Message sent on the bounded sample channel to the sidecar.
 #[derive(Debug, Clone)]
@@ -708,6 +798,8 @@ pub enum SampleMessage {
     TlsSample(TlsSample),
     /// One per HTTP request (headers; body None in phase 1).
     RequestSample(RequestSample),
+    /// Manifold deny/rate-limit event for WAF dashboard streaming.
+    DenyEvent(DenyEventData),
 }
 
 // =============================================================================
@@ -1270,7 +1362,6 @@ pub fn test_request_sample(
         content_length: None,
         cookies: vec![],
         body: None,
-        body_len: 0,
         src_ip,
         conn_id: 1,
         tls_ctx,
@@ -1821,7 +1912,6 @@ mod tests {
                 ("cart_id".into(), "98765".into()),
             ],
             body: None,
-            body_len: 0,
             src_ip: "203.0.113.42".parse().unwrap(),
             conn_id: 1,
             tls_ctx,
@@ -1860,7 +1950,6 @@ mod tests {
             content_length: Some(84),
             cookies: vec![],
             body: None,
-            body_len: 84,
             src_ip: "198.51.100.7".parse().unwrap(),
             conn_id: 2,
             tls_ctx,
@@ -1895,7 +1984,6 @@ mod tests {
             content_length: None,
             cookies: vec![],
             body: None,
-            body_len: 0,
             src_ip: "10.0.0.99".parse().unwrap(),
             conn_id: 3,
             tls_ctx,
@@ -1932,7 +2020,6 @@ mod tests {
             content_length: None,
             cookies: vec![],
             body: None,
-            body_len: 0,
             src_ip: "192.0.2.1".parse().unwrap(),
             conn_id: 4,
             tls_ctx,

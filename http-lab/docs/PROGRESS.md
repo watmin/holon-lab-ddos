@@ -496,6 +496,61 @@ Live-generated rules demonstrating the full capability:
 - **Engram false-match strategy**: Engrams are a fast-path, not exclusive. Fresh rules always generated in parallel. If the engram's rules match the traffic, anomaly resolves. If not, fresh rules cover the gap.
 - **Rule refinement vs. redundancy**: Broader rules are fallbacks, not gatekeepers. The tree's Specificity evaluator picks the most surgical match. `is_redundant` only rejects exact duplicates and strictly over-broad candidates.
 
+## Session: March 4, 2026 — Performance Tuning & Dashboard Polish
+
+### Performance regression diagnosed and fixed (5x → restored)
+
+After implementing 32×4096 striped encoding with cosine attribution, throughput dropped
+from ~100 rps to ~20 rps. Three compounding issues identified and fixed:
+
+1. **k=64 per stripe was wildly oversized**: Each stripe holds ~3 bindings but had 64 PCA
+   components. CCIPCA update cost: 32 × 2 × 64 × 4096 = 16.8M ops/request. Reduced to
+   k=8 (`STRIPED_K` constant) → 2.1M ops/request. **8x speedup.**
+
+2. **Double residual computation**: `build_manifold_state` cloned the striped baseline into
+   `normal_subspaces[0]`, causing `evaluate_manifold` to compute the 32-stripe residual
+   twice on identical data. Fixed by using an empty `normal_subspaces` vec — the baseline
+   threshold check IS Layer 0. **2x speedup on manifold evaluation.**
+
+3. **Triple residual for streamed allows**: With `--stream-requests`, the proxy recomputed
+   `baseline.residual()` a third time for the SSE event, even though `evaluate_manifold`
+   just computed it. Fixed by adding the residual to `ManifoldVerdict::Allow { residual }`.
+
+Net effect: per-request subspace math ~42M → ~3M ops (**14x reduction**).
+
+### Gauge threshold mismatch fixed
+
+The anomaly score widget compared striped RSS residual (large numbers) against the
+single-vector detector's threshold (different scale). Normal traffic appeared red.
+Fixed by using `req_striped_baseline.threshold()` for the gauge display.
+
+### `body_len` field removed
+
+The `body_len` field trusted the `Content-Length` header rather than measuring actual data.
+This violates the data-first principle — the raw header is already captured in `headers`.
+Removed from: struct, Walkable encoding, JSON walk output. The `BodyLen` rule dimension
+remains as an inert stub (returns 0) for forward compatibility.
+
+### WAF dashboard performance improvements
+
+- **Incremental DOM rendering**: Replaced full innerHTML rebuild of 50 verdict cards
+  (~5000+ DOM nodes) with incremental insert-at-top / remove-at-bottom via
+  `requestAnimationFrame` batching. Multiple SSE events per frame are coalesced.
+- **Scroll-pause**: When the user scrolls down to inspect an older card, DOM updates
+  pause to avoid fighting scroll position. Catches up on scroll-to-top.
+- **Counter fix**: "Request Log" counter now uses server-side atomic counts
+  (deny + rate-limit) instead of client-side SSE event count, matching the top-right
+  counters.
+- **Header renamed**: "Request Log" → "Sampled Requests (latest 50)" to clarify that
+  the log shows rate-limited samples, not all requests.
+- **Inline array rendering**: Switched from fixed `length <= 8` cutoff to estimated
+  character width (`estWidth <= 100`). Short pair arrays (<=4 pairs) also render inline.
+
+### Integration tests updated
+
+- Added `stream_requests: bool` parameter to `serve_connection` call in integration tests
+- Added `SampleMessage::DenyEvent` match arm to exhaustive pattern matches
+
 ## Open Questions
 
 - Query string structure for detection — how to handle malformed/double query strings as attack signals?

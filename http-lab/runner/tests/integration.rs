@@ -140,6 +140,7 @@ async fn setup() -> (
                             encoder,
                             manifold,
                             None, // no denial tokens in tests
+                            false, // no streaming in tests
                         ).await;
                     }
                     Err(_) => {}
@@ -240,6 +241,7 @@ async fn proxy_sends_tls_sample_to_channel() {
                         assert_eq!(r.method, "GET");
                         assert_eq!(r.path, "/");
                     }
+                    Some(SampleMessage::DenyEvent(_)) => {}
                     None => break,
                 }
             }
@@ -372,6 +374,7 @@ async fn multiple_requests_on_same_connection() {
                 match msg {
                     Some(SampleMessage::TlsSample(_)) => tls_count += 1,
                     Some(SampleMessage::RequestSample(_)) => req_count += 1,
+                    Some(SampleMessage::DenyEvent(_)) => {}
                     None => break,
                 }
             }

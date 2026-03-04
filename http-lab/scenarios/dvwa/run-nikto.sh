@@ -141,6 +141,7 @@ RUST_LOG=info "$PROXY_BIN" \
     --engram-path "$ENGRAMS_DIR/nikto" \
     --metrics-addr 127.0.0.1:9090 \
     --denial-tokens \
+    --stream-requests \
     > "$PROXY_LOG" 2>&1 &
 echo $! > "$LOGS_DIR/proxy.pid"
 sleep 2

@@ -260,7 +260,6 @@ mod tests {
             content_length: None,
             cookies: vec![],
             body: None,
-            body_len: 0,
             src_ip: ip,
             conn_id: 1,
             tls_ctx,

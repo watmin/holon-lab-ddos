@@ -86,6 +86,12 @@ struct Args {
     /// deny/rate-limit responses. Generates a random AES-256-GCM key on startup.
     #[arg(long, default_value_t = false)]
     denial_tokens: bool,
+
+    /// Stream all manifold verdicts (allow/warmup/rate-limit/deny) to the WAF
+    /// dashboard. Only enable for WAF testing — NOT for DDoS scenarios where
+    /// the volume would flood the sample channel.
+    #[arg(long, default_value_t = false)]
+    stream_requests: bool,
 }
 
 #[tokio::main]
@@ -215,6 +221,7 @@ async fn main() -> Result<()> {
         let rate_limiter = rate_limiter.clone();
         let denial_key = denial_key.clone();
         let upstream = args.upstream;
+        let stream_requests = args.stream_requests;
 
         tokio::spawn(async move {
             match accept_tls(tcp_stream, &acceptor).await {
@@ -241,6 +248,7 @@ async fn main() -> Result<()> {
                         encoder,
                         manifold,
                         denial_key,
+                        stream_requests,
                     ).await;
                 }
                 Err(e) => {

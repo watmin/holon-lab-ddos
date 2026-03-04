@@ -409,7 +409,7 @@ impl SimpleDim {
             SimpleDim::Method => Value::Str(req.method.clone()),
             SimpleDim::Path => Value::Str(req.path.clone()),
             SimpleDim::SrcIp => Value::Str(req.src_ip.to_string()),
-            SimpleDim::BodyLen => Value::Num(req.body_len as i64),
+            SimpleDim::BodyLen => Value::Num(0),
             SimpleDim::Protocol => Value::Str(req.version.to_string()),
 
             SimpleDim::Headers => pair_list(
@@ -1285,7 +1285,6 @@ mod tests {
             ("session".to_string(), "abc123".to_string()),
             ("theme".to_string(), "dark".to_string()),
         ];
-        req.body_len = 256;
         req
     }
 
@@ -1434,7 +1433,7 @@ mod tests {
         let req = sample_req();
         assert_eq!(
             Dimension::Simple(SimpleDim::BodyLen).extract_from_request(&req),
-            Value::Num(256),
+            Value::Num(0),
         );
     }
 
@@ -1868,9 +1867,7 @@ mod tests {
     fn expr_gt_body_len() {
         let req = sample_req();
         let e = Expr::new(Operator::Gt, Dimension::Simple(SimpleDim::BodyLen), Value::Num(100));
-        assert!(e.matches_request(&req));
-        let e2 = Expr::new(Operator::Gt, Dimension::Simple(SimpleDim::BodyLen), Value::Num(300));
-        assert!(!e2.matches_request(&req));
+        assert!(!e.matches_request(&req)); // always 0 — field removed, stub returns 0
     }
 
     #[test]

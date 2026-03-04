@@ -35,8 +35,8 @@ use crate::expr_tree::ExprCompiledTree;
 use crate::denial_token::{self, DenialContext, DenialKey};
 use crate::manifold::{ManifoldState, ManifoldVerdict, evaluate_manifold, drilldown_audit};
 use crate::types::{
-    ConnectionContext, HttpVersion, RequestSample,
-    SampleMessage, TlsSample, now_us,
+    ConnectionContext, DenyEventData, HttpVersion, RequestSample,
+    SampleMessage, TlsSample, now_us, request_walk_full_json,
 };
 
 // =============================================================================
@@ -54,6 +54,7 @@ pub async fn serve_connection(
     encoder: Arc<Encoder>,
     manifold: Arc<ArcSwap<ManifoldState>>,
     denial_key: Option<Arc<DenialKey>>,
+    stream_requests: bool,
 ) {
     // Best-effort: send TLS sample to sidecar
     let tls_sample = TlsSample::from_conn(&conn_ctx);
@@ -76,7 +77,7 @@ pub async fn serve_connection(
         let manifold = mfld.clone();
         let denial_key = dk.clone();
         async move {
-            handle_request(req, conn_ctx, upstream_addr, tree, sample_tx, rate_limiter, encoder, manifold, denial_key).await
+            handle_request(req, conn_ctx, upstream_addr, tree, sample_tx, rate_limiter, encoder, manifold, denial_key, stream_requests).await
         }
     });
 
@@ -102,6 +103,7 @@ async fn handle_request(
     encoder: Arc<Encoder>,
     manifold: Arc<ArcSwap<ManifoldState>>,
     denial_key: Option<Arc<DenialKey>>,
+    stream_requests: bool,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let sample = build_request_sample(&req, &conn_ctx);
 
@@ -145,23 +147,61 @@ async fn handle_request(
 
     // Layers 0+1: manifold scoring (only when manifold is trained)
     let mstate = manifold.load();
+    let n_stripes = crate::N_STRIPES;
     if mstate.is_ready() {
-        let req_vec = encoder.encode_walkable(&sample);
-        let vec_f64: Vec<f64> = req_vec.data().iter().map(|&b| b as f64).collect();
-        let mverdict = evaluate_manifold(&vec_f64, &mstate);
+        let stripe_vecs_raw = encoder.encode_walkable_striped(&sample, n_stripes);
+        let stripe_vecs: Vec<Vec<f64>> = stripe_vecs_raw.iter()
+            .map(|v| v.data().iter().map(|&b| b as f64).collect())
+            .collect();
+        let mverdict = evaluate_manifold(&stripe_vecs, &mstate);
 
         match mverdict {
-            ManifoldVerdict::Allow => {
+            ManifoldVerdict::Allow { residual } => {
                 crate::MANIFOLD_ALLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if stream_requests {
+                    let baseline = mstate.baseline.as_ref();
+                    let request_walk = request_walk_full_json(&sample);
+                    let _ = sample_tx.try_send(SampleMessage::DenyEvent(DenyEventData {
+                        src_ip: sample.src_ip.to_string(),
+                        method: sample.method.clone(),
+                        path: sample.path.clone(),
+                        query: sample.query.clone(),
+                        user_agent: sample.user_agent.clone(),
+                        residual,
+                        threshold: baseline.map(|b| b.threshold()).unwrap_or(0.0),
+                        deny_threshold: mstate.deny_threshold,
+                        verdict: "allow".into(),
+                        request_walk,
+                        attribution: vec![],
+                        timestamp_us: sample.timestamp_us,
+                    }));
+                }
             }
             ManifoldVerdict::Warmup => {
                 crate::MANIFOLD_WARMUP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if stream_requests {
+                    let request_walk = request_walk_full_json(&sample);
+                    let _ = sample_tx.try_send(SampleMessage::DenyEvent(DenyEventData {
+                        src_ip: sample.src_ip.to_string(),
+                        method: sample.method.clone(),
+                        path: sample.path.clone(),
+                        query: sample.query.clone(),
+                        user_agent: sample.user_agent.clone(),
+                        residual: 0.0,
+                        threshold: 0.0,
+                        deny_threshold: 0.0,
+                        verdict: "warmup".into(),
+                        request_walk,
+                        attribution: vec![],
+                        timestamp_us: sample.timestamp_us,
+                    }));
+                }
             }
             ManifoldVerdict::RateLimit { rps, residual } => {
                 crate::MANIFOLD_RATE_LIMIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if !rate_limiter.allow(sample.src_ip, rps as u32) {
-                    let attribution = drilldown_audit(&vec_f64, &mstate, &encoder, 5);
-                    let fields: Vec<String> = attribution.iter()
+                    let full_attribution = drilldown_audit(&stripe_vecs, &mstate, &encoder, &sample, n_stripes, 250);
+                    let fields: Vec<String> = full_attribution.iter().take(5)
                         .map(|a| format!("{}={:.1}", a.field, a.score))
                         .collect();
                     warn!(
@@ -171,9 +211,25 @@ async fn handle_request(
                         "manifold rate-limit"
                     );
                     let token = build_denial_token(
-                        "rate_limit", residual, &mstate, &attribution,
+                        "rate_limit", residual, &mstate, &full_attribution,
                         &sample, &denial_key,
                     );
+                    let baseline = mstate.baseline.as_ref();
+                    let request_walk = request_walk_full_json(&sample);
+                    let _ = sample_tx.try_send(SampleMessage::DenyEvent(DenyEventData {
+                        src_ip: sample.src_ip.to_string(),
+                        method: sample.method.clone(),
+                        path: sample.path.clone(),
+                        query: sample.query.clone(),
+                        user_agent: sample.user_agent.clone(),
+                        residual,
+                        threshold: baseline.map(|b| b.threshold()).unwrap_or(0.0),
+                        deny_threshold: mstate.deny_threshold,
+                        verdict: "rate_limit".into(),
+                        request_walk,
+                        attribution: full_attribution.iter().map(|a| (a.field.clone(), a.score)).collect(),
+                        timestamp_us: sample.timestamp_us,
+                    }));
                     let _ = sample_tx.try_send(SampleMessage::RequestSample(sample));
                     let mut builder = Response::builder()
                         .status(StatusCode::TOO_MANY_REQUESTS);
@@ -187,8 +243,8 @@ async fn handle_request(
             }
             ManifoldVerdict::Deny { residual } => {
                 crate::MANIFOLD_DENY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let attribution = drilldown_audit(&vec_f64, &mstate, &encoder, 5);
-                let fields: Vec<String> = attribution.iter()
+                let full_attribution = drilldown_audit(&stripe_vecs, &mstate, &encoder, &sample, n_stripes, 250);
+                let fields: Vec<String> = full_attribution.iter().take(5)
                     .map(|a| format!("{}={:.1}", a.field, a.score))
                     .collect();
                 warn!(
@@ -200,9 +256,25 @@ async fn handle_request(
                     "manifold deny"
                 );
                 let token = build_denial_token(
-                    "deny", residual, &mstate, &attribution,
+                    "deny", residual, &mstate, &full_attribution,
                     &sample, &denial_key,
                 );
+                let baseline = mstate.baseline.as_ref();
+                let request_walk = request_walk_full_json(&sample);
+                let _ = sample_tx.try_send(SampleMessage::DenyEvent(DenyEventData {
+                    src_ip: sample.src_ip.to_string(),
+                    method: sample.method.clone(),
+                    path: sample.path.clone(),
+                    query: sample.query.clone(),
+                    user_agent: sample.user_agent.clone(),
+                    residual,
+                    threshold: baseline.map(|b| b.threshold()).unwrap_or(0.0),
+                    deny_threshold: mstate.deny_threshold,
+                    verdict: "deny".into(),
+                    request_walk,
+                    attribution: full_attribution.iter().map(|a| (a.field.clone(), a.score)).collect(),
+                    timestamp_us: sample.timestamp_us,
+                }));
                 let _ = sample_tx.try_send(SampleMessage::RequestSample(sample));
                 let mut builder = Response::builder()
                     .status(StatusCode::FORBIDDEN);
@@ -290,7 +362,6 @@ fn build_request_sample(
         content_length,
         cookies,
         body: None,       // body deferred to phase 2
-        body_len: content_length.unwrap_or(0),
         src_ip: conn_ctx.src_ip,
         conn_id: conn_ctx.conn_id,
         tls_ctx: conn_ctx.tls_ctx.clone(),
@@ -314,7 +385,7 @@ fn build_denial_token(
         residual,
         threshold: baseline.threshold(),
         deny_threshold: mstate.deny_threshold,
-        top_fields: attribution.iter().map(|a| a.into()).collect(),
+        top_fields: attribution.iter().take(30).map(|a| a.into()).collect(),
         src_ip: sample.src_ip.to_string(),
         method: sample.method.clone(),
         path: sample.path.clone(),
