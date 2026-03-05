@@ -195,7 +195,7 @@ async fn main() -> Result<()> {
     });
 
     // Initialize holon encoder (shared across connections)
-    let encoder = Arc::new(Encoder::new(VectorManager::new(4096)));
+    let encoder = Arc::new(Encoder::new(VectorManager::new(1024)));
 
     // Per-IP token bucket rate limiter (shared across all connections)
     let rate_limiter = Arc::new(RateLimiter::new());

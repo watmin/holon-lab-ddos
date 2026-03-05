@@ -68,13 +68,13 @@ const TLS_FIELDS: &[&str] = &[
     "session_id_len", "compression",
 ];
 
-const VSA_DIM: usize = 4096;
+const VSA_DIM: usize = 1024;
 const VSA_K: usize = 64;
 
-/// PCA components per stripe. With N_STRIPES=32 and ~100 total leaf bindings,
-/// each stripe holds ~3 bindings — k=8 captures the variance with headroom
-/// while avoiding the 8× overhead of k=64.
-const STRIPED_K: usize = 8;
+/// PCA components per stripe. Parameter sweep showed K=32 reaches the 13x
+/// separation ceiling at the same compute budget as K=8 when DIM is reduced
+/// from 4096 to 1024 (DIM×K×STRIPES = 1,048,576 in both cases).
+const STRIPED_K: usize = 32;
 
 /// Number of independent vector stripes for FQDN leaf-hashed encoding.
 const N_STRIPES: usize = http_proxy::N_STRIPES;
@@ -158,7 +158,13 @@ pub async fn run(
         500,   // reorth_interval
     );
     let mut req_detector = SubspaceDetector::new(VSA_DIM, VSA_K);
-    let mut req_striped_baseline = StripedSubspace::new(VSA_DIM, STRIPED_K, N_STRIPES);
+    let mut req_striped_baseline = StripedSubspace::with_params(
+        VSA_DIM, STRIPED_K, N_STRIPES,
+        2.0,   // amnesia
+        0.01,  // ema_alpha
+        5.0,   // sigma_mult — wider gate for K=32 (tighter residual distribution)
+        500,   // reorth_interval
+    );
     let mut req_tracker = FieldTracker::new(decay_factor(DECAY_HALF_LIFE));
 
     if let Some(ref path) = engram_path {

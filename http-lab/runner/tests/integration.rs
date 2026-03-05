@@ -102,7 +102,7 @@ async fn setup() -> (
     // 3. Shared state
     let tree: Arc<ArcSwap<ExprCompiledTree>> = Arc::new(ArcSwap::new(Arc::new(ExprCompiledTree::empty())));
     let (sample_tx, sample_rx) = mpsc::channel::<SampleMessage>(1024);
-    let encoder = Arc::new(Encoder::new(VectorManager::new(4096)));
+    let encoder = Arc::new(Encoder::new(VectorManager::new(1024)));
 
     // 4. Start proxy listener
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

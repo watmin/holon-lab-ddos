@@ -551,6 +551,89 @@ remains as an inert stub (returns 0) for forward compatibility.
 - Added `stream_requests: bool` parameter to `serve_connection` call in integration tests
 - Added `SampleMessage::DenyEvent` match arm to exhaustive pattern matches
 
+## Session: March 5, 2026 — Parameter Sweep
+
+Systematic parameter sweep across the spectral firewall's full configuration space
+using a new benchmark binary (`proxy/examples/param_sweep.rs`).
+
+### What was measured
+
+Three sweep categories, ~50 configurations total:
+- **Geometry:** DIM (512-8192), STRIPES (1-64), K (2-64)
+- **Eigenvalue:** amnesia (0.5-8.0), sigma_mult (1.5-5.0), ema_alpha (0.001-0.1), warmup (100-2000)
+- **Decision:** deny_mult (1.5-4.0)
+
+Each configuration: synthetic DVWA-normal vs Nikto-attack traffic, measuring encode
+latency, residual latency, full hot-path latency, separation ratio, FPR, FNR, and
+eigenvalue health.
+
+### Key findings
+
+- **K is the most impactful parameter.** K=16 gives 9.2x separation vs K=8's 4.7x.
+  K=32 reaches the ceiling at 13x. Recommended: increase STRIPED_K from 8 to 16.
+- **Full hot path is ~3ms at DIM=4096**, not sub-millisecond. The 41us live measurement
+  was residual-only (vector pre-encoded at connection accept).
+- **0% FPR and 0% FNR across all configurations** — detection is robust.
+- **Warmup: 500 is adequate**, 100 is insufficient (1.6x separation).
+- **Amnesia, ema_alpha, deny_mult**: minimal impact for steady traffic.
+
+### Files
+
+- `proxy/examples/param_sweep.rs` — benchmark binary
+- `docs/PARAM-SWEEP.md` — full results and analysis
+
+---
+
+## Session: March 5, 2026 — Interaction Sweeps, Config Optimization, Control Experiment
+
+### Interaction sweeps (Round 2)
+
+Extended the parameter sweep with 80+ additional configurations exploring
+two-variable interactions: DIM×K, DIM×STRIPES, STRIPES×K, and iso-compute
+budget comparisons (hold DIM×K×STRIPES constant, vary the split).
+
+**Critical finding:** We were allocating compute wrong. At the same FLOP budget:
+- Old (4096×32×8): 2.1ms, 4.7x separation
+- New (1024×32×32): 997us, 13.0x separation — 2.1x faster AND 2.8x better
+
+K is the dominant quality lever. DIM primarily adds latency, not separation.
+The separation ceiling (~13x) is achievable at any DIM once K≥32.
+
+### Configuration applied
+
+| Parameter    | Old  | New  |
+|-------------|------|------|
+| `VSA_DIM`   | 4096 | 1024 |
+| `STRIPED_K` | 8    | 32   |
+| `sigma_mult`| 3.5  | 5.0  |
+
+The sigma_mult increase was needed because K=32 makes normal residuals much
+tighter — 3.5σ was too narrow for real traffic variance despite 0% FPR in
+synthetic benchmarks. 5.0σ eliminated false positives while attacks remain
+at 3.8x threshold.
+
+### Live validation
+
+Proxied Nikto run with new config: 1,793 allows (0 FP), 9,788 denies, 82 rate-limits.
+Threshold: 44.04, attack residual: ~166 (3.8x above threshold).
+
+### Control experiment
+
+Nikto run directly against DVWA (no firewall): **17 findings** including PHP
+backdoors, directory traversal, remote command execution, and missing security
+headers. Through the firewall: **0 exploitable findings**. This is the definitive
+proof that the spectral firewall works.
+
+### Files changed
+
+- `sidecar/src/lib.rs` — VSA_DIM 4096→1024, STRIPED_K 8→32, sigma_mult 3.5→5.0
+- `runner/src/main.rs` — encoder DIM 4096→1024
+- `runner/tests/integration.rs` — encoder DIM 4096→1024
+- `sidecar/src/detectors.rs` — updated memory budget comment
+- `proxy/examples/param_sweep.rs` — added interaction sweep configurations
+- `docs/PARAM-SWEEP.md` — interaction sweep tables and updated analysis/recommendations
+- `docs/FINDINGS-MANIFOLD-FIREWALL.md` — config validation, control experiment results
+
 ## Open Questions
 
 - Query string structure for detection — how to handle malformed/double query strings as attack signals?

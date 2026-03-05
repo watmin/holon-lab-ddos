@@ -820,7 +820,7 @@ pub struct SurpriseDetection {
 // VsaFieldRing — trait boundary for future congestion relief (DEFERRED)
 // =============================================================================
 //
-// When the main subspace's k=64 components over d=4096 dims become congested
+// When the main subspace's k=64 components over d=1024 dims become congested
 // from rich HTTP traffic, a VsaFieldRing distributes load across N independent
 // subspaces. Each ProbeTarget hashes to a slot, and probing queries that slot's
 // subspace instead of (or alongside) the main one.
@@ -828,7 +828,7 @@ pub struct SurpriseDetection {
 // The detection loop, SurpriseHistory, and Detection::to_expr() remain unchanged
 // because they operate on ProbeTarget + DetectionKind, not on raw subspace references.
 //
-// Memory budget when added: N=32 * (k=32+1) * d=4096 * 8 bytes ≈ 33MB fixed.
+// Memory budget when added: N=32 * (k=32+1) * d=1024 * 8 bytes ≈ 8.5MB fixed.
 
 /// Trait for field-level anomaly scoring, abstracting over single-subspace and
 /// ring-based implementations so the detection loop is agnostic.
