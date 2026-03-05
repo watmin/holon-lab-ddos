@@ -338,10 +338,10 @@
         }
         .json-punct { color: #555; }
         .json-key { font-weight: bold; }
-        .json-str { color: #8a8; }
-        .json-num { color: #8af; }
-        .json-null { color: #666; font-style: italic; }
-        .json-bool { color: #fa8; }
+        .json-str { color: #777; }
+        .json-num { color: #777; }
+        .json-null { color: #555; font-style: italic; }
+        .json-bool { color: #777; }
         .scored .json-str,
         .scored .json-num,
         .scored .json-null,
@@ -910,7 +910,10 @@
                 ? scoreToColor(score, minScore, maxScore)
                 : '#666';
             const comma = i < keys.length - 1 ? '<span class="json-punct">,</span>' : '';
-            const valHtml = jsonValueKeyed(val, scoreMap, minScore, maxScore, fieldPath, depth + 1);
+            let valHtml = jsonValueKeyed(val, scoreMap, minScore, maxScore, fieldPath, depth + 1);
+            if (score !== undefined && (val === null || typeof val !== 'object' || Array.isArray(val))) {
+                valHtml = `<span class="scored" style="color:${keyColor};">${valHtml}</span>`;
+            }
             out += `${pad}<span class="json-key" style="color:${keyColor};">"${esc(key)}"</span>` +
                    `<span class="json-punct">: </span>${valHtml}${comma}\n`;
         }
