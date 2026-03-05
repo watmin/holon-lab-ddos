@@ -201,6 +201,48 @@ score high; fields reconstructed by the subspace score near zero.
 Combined with 32-stripe encoding (reducing crosstalk) and k=8 per stripe (restoring
 throughput), the system now produces meaningful per-field attribution at WAF throughput.
 
+## Attribution Analysis: TLS Dominance (March 5, 2026)
+
+Analysis of 4,520 deny events from the DVWA+Nikto run revealed that spectral
+attribution is dominated by TLS fingerprint fields:
+
+| Field | Appearances (of 4,520) | Score |
+|-------|------------------------|-------|
+| `tls.ext_order.[1]` | 4,497 (99.5%) | 0.5 |
+| `tls.cipher_order.[22]` | 4,484 (99.2%) | 0.5 |
+| `tls.cipher_order.[27]` | 3,748 (83%) | 0.4 |
+| `tls.cipher_order.[23]` | 3,543 (78%) | 0.4 |
+| `header_shapes.[4].[0]` | 754 (17%) | 0.4 |
+| `path_shape.[3]` | 165 (3.6%) | 0.4 |
+| `query_shape.[0]` | 120 (2.7%) | 0.4 |
+
+**Why this happens:** Nikto uses OpenSSL/libcurl with a completely different cipher
+suite and extension ordering than browser-based warmup traffic. The TLS ClientHello
+fingerprint diverges on 30+ individual cipher and extension order elements, each
+encoded as a separate leaf binding. Collectively, TLS fields occupy enough stripes
+to dominate the cosine attribution ranking.
+
+**Why it's technically correct:** This is the same signal that JA3/JA4 fingerprinting
+captures — but the spectral firewall discovers it automatically from raw data without
+any explicit TLS fingerprinting rules. The system learned that Nikto's TLS handshake
+looks fundamentally different from normal traffic, which is true.
+
+**Why it limits WAF attribution:** The TLS signal is constant across all Nikto
+requests regardless of attack type. It doesn't discriminate between path traversal,
+SQLi probes, or CGI scans. HTTP-level fields (`path_shape`, `query_shape`,
+`header_shapes`) do appear in attribution but are ranked below the TLS wall.
+
+**Future tunability options:**
+- Category-weighted attribution (separate TLS weight vs HTTP weight)
+- Layered display: TLS attribution vs HTTP attribution shown in separate UI sections
+- Field exclusion lists for known-constant signals
+- Per-category normalized scoring (rank within TLS, rank within HTTP, then merge)
+
+For the proof of concept, TLS dominance validates that the spectral approach detects
+real anomalies from raw data. The HTTP-level fields ARE present in the attribution
+tail and DO vary across different attack types — the signal exists, it's just ranked
+below the TLS fingerprint.
+
 ## What's Next
 
 - [x] Live test against DVWA with real Nikto scan — **Done. 10,121 denies, 0 vulns found.**

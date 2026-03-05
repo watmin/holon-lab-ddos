@@ -24,7 +24,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::tls::ReplayStream;
 
@@ -206,10 +206,13 @@ async fn handle_request(
                         .collect();
                     warn!(
                         src = %sample.src_ip,
+                        method = %sample.method,
+                        path = %sample.path,
                         residual = format!("{:.3}", residual),
                         fields = fields.join(","),
                         "manifold rate-limit"
                     );
+                    log_attribution("RATE-LTD", &sample, residual, &mstate, &full_attribution);
                     let token = build_denial_token(
                         "rate_limit", residual, &mstate, &full_attribution,
                         &sample, &denial_key,
@@ -255,6 +258,7 @@ async fn handle_request(
                     fields = fields.join(","),
                     "manifold deny"
                 );
+                log_attribution("DENY", &sample, residual, &mstate, &full_attribution);
                 let token = build_denial_token(
                     "deny", residual, &mstate, &full_attribution,
                     &sample, &denial_key,
@@ -402,6 +406,33 @@ fn build_denial_token(
             None
         }
     }
+}
+
+fn log_attribution(
+    verdict: &str,
+    sample: &RequestSample,
+    residual: f64,
+    mstate: &ManifoldState,
+    attribution: &[crate::manifold::DrilldownAttribution],
+) {
+    let threshold = mstate.baseline.as_ref().map(|b| b.threshold()).unwrap_or(0.0);
+    let deviation = if threshold > 0.0 { residual / threshold } else { 0.0 };
+    let ua = sample.user_agent.as_deref().unwrap_or("-");
+    let top: Vec<String> = attribution.iter().take(15)
+        .map(|a| format!("  {:>6.1}  {}", a.score, a.field))
+        .collect();
+    let sep = "═".repeat(60);
+    info!(
+        "\n╔══ {} ══ {} {} ══ src={} ua={}\n\
+         ║  residual={:.2}  threshold={:.2}  deny_thr={:.2}  deviation={:.1}x\n\
+         ║  top fields:\n{}\n\
+         ╚{}",
+        verdict, sample.method, sample.path,
+        sample.src_ip, ua,
+        residual, threshold, mstate.deny_threshold, deviation,
+        top.join("\n"),
+        sep,
+    );
 }
 
 fn parse_cookies(header: &str) -> Vec<(String, String)> {
