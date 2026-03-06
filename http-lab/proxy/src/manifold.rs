@@ -213,7 +213,7 @@ fn collect_leaf_scores(
     results: &mut Vec<DrilldownAttribution>,
 ) {
     match value {
-        WalkableValue::Scalar(_) | WalkableValue::Set(_) => {
+        WalkableValue::Scalar(_) | WalkableValue::Set(_) | WalkableValue::List(_) => {
             let stripe_idx = Encoder::field_stripe(path, n_stripes);
             let binding = encoder.leaf_binding(value, path);
             let score = cosine_f64_i8(&anomalies[stripe_idx], anomaly_norms[stripe_idx], binding.data());
@@ -232,7 +232,7 @@ fn collect_leaf_scores(
                 collect_leaf_scores(val, &sub, n_stripes, encoder, anomalies, anomaly_norms, results);
             }
         }
-        WalkableValue::List(items) => {
+        WalkableValue::Spread(items) => {
             if items.is_empty() {
                 let stripe_idx = Encoder::field_stripe(path, n_stripes);
                 let binding = encoder.leaf_binding(value, path);

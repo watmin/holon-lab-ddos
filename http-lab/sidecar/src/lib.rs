@@ -71,10 +71,11 @@ const TLS_FIELDS: &[&str] = &[
 const VSA_DIM: usize = 1024;
 const VSA_K: usize = 64;
 
-/// PCA components per stripe. Parameter sweep showed K=32 reaches the 13x
-/// separation ceiling at the same compute budget as K=8 when DIM is reduced
-/// from 4096 to 1024 (DIM×K×STRIPES = 1,048,576 in both cases).
-const STRIPED_K: usize = 32;
+/// PCA components per stripe. Fine-grained sweep showed a threshold knee at
+/// K=20 (thr=17.4, sep=6.7x) — nearly identical deny margin to K=32 (thr=16.4,
+/// sep=7.1x) at 30% less residual latency. K<16 has insufficient deny margin
+/// in live traffic (K=4 failed: attack scores ~121 vs deny_threshold ~128).
+const STRIPED_K: usize = 20;
 
 /// Number of independent vector stripes for FQDN leaf-hashed encoding.
 const N_STRIPES: usize = http_proxy::N_STRIPES;

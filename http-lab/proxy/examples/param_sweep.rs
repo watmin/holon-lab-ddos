@@ -3,11 +3,13 @@
 //!
 //! Run with: cargo run -p http-proxy --release --example param_sweep
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use holon::kernel::{Encoder, Vector, VectorManager};
 use holon::memory::StripedSubspace;
+use holon::walkable::{Walkable, WalkableValue};
 use http_proxy::{HttpVersion, RequestSample, TlsContext};
 
 // =============================================================================
@@ -487,8 +489,148 @@ fn run_decision_sweep(
 // Main
 // =============================================================================
 
+// =============================================================================
+// Leaf binding inventory
+// =============================================================================
+
+fn count_leaves(value: &WalkableValue, path: &str, leaves: &mut Vec<String>) {
+    match value {
+        WalkableValue::Scalar(_) => {
+            leaves.push(path.to_string());
+        }
+        WalkableValue::Map(items) => {
+            if items.is_empty() {
+                leaves.push(format!("{}.{{}}", path));
+                return;
+            }
+            for (key, val) in items {
+                let sub = if path.is_empty() { key.to_string() } else { format!("{}.{}", path, key) };
+                count_leaves(val, &sub, leaves);
+            }
+        }
+        WalkableValue::List(_) => {
+            leaves.push(format!("{}(list)", path));
+        }
+        WalkableValue::Set(_) => {
+            leaves.push(format!("{}(set)", path));
+        }
+        WalkableValue::Spread(items) => {
+            if items.is_empty() {
+                leaves.push(format!("{}.[]", path));
+                return;
+            }
+            for (i, item) in items.iter().enumerate() {
+                count_leaves(item, &format!("{}.[{}]", path, i), leaves);
+            }
+        }
+    }
+}
+
+fn print_leaf_inventory(samples: &[RequestSample], label: &str, n_stripes: usize) {
+    let sep = "=".repeat(80);
+    println!("\n{sep}");
+    println!("=== LEAF INVENTORY: {} ({} samples) ===", label, samples.len());
+    println!("{sep}\n");
+
+    let mut all_counts: Vec<usize> = Vec::new();
+    let mut path_freq: HashMap<String, usize> = HashMap::new();
+    let mut stripe_totals: Vec<usize> = vec![0; n_stripes];
+
+    for sample in samples {
+        let items = sample.walk_map_items();
+        let mut leaves = Vec::new();
+        for (key, val) in &items {
+            count_leaves(val, key, &mut leaves);
+        }
+        all_counts.push(leaves.len());
+
+        for leaf in &leaves {
+            *path_freq.entry(leaf.clone()).or_insert(0) += 1;
+            let stripe = Encoder::field_stripe(leaf, n_stripes);
+            stripe_totals[stripe] += 1;
+        }
+    }
+
+    let n = all_counts.len() as f64;
+    let min = *all_counts.iter().min().unwrap_or(&0);
+    let max = *all_counts.iter().max().unwrap_or(&0);
+    let mean = all_counts.iter().sum::<usize>() as f64 / n;
+    let mut sorted = all_counts.clone();
+    sorted.sort();
+    let p50 = sorted[sorted.len() / 2];
+
+    println!("Leaf count per request:");
+    println!("  min={}, p50={}, mean={:.1}, max={}", min, p50, mean, max);
+    println!("  per-stripe avg: {:.1} (at {} stripes)", mean / n_stripes as f64, n_stripes);
+    println!();
+
+    // Per-stripe distribution (averaged across all samples)
+    let avg_per_stripe: Vec<f64> = stripe_totals.iter()
+        .map(|&t| t as f64 / n)
+        .collect();
+    let stripe_min = avg_per_stripe.iter().cloned().fold(f64::INFINITY, f64::min);
+    let stripe_max = avg_per_stripe.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let stripe_mean = avg_per_stripe.iter().sum::<f64>() / n_stripes as f64;
+    let empty_stripes = avg_per_stripe.iter().filter(|&&v| v < 0.5).count();
+
+    println!("Per-stripe binding distribution (avg across samples):");
+    println!("  min={:.1}, mean={:.1}, max={:.1}, empty_stripes={}", stripe_min, stripe_mean, stripe_max, empty_stripes);
+    print!("  histogram: [");
+    for (i, &v) in avg_per_stripe.iter().enumerate() {
+        if i > 0 { print!(", "); }
+        print!("{:.1}", v);
+    }
+    println!("]");
+    println!();
+
+    // Field inventory: sorted by frequency, show all unique paths from first sample
+    let first_items = samples[0].walk_map_items();
+    let mut first_leaves = Vec::new();
+    for (key, val) in &first_items {
+        count_leaves(val, key, &mut first_leaves);
+    }
+
+    println!("Field inventory (first sample, {} leaves):", first_leaves.len());
+    for leaf in &first_leaves {
+        let stripe = Encoder::field_stripe(leaf, n_stripes);
+        println!("  stripe {:>2} | {}", stripe, leaf);
+    }
+    println!();
+
+    // Unique paths across all samples
+    let mut paths: Vec<(String, usize)> = path_freq.into_iter().collect();
+    paths.sort_by(|a, b| b.1.cmp(&a.1));
+    let total_unique = paths.len();
+    println!("Unique leaf paths across all {} samples: {}", samples.len(), total_unique);
+    println!("Paths present in all samples ({}/{}):", samples.len(), samples.len());
+    for (path, count) in paths.iter().filter(|(_, c)| *c == samples.len()) {
+        let stripe = Encoder::field_stripe(path, n_stripes);
+        println!("  stripe {:>2} | {} ({}x)", stripe, path, count);
+    }
+    let variable_count = paths.iter().filter(|(_, c)| *c != samples.len()).count();
+    if variable_count > 0 {
+        println!("Variable paths (present in some but not all):");
+        for (path, count) in paths.iter().filter(|(_, c)| *c != samples.len()).take(30) {
+            let stripe = Encoder::field_stripe(path, n_stripes);
+            println!("  stripe {:>2} | {} ({}x / {})", stripe, path, count, samples.len());
+        }
+        if variable_count > 30 {
+            println!("  ... and {} more", variable_count - 30);
+        }
+    }
+}
+
 fn main() {
     let defaults = (4096usize, 32usize, 8usize, 2.0f64, 3.5f64, 0.01f64, 500usize);
+    let encoder = Encoder::new(VectorManager::new(1024));
+
+    // =========================================================================
+    // Leaf binding inventory (run first — ground truth for all param decisions)
+    // =========================================================================
+    let normals = normal_samples(&encoder, 20);
+    let attacks = attack_samples(&encoder, 20);
+    print_leaf_inventory(&normals, "NORMAL (DVWA browse)", 32);
+    print_leaf_inventory(&attacks, "ATTACK (Nikto probe)", 32);
 
     // =========================================================================
     // Sweep 1: Geometry — DIM
@@ -636,36 +778,26 @@ fn main() {
     }
 
     // =========================================================================
-    // Interaction Sweep 4: Iso-compute budget configs
-    // Total FLOPs ∝ DIM × K × STRIPES — hold product ~constant
-    // Target budget: ~2M FLOPs (current 4096×8×32 = 1M K-steps)
+    // Targeted K sweep: low values at production config (DIM=1024, STRIPES=32)
     // =========================================================================
     println!("\n{sep}");
-    println!("=== ISO-COMPUTE: DIM x STRIPES x K (budget ~= DIM*K*STRIPES constant) ===");
+    println!("=== LOW-K SWEEP: K=1..8 at DIM=1024, STRIPES=32 (production config) ===");
     println!("{sep}\n");
-    println!("Budget target: DIM*K*STRIPES ≈ 1M (current = 4096*8*32 = 1,048,576)");
-    println!();
     print_geometry_header();
-    let budget_configs: &[(usize, usize, usize)] = &[
-        // ~1M budget, different splits
-        (4096, 32, 8),    // current: 1,048,576
-        (2048, 32, 16),   // 1,048,576 — same budget, 2x K
-        (2048, 64, 8),    // 1,048,576 — same budget, 2x stripes
-        (1024, 64, 16),   // 1,048,576 — low DIM, many stripes, high K
-        (1024, 32, 32),   // 1,048,576 — low DIM, default stripes, 4x K
-        (512, 64, 32),    // 1,048,576 — tiny DIM, max stripes+K
-        (4096, 16, 16),   // 1,048,576 — high DIM, fewer stripes, 2x K
-        (8192, 16, 8),    // 1,048,576 — huge DIM, few stripes
-        (8192, 8, 16),    // 1,048,576 — huge DIM, fewer stripes, high K
-        // slightly over-budget "best guess" configs
-        (2048, 32, 32),   // 2,097,152 — 2x budget, max K at DIM=2048
-        (2048, 16, 16),   // 524,288 — half budget, compact
-        (1024, 16, 16),   // 262,144 — quarter budget, minimal
-    ];
-    for &(dim, stripes, k) in budget_configs {
-        let r = run_config(dim, stripes, k, defaults.3, defaults.4, defaults.5, defaults.6);
-        let product = dim * stripes * k;
-        print!("[{:>9}] ", product);
+    for &k in &[1, 2, 3, 4, 5, 6, 8, 16, 32] {
+        let r = run_config(1024, 32, k, 2.0, 5.0, 0.01, 500);
+        print_result_geometry(&r);
+    }
+
+    // Fine-grained K sweep between 8 and 32 at production DIM=1024, STRIPES=32
+    // Goal: find the sweet spot where threshold drops enough for viable deny margin
+    let sep = "=".repeat(80);
+    println!("\n{sep}");
+    println!("=== FINE K SWEEP: K=8..32 at DIM=1024, STRIPES=32 ===");
+    println!("{sep}\n");
+    print_geometry_header();
+    for &k in &[8, 10, 12, 14, 16, 18, 20, 24, 28, 32] {
+        let r = run_config(1024, 32, k, 2.0, 5.0, 0.01, 500);
         print_result_geometry(&r);
     }
 

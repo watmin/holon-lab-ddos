@@ -234,6 +234,14 @@ fn string_list(vals: &[String]) -> WalkableValue {
     WalkableValue::List(vals.iter().map(|s| scalar_s(s.clone())).collect())
 }
 
+/// Encode a string as a composed list of single characters.
+/// Positional binding gives fuzzy matching: similar strings → similar vectors.
+fn char_list(s: &str) -> WalkableValue {
+    WalkableValue::List(
+        s.chars().map(|c| scalar_s(c.to_string())).collect()
+    )
+}
+
 impl Walkable for TlsContext {
     fn walk_type(&self) -> WalkType {
         WalkType::Map
@@ -571,7 +579,7 @@ impl Walkable for RequestSample {
 
         // --- Request line ---
         items.push(("method", scalar_s(self.method.clone())));
-        items.push(("path", scalar_s(self.path.clone())));
+        items.push(("path", char_list(&self.path)));
 
         // Path split by '/' — positional encoding captures directory structure
         items.push(("path_parts", WalkableValue::List(
@@ -580,9 +588,9 @@ impl Walkable for RequestSample {
 
         items.push(("version", scalar_s(self.version.to_string())));
 
-        // Raw query string (exact bytes as received — captures encoding oddities)
+        // Raw query string — char-encoded for fuzzy matching on payload content
         if let Some(ref q) = self.query {
-            items.push(("query", scalar_s(q.clone())));
+            items.push(("query", char_list(q)));
 
             // Structured query decomposition. Each segment encodes differently:
             //   "foo=bar" → List["foo", "bar"]  (pair: key bound to value)
@@ -616,12 +624,14 @@ impl Walkable for RequestSample {
                 .collect()
         )));
 
-        // Full headers as List of [name, value] pairs — lossless, ordered, duplicates preserved
-        items.push(("headers", WalkableValue::List(
+        // Full headers as independent [name, char-encoded-value] pairs.
+        // Names stay atomic (categorical identifiers); values get char_list
+        // for fuzzy matching (User-Agent, Accept, Referer, etc.).
+        items.push(("headers", WalkableValue::Spread(
             self.headers.iter()
                 .map(|(k, v)| WalkableValue::List(vec![
                     scalar_s(k.clone()),
-                    scalar_s(v.clone()),
+                    char_list(v),
                 ]))
                 .collect()
         )));
@@ -630,10 +640,9 @@ impl Walkable for RequestSample {
             self.headers.len() as f64
         ))));
 
-        // Header shapes: [[name, value_len], ...] — structural fingerprint per header.
-        // Encodes the LENGTH of each header value alongside its name so the subspace
-        // learns normal shape distributions (e.g., UA is typically 90-120 chars).
-        items.push(("header_shapes", WalkableValue::List(
+        // Header shapes: [[name, value_len], ...] — per-header structural fingerprint.
+        // Each header independently attributable for rule crafting.
+        items.push(("header_shapes", WalkableValue::Spread(
             self.headers.iter()
                 .map(|(k, v)| WalkableValue::List(vec![
                     scalar_s(k.clone()),
@@ -642,9 +651,9 @@ impl Walkable for RequestSample {
                 .collect()
         )));
 
-        // Cookies as List of [key, value] pairs
+        // Cookies as independent [key, value] pairs — per-cookie attribution
         if !self.cookies.is_empty() {
-            items.push(("cookies", WalkableValue::List(
+            items.push(("cookies", WalkableValue::Spread(
                 self.cookies.iter()
                     .map(|(k, v)| WalkableValue::List(vec![
                         scalar_s(k.clone()),
@@ -682,7 +691,8 @@ impl Walkable for RequestSample {
         }
 
         // --- Connection context ---
-        items.push(("src_ip", scalar_s(self.src_ip_str())));
+        // Char-encoded: IPs sharing a subnet prefix produce similar vectors
+        items.push(("src_ip", char_list(&self.src_ip_str())));
 
         // Full nested TLS context — encoder handles deep nesting via role-filler binding
         items.push(("tls", self.tls_ctx.to_walkable_value()));
@@ -721,6 +731,9 @@ pub fn walkable_value_to_json(val: &WalkableValue) -> serde_json::Value {
             serde_json::Value::Array(items.iter().map(walkable_value_to_json).collect())
         }
         WalkableValue::Set(items) => {
+            serde_json::Value::Array(items.iter().map(walkable_value_to_json).collect())
+        }
+        WalkableValue::Spread(items) => {
             serde_json::Value::Array(items.iter().map(walkable_value_to_json).collect())
         }
     }
