@@ -508,3 +508,151 @@ or Gini provides better separation if needed.
    alongside residual
 5. Validate with live DVWA+Nikto: verify that Nikto probes show high breadth
    (broad) while legitimate browser variants show low breadth (narrow)
+
+---
+
+## 6. Centralized Engram Federation (HQ)
+
+### The idea
+
+Multiple edge nodes run independent spectral firewalls — each with its own
+warmup, adaptive learning, and accumulated manifold state. A central **HQ**
+periodically collects the learned state (engrams + rules) from all nodes,
+merges them, and redistributes the merged result as the cold-boot starting
+point for new or restarting nodes.
+
+This solves several real deployment problems:
+- **Cold start**: a new node comes up with zero learned state and must survive
+  a full warmup period before it can enforce. With HQ, it boots from the
+  fleet-wide merged engram and is immediately effective.
+- **Node restart**: after a crash or deploy, the node loses its in-memory
+  manifold. HQ provides continuity — the restarted node loads the last
+  merged engram instead of starting from scratch.
+- **Fleet consistency**: without federation, each node drifts independently.
+  Node A sees mobile traffic, node B sees API traffic, node C sees browsers.
+  Each develops a different normal baseline. HQ merges these perspectives
+  into a unified view — every node benefits from the fleet's collective
+  observation.
+- **Attack intelligence sharing**: if node A learns to deny a new scanner
+  pattern (via auto-generated rules), HQ propagates that rule to all nodes
+  before the scanner reaches them.
+
+### What gets federated
+
+Two distinct artifacts:
+
+**1. Engrams (spectral state)**
+The `StripedSubspace` — per-stripe eigenvectors, eigenvalues, and threshold
+statistics. This is the learned normal manifold. Merging engrams means
+combining the subspace knowledge from multiple observation points.
+
+**2. Rules (symbolic state)**
+The auto-generated `RuleExpr` set — IP blocks, TLS fingerprint rules,
+rate limits. These are already serializable (EDN format). Merging rules
+means deduplicating, resolving conflicts, and propagating fleet-wide.
+
+### Engram merge strategies
+
+The core question: how to combine two `StripedSubspace` instances that
+were trained on different (possibly overlapping) traffic populations.
+
+**A. Subspace union (stack)**
+Treat each node's engram as a separate `NormalSubspace` in the merged
+`ManifoldState.normal_subspaces` vector. A request is "normal" if it's
+close to ANY node's learned subspace. Simple, no information loss, but
+compute scales linearly with number of contributing nodes.
+
+**B. Eigenvector averaging**
+Average the per-stripe eigenvectors across nodes (weighted by sample count
+or confidence). Produces a single merged subspace that captures the
+"average" normal. Loses outlier populations that only one node observed.
+Compact — same size as a single engram.
+
+**C. Concatenate-and-refit**
+Concatenate the eigenvectors from all nodes into an enlarged basis, then
+run a fresh PCA/CCIPCA pass to extract the top-K components. Captures the
+full variance across all nodes in a compact representation. Most expensive
+to compute but most principled.
+
+**D. Federated CCIPCA**
+CCIPCA is already an online algorithm — it processes one sample at a time.
+HQ could replay "summary vectors" from each node through a central CCIPCA
+instance. Each node periodically sends its current principal components
+(not raw traffic) to HQ, which incorporates them into the global model.
+Privacy-preserving: raw requests never leave the edge.
+
+**Recommendation:** Start with **A (subspace union)** — it's trivial to
+implement since `ManifoldState.normal_subspaces` already supports multiple
+entries. Each collection cycle, HQ gathers engrams and builds a stacked
+set. Nodes boot with the full stack. Graduate to C or D when the stack
+grows too large for per-request compute budget.
+
+### Rule merge strategy
+
+Rules are simpler — they're symbolic and already have identity keys:
+
+1. HQ collects `active_rule_specs()` from each node
+2. Deduplicate by `identity_key()` (already implemented)
+3. Union the rule sets — if any node thinks a pattern is anomalous, include it
+4. Apply redundancy check (`is_redundant()`) to prune over-broad rules
+5. Redistribute the merged set as preloaded rules for cold boot
+
+Conflict resolution: if node A has `rate-limit 50` and node B has
+`rate-limit 100` for the same constraint, take the more restrictive
+(lower rps). For block vs rate-limit on the same pattern, prefer block.
+
+### Collection protocol
+
+```
+  ┌──────┐     engram + rules      ┌──────┐
+  │Node A├────────────────────────►│      │
+  └──────┘                         │      │
+  ┌──────┐     engram + rules      │  HQ  │──── merge ──► merged.engram
+  │Node B├────────────────────────►│      │               merged.rules
+  └──────┘                         │      │
+  ┌──────┐     engram + rules      │      │
+  │Node C├────────────────────────►│      │
+  └──────┘                         └──┬───┘
+                                      │
+                    ┌─────────────────┼─────────────────┐
+                    ▼                 ▼                  ▼
+               ┌──────┐         ┌──────┐          ┌──────┐
+               │Node A│         │Node B│          │Node D│ (new/restarted)
+               └──────┘         └──────┘          └──────┘
+```
+
+- **Pull model**: HQ polls nodes on a schedule (e.g., every 5 minutes)
+- **Push model**: nodes push to HQ after significant manifold changes
+  (threshold shift > N%, new rules generated, warmup complete)
+- **Distribution**: nodes fetch merged engram on boot, or HQ pushes after
+  each merge cycle
+
+### Interaction with other investigations
+
+- **Adaptive learning (Section 2)**: federation amplifies adaptive learning.
+  If one node adapts to mobile traffic, HQ propagates that adaptation to
+  all nodes. Without federation, every node must independently discover
+  and adapt to the same traffic patterns.
+- **Anomaly breadth (Section 5)**: breadth could be aggregated at HQ level.
+  If the same narrow anomaly appears across multiple nodes, it's likely
+  legitimate drift (promote to normal). If the same broad anomaly appears
+  across nodes, it's likely a distributed attack (escalate to block).
+- **Engram stacking (Section 2C)**: federation naturally produces stacked
+  engrams. Each node's contribution becomes a population in the stack.
+
+### Open questions
+
+1. **Staleness**: how old can a merged engram be before it hurts more than
+   it helps? Traffic patterns change — a 24-hour-old engram may encode
+   yesterday's deployment, not today's.
+2. **Poisoning at scale**: if one compromised node sends a corrupted engram
+   to HQ, it could poison the entire fleet. Mitigation: HQ validates
+   incoming engrams (e.g., reject if threshold is anomalously low/high,
+   or if eigenvectors are near-zero).
+3. **Heterogeneous services**: if different nodes serve different
+   applications (API vs web vs mobile), merging their engrams may produce
+   an overly permissive baseline. May need per-service-class federation
+   rather than fleet-wide.
+4. **Transport**: engram serialization format and size. Current engram
+   files are compact (eigenvectors + metadata). Rules are EDN text.
+   Both fit comfortably in an HTTP POST body.
