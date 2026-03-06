@@ -412,42 +412,99 @@ Two requests with the same residual of 120:
 - **Broad anomaly**: 40 of 53 fields have high attribution scores — every
   dimension of the request is wrong. Completely foreign client structure.
 
-### Metric definition
+### Relationship with adaptive learning (Section 2)
 
-After `collect_leaf_scores` computes ALL field scores in `drilldown_audit`,
-before truncating to `limit`:
+Breadth and adaptive learning are **complementary, not substitutes.**
 
-```rust
-let anomaly_breadth = scores.iter()
-    .filter(|s| s.score > breadth_threshold)
-    .count() as f64 / scores.len() as f64;
+Adaptive learning is the *mechanism* (learn or don't learn from sub-threshold
+traffic). Breadth is the *intelligence* that makes the mechanism safer.
+
+Without breadth, adaptive learning has a poisoning vulnerability: an attacker
+could craft requests that are "slightly off in many dimensions" to sneak under
+the threshold while gradually rotating the manifold. Each individual field
+looks almost normal, but the cumulative effect shifts the baseline.
+
+The narrow/broad distinction doesn't map cleanly onto sub-threshold/above-threshold:
+
+- **Narrow + high residual**: one extreme field (novel TLS extension set,
+  everything else identical). Above threshold, but it's just a client update —
+  adaptive learning can't absorb it even though it should.
+- **Broad + low residual**: many fields slightly off, but none extreme enough
+  to push the aggregate over threshold. Adaptive learning absorbs it — slowly
+  poisoning the manifold. This is the dangerous quadrant.
+
+The combined decision space:
+
+```
+  residual
+     ▲
+     │  DENY            │  DENY
+     │  (narrow but     │  (broad, everything
+     │   extreme)       │   wrong — scanner)
+     ├──────────────────┤───────────────────
+     │  LEARN           │  SUSPECT
+     │  (minor drift,   │  (subtle but wide —
+     │   absorb it)     │   possible poisoning)
+     ▼                  │
+     └──────────────────┴───────────────────► breadth
+        narrow                        broad
 ```
 
-Returns a ratio in [0.0, 1.0]:
-- 0.0 → no individual fields are anomalous (noise-like residual)
-- 0.1 → narrow anomaly (5/53 fields hot)
-- 0.8 → broad anomaly (42/53 fields hot)
+The learning gate becomes: update manifold only if
+`residual < threshold AND breadth < narrow_threshold`. This restricts learning
+to requests that are *mostly familiar with minor variations* — exactly the
+legitimate drift case.
 
-The `breadth_threshold` needs calibration — could use a fraction of the max
-score, or a fixed value based on baseline measurements.
+### Metric candidates (threshold-free)
+
+The original definition (`fraction of fields above breadth_threshold`) requires
+calibrating `breadth_threshold`, which is fragile and application-specific.
+Three threshold-free alternatives:
+
+**1. Shannon entropy of attribution distribution.** Normalize per-field scores
+into a probability distribution, compute entropy. High entropy = scores spread
+evenly (broad). Low entropy = concentrated in few fields (narrow).
+Self-calibrating, no tuning parameter. Can be computed at holon-rs level.
+
+**2. Concentration ratio.** `max_field_score / mean_field_score`. High ratio =
+one field dominates (narrow). Ratio near 1.0 = everything contributes equally
+(broad). Simplest to compute, easy to reason about.
+
+**3. Gini coefficient** of per-field scores. 0 = perfectly uniform (broadest).
+1 = all energy in one field (narrowest). Standard inequality measure,
+well-understood statistical properties.
+
+All three compute a single scalar from the existing attribution scores. They
+can be implemented generically in `holon-rs` as a property of any residual
+decomposition — no application-specific knowledge needed.
+
+**Recommendation:** start with concentration ratio (simplest), validate that
+it distinguishes narrow vs broad in live traffic, then evaluate whether entropy
+or Gini provides better separation if needed.
 
 ### Use cases
 
-1. **Tiered enforcement**: broad anomaly → immediate deny with high confidence;
+1. **Adaptive learning gate**: narrow anomalies (low breadth) are safe
+   candidates for gated continuous learning (Section 2). Broad anomalies
+   should never be learned — they represent fundamentally different client
+   structures or slow-poisoning attempts
+2. **Tiered enforcement**: broad anomaly → immediate deny with high confidence;
    narrow anomaly → rate-limit, possible legitimate client variant
-2. **Rule generation confidence**: narrow anomaly concentrated in TLS fields →
+3. **Rule generation confidence**: narrow anomaly concentrated in TLS fields →
    auto-generate TLS fingerprint rule. Broad anomaly → different threat class,
    needs manual review
-3. **Adaptive learning gate**: narrow anomalies (breadth < 0.2) are candidates
-   for gated continuous learning (Section 2). Broad anomalies should never be
-   learned — they represent fundamentally different client structures
 4. **Alert prioritization**: breadth as a dimension for SOC triage — broad
    anomalies are more likely real attacks, narrow ones more likely false
    positives from client diversity
 
 ### Implementation plan
 
-1. Compute breadth ratio in `drilldown_audit` alongside the top-N fields
-2. Surface in `ManifoldVerdict` and log output
-3. Include in `DenialContext` for token inspection
-4. Use as an input to enforcement decisions (alongside residual and streak)
+1. Add concentration ratio (and optionally entropy) computation to
+   `drilldown_audit` in `manifold.rs` — computed from the full score list
+   before truncation to top-N
+2. Surface in `ManifoldVerdict` as `breadth: f64`
+3. Include in log output and `DenialContext` for inspection
+4. Wire into adaptive learning gate (Section 2) as a second condition
+   alongside residual
+5. Validate with live DVWA+Nikto: verify that Nikto probes show high breadth
+   (broad) while legitimate browser variants show low breadth (narrow)
