@@ -517,9 +517,20 @@ or Gini provides better separation if needed.
 
 Multiple edge nodes run independent spectral firewalls — each with its own
 warmup, adaptive learning, and accumulated manifold state. A central **HQ**
-periodically collects the learned state (engrams + rules) from all nodes,
-merges them, and redistributes the merged result as the cold-boot starting
-point for new or restarting nodes.
+periodically collects the learned engrams from all nodes, merges them, and
+redistributes the merged result as the cold-boot starting point for new or
+restarting nodes.
+
+The engram is the core artifact: the `StripedSubspace` — per-stripe
+eigenvectors, eigenvalues, and threshold statistics that geometrically
+define "what normal traffic looks like." It's not an allow-list of values;
+it's a subspace. Anything that projects well onto it has low residual
+(normal). Anything orthogonal to it is anomalous. This is what HQ
+federates — the learned shape of normal across the fleet.
+
+(Auto-generated rules are a separate, DDoS-specific reactive mechanism.
+They may optionally be shared via HQ but are not the primary value —
+the engram is.)
 
 This solves several real deployment problems:
 - **Cold start**: a new node comes up with zero learned state and must survive
@@ -533,23 +544,6 @@ This solves several real deployment problems:
   Each develops a different normal baseline. HQ merges these perspectives
   into a unified view — every node benefits from the fleet's collective
   observation.
-- **Attack intelligence sharing**: if node A learns to deny a new scanner
-  pattern (via auto-generated rules), HQ propagates that rule to all nodes
-  before the scanner reaches them.
-
-### What gets federated
-
-Two distinct artifacts:
-
-**1. Engrams (spectral state)**
-The `StripedSubspace` — per-stripe eigenvectors, eigenvalues, and threshold
-statistics. This is the learned normal manifold. Merging engrams means
-combining the subspace knowledge from multiple observation points.
-
-**2. Rules (symbolic state)**
-The auto-generated `RuleExpr` set — IP blocks, TLS fingerprint rules,
-rate limits. These are already serializable (EDN format). Merging rules
-means deduplicating, resolving conflicts, and propagating fleet-wide.
 
 ### Engram merge strategies
 
@@ -587,30 +581,16 @@ entries. Each collection cycle, HQ gathers engrams and builds a stacked
 set. Nodes boot with the full stack. Graduate to C or D when the stack
 grows too large for per-request compute budget.
 
-### Rule merge strategy
-
-Rules are simpler — they're symbolic and already have identity keys:
-
-1. HQ collects `active_rule_specs()` from each node
-2. Deduplicate by `identity_key()` (already implemented)
-3. Union the rule sets — if any node thinks a pattern is anomalous, include it
-4. Apply redundancy check (`is_redundant()`) to prune over-broad rules
-5. Redistribute the merged set as preloaded rules for cold boot
-
-Conflict resolution: if node A has `rate-limit 50` and node B has
-`rate-limit 100` for the same constraint, take the more restrictive
-(lower rps). For block vs rate-limit on the same pattern, prefer block.
-
 ### Collection protocol
 
 ```
-  ┌──────┐     engram + rules      ┌──────┐
+  ┌──────┐       engram            ┌──────┐
   │Node A├────────────────────────►│      │
   └──────┘                         │      │
-  ┌──────┐     engram + rules      │  HQ  │──── merge ──► merged.engram
-  │Node B├────────────────────────►│      │               merged.rules
+  ┌──────┐       engram            │  HQ  │──── merge ──► merged.engram
+  │Node B├────────────────────────►│      │
   └──────┘                         │      │
-  ┌──────┐     engram + rules      │      │
+  ┌──────┐       engram            │      │
   │Node C├────────────────────────►│      │
   └──────┘                         └──┬───┘
                                       │
@@ -623,7 +603,7 @@ Conflict resolution: if node A has `rate-limit 50` and node B has
 
 - **Pull model**: HQ polls nodes on a schedule (e.g., every 5 minutes)
 - **Push model**: nodes push to HQ after significant manifold changes
-  (threshold shift > N%, new rules generated, warmup complete)
+  (threshold shift > N%, warmup complete)
 - **Distribution**: nodes fetch merged engram on boot, or HQ pushes after
   each merge cycle
 
@@ -654,5 +634,5 @@ Conflict resolution: if node A has `rate-limit 50` and node B has
    an overly permissive baseline. May need per-service-class federation
    rather than fleet-wide.
 4. **Transport**: engram serialization format and size. Current engram
-   files are compact (eigenvectors + metadata). Rules are EDN text.
-   Both fit comfortably in an HTTP POST body.
+   files are compact (eigenvectors + metadata). Fits comfortably in an
+   HTTP POST body.
