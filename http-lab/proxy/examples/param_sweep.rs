@@ -121,6 +121,8 @@ fn make_sample(
         tls_ctx,
         tls_vec,
         timestamp_us: 0,
+        traffic_source: None,
+        response_status: None,
     }
 }
 

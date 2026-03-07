@@ -265,6 +265,8 @@ mod tests {
             tls_ctx,
             tls_vec,
             timestamp_us: now_us(),
+            traffic_source: None,
+            response_status: None,
         };
 
         let action = tree.evaluate_req(&req);

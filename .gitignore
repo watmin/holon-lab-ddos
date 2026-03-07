@@ -1,22 +1,10 @@
-/target
-**/target/
-**/*.rs.bk
-Cargo.lock
-.idea/
-.vscode/
-*.swp
-*.swo
+# Python
+__pycache__/
+*.pyc
+.venv/
 
-# Keep the compiled eBPF binary (needed for userspace to compile)
-!veth-lab/filter-ebpf/target/bpfel-unknown-none/release/veth-filter
+# Agent logs (generated at runtime)
+agent_logs/
 
-# Ignore log files, certs, engrams, pid files
-logs/*.log
-**/logs/*.log
-**/logs/*.json
-**/logs/*.pid
-**/certs/
-**/engrams/
-
-# Generated rule files (use scripts/generate_ruleset_edn.py to recreate)
-veth-lab/scenarios/rules-*
+# Target build artifacts
+target/

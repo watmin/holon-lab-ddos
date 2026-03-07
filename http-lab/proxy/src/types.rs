@@ -493,6 +493,11 @@ pub struct RequestSample {
     /// Out-of-band traffic label from `X-Traffic-Source` header.
     /// Stripped before VSA encoding. Used for experiment attribution only.
     pub traffic_source: Option<String>,
+
+    /// Upstream response status code (set after forwarding to backend).
+    /// None if the request was denied before reaching the backend.
+    /// Used by the sidecar to gate learning: only learn from 2xx/3xx responses.
+    pub response_status: Option<u16>,
 }
 
 impl RequestSample {
@@ -1393,6 +1398,8 @@ pub fn test_request_sample(
         tls_ctx,
         tls_vec,
         timestamp_us: now_us(),
+        traffic_source: None,
+        response_status: None,
     }
 }
 
@@ -1950,6 +1957,8 @@ mod tests {
             tls_ctx,
             tls_vec,
             timestamp_us: 0,
+            traffic_source: None,
+            response_status: None,
         };
 
         let output = render_walkable(&req);
@@ -1988,6 +1997,8 @@ mod tests {
             tls_ctx,
             tls_vec,
             timestamp_us: 0,
+            traffic_source: None,
+            response_status: None,
         };
 
         let output = render_walkable(&req);
@@ -2022,6 +2033,8 @@ mod tests {
             tls_ctx,
             tls_vec,
             timestamp_us: 0,
+            traffic_source: None,
+            response_status: None,
         };
 
         let output = render_walkable(&req);
@@ -2058,6 +2071,8 @@ mod tests {
             tls_ctx,
             tls_vec,
             timestamp_us: 0,
+            traffic_source: None,
+            response_status: None,
         };
 
         let output = render_walkable(&req);

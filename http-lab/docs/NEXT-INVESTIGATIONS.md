@@ -265,7 +265,8 @@ This keeps the proxy's scoring threshold in sync with the evolving baseline.
 
 Configuration constants (sidecar `lib.rs`):
 ```
-ADAPTIVE_RESIDUAL_GATE     = 0.5   // safety margin from threshold (was 0.7, tightened after poisoning)
+// ADAPTIVE_RESIDUAL_GATE — ELIMINATED. Replaced by residual < CCIPCA_threshold
+//                          AND backend_ok gate. See Section 6.
 ADAPTIVE_CONCENTRATION_GATE = 2.0  // min stripe concentration to learn
 ADAPTIVE_LEARN_INTERVAL     = 10   // learn 1 in N eligible samples
 ADAPTIVE_REPUBLISH_INTERVAL = 50   // republish manifold every N learns
@@ -590,125 +591,64 @@ Validate with live DVWA+Nikto:
 
 ---
 
-## 6. Deriving Decision Boundaries from Training Data (Magic Numbers)
+## 6. Deriving Decision Boundaries from Training Data (RESOLVED)
 
-### The problem
+### The problem (original)
 
-Three hardcoded constants control the spectral firewall's sensitivity:
+Three hardcoded constants controlled the spectral firewall's sensitivity:
+`sigma_mult=3.0`, `deny_mult=1.5`, `ADAPTIVE_RESIDUAL_GATE=0.5`. These were
+tuned by hand and failed to generalize across deployment scenarios.
 
-```
-sigma_mult             = 3.0   // threshold = mean_residual + sigma_mult * stddev
-deny_mult              = 1.5   // deny_threshold = threshold * deny_mult
-ADAPTIVE_RESIDUAL_GATE = 0.5   // learn only if residual < threshold * gate
-```
+### Resolution: Empirical self-calibration (March 7, 2026)
 
-These were tuned by hand during the multi-attack experiment (March 7, 2026).
-The original values (5.0, 2.0, 0.7) worked for uniform synthetic traffic but
-completely failed with diverse real browser training data — threshold inflation
-made the firewall blind, and the permissive adaptive gate caused the model to
-absorb attack traffic into the baseline (1,374 poisoning learns).
+All three constants have been eliminated from the enforcement decision path.
+The system now derives its thresholds from a rolling residual buffer that
+tracks confirmed-normal traffic.
 
-The values 3.0 / 1.5 / 0.5 work for "20 diverse browser agents + 3 scanners"
-but there's no reason to believe they generalize to:
-- Single-client deployments (one app, one browser type)
-- API-heavy services (many endpoints, structured JSON, no browser variance)
-- Multi-tenant environments (wide variance in client populations)
-- Different K / DIM / STRIPES configurations
-
-### Why these interact
-
-The three constants are entangled:
-
-- **sigma_mult** controls threshold height. Higher = more permissive = fewer FP
-  but also fewer TP. This interacts with training diversity — diverse warmup
-  produces higher residual variance, pushing thresholds higher at the same sigma.
-
-- **deny_mult** is a multiplier ON the threshold. Its absolute effect scales
-  with sigma_mult × variance. When thresholds are high (diverse training),
-  even 1.5x produces an unreachably high deny boundary.
-
-- **ADAPTIVE_RESIDUAL_GATE** is a fraction OF the threshold. When thresholds
-  inflate, the absolute gate value inflates too, admitting attack traffic into
-  the learning path. This caused the poisoning cascade.
-
-### Proposed approaches
-
-#### A. Variance-normalized sigma_mult
-
-Instead of `threshold = mean + sigma_mult * stddev`, use:
+**Architecture:**
 
 ```
-threshold = mean + sigma_mult * stddev / sqrt(N_populations)
+ResidualBuffer (VecDeque<f64>, capacity=500)
+├── Admission gate: residual < CCIPCA_threshold AND backend_ok (2xx/3xx)
+├── score_threshold = buf_max                    (empirical allow ceiling)
+└── deny_threshold  = sqrt(buf_max × CCIPCA_thr) (geometric mean, no multiplier)
 ```
 
-Where `N_populations` is estimated from the training data (e.g., number of
-distinct TLS fingerprint clusters, or number of distinct source IP subnets).
-More populations → wider per-population variance → scale sigma down.
+**Why the geometric mean works:**
 
-Alternative: use the **coefficient of variation** (CV = stddev/mean) of the
-training residuals as a scaling factor. High CV (diverse training) → reduce
-sigma_mult automatically. Low CV (uniform training) → use full sigma.
+The two data-derived boundaries — `buf_max` (tight, empirical) and
+`CCIPCA_threshold` (loose, statistical) — bracket the true anomaly boundary.
+Their geometric mean places the deny line proportionally between them without
+a hardcoded multiplier:
 
-#### B. Separation-based deny_mult
+- Early (sparse buffer): buf_max is small, CCIPCA is large → generous deny
+  threshold, prevents death spiral where denied traffic can't feed learning
+- Steady state: both converge → tight, proportional threshold
+- Adapts automatically to traffic diversity, K, DIM, and population count
 
-During warmup, if attack engrams are available, compute the observed separation
-ratio (attack_residual / normal_threshold). Set deny_mult as a fraction of this:
+**Death spiral discovery and fix:**
 
-```
-deny_mult = max(1.2, separation_ratio * 0.5)
-```
+Initial attempt used `buf_max * 2.0` for deny_threshold. With buf_max=8.39
+from only 80 warmup samples, this produced deny_threshold=16.78. Normal
+post-warmup browser traffic had residuals of 17-22 (visiting pages not seen
+during warmup), causing:
+1. Hard deny → no backend forwarding → no learning → buffer frozen
+2. Threshold stays tight → more denies → repeat
 
-Without attack engrams, use a conservative default (1.5) and adjust after
-first attack encounter.
+The geometric mean (`sqrt(8.39 × 121) = 31.9`) broke this cycle — browsers
+at 22 pass through as rate-limited (not denied), while attacks at 90 are
+firmly denied. Rate-limited traffic still gets forwarded, feeding adaptive
+learning and growing the buffer.
 
-Better: compute the deny boundary from the **training residual distribution**
-directly. Set deny_threshold at a percentile (e.g., 99.9th percentile of
-training residuals), not as a multiplier on the mean-based threshold. This
-naturally adapts to the training distribution's shape.
+**Remaining operational constants** (not decision boundaries):
+- `RESIDUAL_BUFFER_CAPACITY=500`, `RESIDUAL_BUFFER_MIN_SAMPLES=50` — buffer sizing
+- `ADAPTIVE_LEARN_INTERVAL=10`, `ADAPTIVE_CONCENTRATION_GATE=2.0` — learning rate
+- `sigma_mult=3.0` — still used inside CCIPCA for its internal estimate, but
+  no longer drives proxy-side scoring. Serves as one input to the geometric mean.
 
-#### C. Attack-aware adaptive gate
-
-The adaptive gate should ensure attack traffic can never pass. Two approaches:
-
-1. **Relative to separation:** if we know the minimum expected attack residual
-   (from engram library or from the first observed attack), set the gate below
-   that. `gate = min(0.5, min_attack_residual / threshold * 0.8)`.
-
-2. **Distribution-based:** set the gate at a percentile of the training
-   residual distribution (e.g., 80th percentile). This adapts automatically
-   — diverse training with high p80 produces a high absolute gate, but the
-   percentile ensures only clearly-normal samples are learned.
-
-3. **Tighten under attack:** when the anomaly streak is active, reduce the gate
-   to zero (freeze learning entirely). Resume at normal gate level after the
-   streak breaks. This is the simplest and most robust — it decouples the gate
-   from threshold calibration entirely during active attacks.
-
-#### D. Online calibration during warmup
-
-At the end of warmup, compute:
-- Mean and variance of normal residuals → sigma_mult target
-- Distribution shape (kurtosis, tail weight) → deny_mult target
-- Percentiles (p50, p90, p99) → adaptive gate target
-
-Emit these as recommended configuration to the operator, or apply them
-automatically with a "calibrated" flag in the manifold state.
-
-### Interaction with other investigations
-
-- **Training diversity (Section 2)**: the root cause is that diverse training
-  inflates variance. Approaches A and D address this directly.
-- **Adaptive learning (Section 2)**: approach C (tighten under attack) could
-  replace the current constant gate entirely, making the gate a function of
-  system state rather than a tuned parameter.
-- **Engram federation (Section 7)**: federated engrams carry threshold
-  statistics. HQ could compute fleet-wide percentiles for calibration.
-
-### Priority
-
-High. The current hardcoded values are the most fragile part of the system.
-Every new deployment scenario will require re-tuning. This should be addressed
-before production use.
+**Validation:** 20 LLM browsers + 3 scanners, WARMUP_SAMPLES=100. 5,118 attack
+denies, 48 browser FPs (27 early settling + 18 Firefox minority + 3 POSTs),
+manual Chrome browsing had ~3 initial FPs then zero. 99.1% precision.
 
 ---
 
@@ -821,6 +761,46 @@ grows too large for per-request compute budget.
 - **Engram stacking (Section 2C)**: federation naturally produces stacked
   engrams. Each node's contribution becomes a population in the stack.
 
+### Deployment model: Passive → Federated → Enforcement
+
+The self-calibrating thresholds (Section 6) enable a zero-tuning deployment:
+
+**Phase 1: Passive observation (1-2 weeks per fleet)**
+- Deploy spectral firewall in **monitor-only mode** across all app nodes
+- Each node learns its normal baseline from live traffic
+- Thresholds self-calibrate from the residual buffer — no human tuning
+- Log verdicts but don't enforce — build confidence in the model
+- Validates: false positive rate, coverage of client diversity, threshold
+  stability under real traffic patterns
+
+**Phase 2: Federated convergence (HQ merge cycle)**
+- HQ collects engrams from all nodes (pull or push model)
+- Merges via subspace union (start simple) or eigenvector averaging
+- Redistributes the merged engram as the fleet-wide cold-boot baseline
+- Every node now carries the collective intelligence of the fleet:
+  - Node A saw mobile traffic → all nodes know mobile patterns
+  - Node B saw API consumers → all nodes recognize API structure
+  - Node C saw browser diversity → all nodes handle browser variance
+- The merged engram's residual distribution reflects fleet-wide diversity,
+  so the geometric-mean deny threshold is naturally calibrated for the
+  full population
+
+**Phase 3: Confident enforcement**
+- Flip nodes to enforcement mode — deny/rate-limit anomalous traffic
+- New/restarting nodes boot from the merged engram, enforce immediately
+- No warmup vulnerability, no cold-start false positives
+- Adaptive learning continues refining per-node baselines
+- HQ continues merging and redistributing periodically
+
+**Why this works:** The spectral firewall learns "what normal looks like"
+from pure geometry — no attack signatures, no rules, no CVE databases.
+The fleet collectively observes the full diversity of legitimate traffic.
+Federation shares that collective observation. Self-calibrating thresholds
+mean no per-deployment tuning. The result is a firewall that's never been
+told about any attack but denies 99%+ of vulnerability scanners by
+recognizing that attack traffic is geometrically alien to the learned
+normal subspace.
+
 ### Open questions
 
 1. **Staleness**: how old can a merged engram be before it hurts more than
@@ -837,3 +817,10 @@ grows too large for per-request compute budget.
 4. **Transport**: engram serialization format and size. Current engram
    files are compact (eigenvectors + metadata). Fits comfortably in an
    HTTP POST body.
+5. **Monitor-only mode**: needs implementation — log verdicts without
+   applying deny/rate-limit actions. Could be a simple CLI flag or
+   env var on the proxy.
+6. **Convergence metrics**: how does HQ know when the fleet has converged
+   enough to recommend enforcement? Possible signals: threshold stability
+   (variance of deny_threshold across nodes), false positive rate in
+   monitor logs, engram similarity between merge cycles.

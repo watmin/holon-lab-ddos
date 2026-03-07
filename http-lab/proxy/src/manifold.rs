@@ -49,9 +49,12 @@ pub struct ManifoldState {
     pub baseline: Option<StripedSubspace>,
     /// Layer 2: current strategic threat assessment.
     pub threat_mode: ThreatMode,
-    /// Layer 1 threshold: residual above this → deny (exploit).
+    /// Empirical allow ceiling: max observed residual from confirmed-normal traffic.
+    /// Residuals below this are allowed without further checks.
+    pub score_threshold: f64,
+    /// Deny floor: residual above this → deny (exploit/scan).
     pub deny_threshold: f64,
-    /// Layer 1 threshold: residual between normal and deny → rate-limit (DDoS).
+    /// Rate-limit RPS cap for traffic in the suspicious band.
     pub rate_limit_rps: f64,
 }
 
@@ -62,6 +65,7 @@ impl ManifoldState {
             normal_subspaces: vec![],
             baseline: None,
             threat_mode: ThreatMode::Normal,
+            score_threshold: f64::INFINITY,
             deny_threshold: f64::INFINITY,
             rate_limit_rps: 100.0,
         }
@@ -105,10 +109,8 @@ pub fn evaluate_manifold(stripe_vecs: &[Vec<f64>], state: &ManifoldState) -> Man
         return ManifoldVerdict::Deny { residual: f64::INFINITY };
     }
 
-    let threshold = baseline.threshold();
-
-    // Layer 0: baseline is the primary normal reference
-    if residual <= threshold {
+    // Layer 0: allow if within empirically observed normal range
+    if residual <= state.score_threshold {
         return ManifoldVerdict::Allow { residual };
     }
 
@@ -385,6 +387,7 @@ mod tests {
             }],
             baseline: Some(sub),
             threat_mode: ThreatMode::Normal,
+            score_threshold: threshold,
             deny_threshold: threshold * 2.0,
             rate_limit_rps: 100.0,
         };
@@ -415,6 +418,7 @@ mod tests {
             normal_subspaces: vec![],
             baseline: Some(sub),
             threat_mode: ThreatMode::Normal,
+            score_threshold: threshold * 0.5,
             deny_threshold: threshold * 1.5,
             rate_limit_rps: 100.0,
         };
@@ -451,6 +455,7 @@ mod tests {
             normal_subspaces: vec![],
             baseline: Some(sub.clone()),
             threat_mode: ThreatMode::Normal,
+            score_threshold: threshold,
             deny_threshold: threshold * 3.0,
             rate_limit_rps: 100.0,
         };
@@ -458,6 +463,7 @@ mod tests {
             normal_subspaces: vec![],
             baseline: Some(sub),
             threat_mode: ThreatMode::Targeted,
+            score_threshold: threshold,
             deny_threshold: threshold * 3.0,
             rate_limit_rps: 100.0,
         };

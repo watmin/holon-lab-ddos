@@ -87,7 +87,10 @@ const ANALYSIS_MAX_MS: u64 = 500;
 
 /// Warmup requires this many individual samples (not ticks).
 const WARMUP_SAMPLES_TLS: usize = 30;
-const WARMUP_SAMPLES_REQ: usize = 500;
+/// Default REQ warmup count. Override with `WARMUP_SAMPLES` env var for demos
+/// with low-throughput traffic generators (e.g. LLM browser agents at ~3rps).
+/// Minimum useful value is ~2x STRIPED_K (40) for subspace convergence.
+const WARMUP_SAMPLES_REQ_DEFAULT: usize = 500;
 
 const ANOMALY_STREAK_THRESHOLD: usize = 3;
 const RULE_TTL_SECS: u64 = 300;
@@ -110,11 +113,6 @@ const DECAY_HALF_LIFE: usize = 500;
 // Adaptive learning configuration
 // =============================================================================
 
-/// Residual must be below threshold * ADAPTIVE_RESIDUAL_GATE for a sample to
-/// be a candidate for continuous learning. 0.7 = only learn requests that are
-/// well within the "normal" regime (30% safety margin from threshold).
-const ADAPTIVE_RESIDUAL_GATE: f64 = 0.5;
-
 /// Per-stripe concentration ratio must exceed this for adaptive learning.
 /// High concentration = narrow anomaly (one stripe dominates) = safe to learn.
 /// Low concentration = broad anomaly (all stripes elevated) = potential poisoning.
@@ -125,6 +123,72 @@ const ADAPTIVE_LEARN_INTERVAL: usize = 10;
 
 /// How many adaptive learns between manifold state republishes.
 const ADAPTIVE_REPUBLISH_INTERVAL: usize = 50;
+
+/// Capacity for the rolling residual buffer used for continuous deny calibration.
+const RESIDUAL_BUFFER_CAPACITY: usize = 500;
+
+/// Minimum samples in the residual buffer before deriving a deny threshold.
+const RESIDUAL_BUFFER_MIN_SAMPLES: usize = 50;
+
+// =============================================================================
+// Rolling residual buffer for continuous threshold calibration
+// =============================================================================
+
+use std::collections::VecDeque;
+
+/// Tracks the last N allowed+backend-success residuals for deriving the deny
+/// threshold from observed traffic. Replaces the hardcoded `threshold * 1.5`.
+struct ResidualBuffer {
+    buf: VecDeque<f64>,
+    capacity: usize,
+}
+
+impl ResidualBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            buf: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn push(&mut self, residual: f64) {
+        if self.buf.len() >= self.capacity {
+            self.buf.pop_front();
+        }
+        self.buf.push_back(residual);
+    }
+
+    fn max(&self) -> Option<f64> {
+        self.buf.iter().copied().reduce(f64::max)
+    }
+
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Allow ceiling: max observed residual from confirmed-normal traffic.
+    /// Falls back to `fallback` (typically baseline.threshold()) when
+    /// insufficient data.
+    fn score_threshold(&self, fallback: f64) -> f64 {
+        if self.buf.len() < RESIDUAL_BUFFER_MIN_SAMPLES {
+            return fallback;
+        }
+        self.max().unwrap_or(fallback)
+    }
+
+    /// Deny threshold: geometric mean of empirical max and CCIPCA threshold.
+    /// Places the deny boundary between the tight empirical ceiling and the
+    /// loose statistical ceiling — no hardcoded multiplier needed.
+    /// Returns infinity when insufficient data (< RESIDUAL_BUFFER_MIN_SAMPLES).
+    fn deny_threshold(&self, baseline_threshold: f64) -> f64 {
+        if self.buf.len() < RESIDUAL_BUFFER_MIN_SAMPLES {
+            return f64::INFINITY;
+        }
+        self.max()
+            .map(|m| (m * baseline_threshold).sqrt())
+            .unwrap_or(f64::INFINITY)
+    }
+}
 
 // =============================================================================
 // Entry point — called by proxy main.rs
@@ -142,7 +206,11 @@ pub async fn run(
     rule_ttl_secs: Option<u64>,
 ) -> Result<()> {
     let ttl = rule_ttl_secs.unwrap_or(RULE_TTL_SECS);
-    info!("Sidecar starting (rule_ttl={}s)", ttl);
+    let warmup_samples_req: usize = std::env::var("WARMUP_SAMPLES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(WARMUP_SAMPLES_REQ_DEFAULT);
+    info!("Sidecar starting (rule_ttl={}s, warmup_req={})", ttl, warmup_samples_req);
 
     let encoder = Arc::new(Encoder::new(VectorManager::new(VSA_DIM)));
     let stats = new_shared_stats();
@@ -215,6 +283,9 @@ pub async fn run(
     let mut adaptive_learn_count = 0u64;
     let mut adaptive_since_republish = 0usize;
 
+    // Rolling residual buffer for continuous deny threshold calibration
+    let mut residual_buffer = ResidualBuffer::new(RESIDUAL_BUFFER_CAPACITY);
+
     // Layer 2: window-level spectrum tracking
     let mut req_window_tracker = WindowTracker::new(VSA_DIM, VSA_K, WINDOW_SIZE);
     let mut current_threat_mode = ThreatMode::Normal;
@@ -237,7 +308,40 @@ pub async fn run(
 
     info!("  Analysis trigger: every {} REQ samples or {}ms (hybrid)", ANALYSIS_INTERVAL, ANALYSIS_MAX_MS);
     info!("  Decay half-life: {} requests (factor={:.6})", DECAY_HALF_LIFE, decay_alpha);
-    info!("  Warmup: {} TLS samples, {} REQ samples", WARMUP_SAMPLES_TLS, WARMUP_SAMPLES_REQ);
+    info!("  Warmup: {} TLS samples, {} REQ samples", WARMUP_SAMPLES_TLS, warmup_samples_req);
+
+    // Try loading persisted baseline engram to skip warmup
+    if let Some(ref path) = engram_path {
+        let baseline_path = format!("{}.baseline.striped.json", path);
+        if let Ok(json) = std::fs::read_to_string(&baseline_path) {
+            match serde_json::from_str::<holon::memory::StripedSubspaceSnapshot>(&json) {
+                Ok(snap) => {
+                    let n_stripes = snap.stripes.len();
+                    req_striped_baseline = StripedSubspace::from_snapshot(snap);
+                    req_warmup_done = true;
+                    req_warmup_count = warmup_samples_req;
+
+                    let score_thr = residual_buffer.score_threshold(req_striped_baseline.threshold());
+                    let deny_thr = residual_buffer.deny_threshold(req_striped_baseline.threshold());
+                    let mstate = build_manifold_state(
+                        &req_striped_baseline, &current_threat_mode, 50.0, score_thr, deny_thr,
+                    );
+                    manifold.store(Arc::new(mstate));
+
+                    info!(
+                        "[BASELINE] Loaded from {} ({} stripes, score_threshold={:.2}, deny_threshold={:.2}) — warmup skipped",
+                        baseline_path, n_stripes,
+                        score_thr, deny_thr,
+                    );
+                }
+                Err(e) => {
+                    warn!("[BASELINE] Failed to parse {}: {} — starting fresh warmup", baseline_path, e);
+                }
+            }
+        } else {
+            info!("[BASELINE] No persisted baseline at {} — starting fresh warmup", baseline_path);
+        }
+    }
 
     loop {
         // =====================================================================
@@ -307,18 +411,35 @@ pub async fn run(
                         &mut adaptive_sample_counter,
                         &mut adaptive_learn_count,
                         &mut adaptive_since_republish,
+                        &mut residual_buffer,
                     );
 
                     // Republish manifold state after enough adaptive learns
                     if adaptive_since_republish >= ADAPTIVE_REPUBLISH_INTERVAL && req_warmup_done {
                         adaptive_since_republish = 0;
+                        let score_thr = residual_buffer.score_threshold(req_striped_baseline.threshold());
+                        let deny_thr = residual_buffer.deny_threshold(req_striped_baseline.threshold());
                         manifold.store(Arc::new(build_manifold_state(
-                            &req_striped_baseline, &current_threat_mode, baseline_rps,
+                            &req_striped_baseline, &current_threat_mode, baseline_rps, score_thr, deny_thr,
                         )));
                         info!(
-                            "[ADAPTIVE] Republished manifold (total_learns={}, threshold={:.2})",
-                            adaptive_learn_count, req_striped_baseline.threshold(),
+                            "[ADAPTIVE] Republished manifold (total_learns={}, score_thr={:.2}, deny_thr={:.2}, buf_len={}, buf_max={:.2})",
+                            adaptive_learn_count, score_thr,
+                            deny_thr, residual_buffer.len(),
+                            residual_buffer.max().unwrap_or(0.0),
                         );
+
+                        // Periodic baseline save (piggyback on republish interval)
+                        if let Some(ref path) = engram_path {
+                            if req_detector.anomaly_streak == 0 {
+                                let baseline_path = format!("{}.baseline.striped.json", path);
+                                if let Ok(json) = serde_json::to_string(&req_striped_baseline.snapshot()) {
+                                    if let Err(e) = std::fs::write(&baseline_path, &json) {
+                                        warn!("[BASELINE] Periodic save failed: {}", e);
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     match &adaptive_result {
@@ -332,7 +453,7 @@ pub async fn run(
                         }
                         AdaptiveResult::BroadRejected { concentration } => {
                             warn!(
-                                "[ADAPTIVE] Broad sample rejected (concentration={:.2}, gate={:.1})",
+                                "[ADAPTIVE] Broad sample rejected (concentration={:.2}, conc_gate={:.1})",
                                 concentration, ADAPTIVE_CONCENTRATION_GATE,
                             );
                         }
@@ -367,6 +488,8 @@ pub async fn run(
                                 if req_warmup_done {
                                     manifold.store(Arc::new(build_manifold_state(
                                         &req_striped_baseline, &current_threat_mode, baseline_rps,
+                                        residual_buffer.score_threshold(req_striped_baseline.threshold()),
+                                        residual_buffer.deny_threshold(req_striped_baseline.threshold()),
                                     )));
                                 }
                             }
@@ -382,6 +505,8 @@ pub async fn run(
                                 if req_warmup_done {
                                     manifold.store(Arc::new(build_manifold_state(
                                         &req_striped_baseline, &current_threat_mode, baseline_rps,
+                                        residual_buffer.score_threshold(req_striped_baseline.threshold()),
+                                        residual_buffer.deny_threshold(req_striped_baseline.threshold()),
                                     )));
                                 }
                             }
@@ -393,6 +518,8 @@ pub async fn run(
                                     if req_warmup_done {
                                         manifold.store(Arc::new(build_manifold_state(
                                             &req_striped_baseline, &current_threat_mode, baseline_rps,
+                                            residual_buffer.score_threshold(req_striped_baseline.threshold()),
+                                            residual_buffer.deny_threshold(req_striped_baseline.threshold()),
                                         )));
                                     }
                                 }
@@ -406,6 +533,23 @@ pub async fn run(
                     if let Some(ref path) = engram_path {
                         tls_detector.save_library(&format!("{}.tls", path));
                         req_detector.save_library(&format!("{}.req", path));
+
+                        // Persist baseline engram (only if not under active attack)
+                        if req_detector.anomaly_streak == 0 && req_warmup_done {
+                            let baseline_path = format!("{}.baseline.striped.json", path);
+                            match serde_json::to_string(&req_striped_baseline.snapshot()) {
+                                Ok(json) => {
+                                    if let Err(e) = std::fs::write(&baseline_path, &json) {
+                                        warn!("[BASELINE] Failed to save to {}: {}", baseline_path, e);
+                                    } else {
+                                        info!("[BASELINE] Saved to {} ({} bytes)", baseline_path, json.len());
+                                    }
+                                }
+                                Err(e) => warn!("[BASELINE] Serialization failed: {}", e),
+                            }
+                        } else if req_detector.anomaly_streak > 0 {
+                            warn!("[BASELINE] Skipping save — anomaly streak active ({})", req_detector.anomaly_streak);
+                        }
                     }
                     return Ok(());
                 }
@@ -469,7 +613,7 @@ pub async fn run(
             info!("[TLS] Warmup complete ({} samples, threshold={:.2})",
                   tls_warmup_count, tls_detector.baseline.threshold());
         }
-        if !req_warmup_done && req_warmup_count >= WARMUP_SAMPLES_REQ {
+        if !req_warmup_done && req_warmup_count >= warmup_samples_req {
             req_warmup_done = true;
             let warmup_secs = warmup_start
                 .map(|t| t.elapsed().as_secs_f64())
@@ -481,10 +625,12 @@ pub async fn run(
             info!("[REQ] Warmup complete ({} samples, striped_threshold={:.2}, baseline_rps={:.0}, normal engram minted)",
                   req_warmup_count, req_striped_baseline.threshold(), baseline_rps);
 
-            let mstate = build_manifold_state(&req_striped_baseline, &current_threat_mode, baseline_rps);
+            let score_thr = residual_buffer.score_threshold(req_striped_baseline.threshold());
+            let deny_thr = residual_buffer.deny_threshold(req_striped_baseline.threshold());
+            let mstate = build_manifold_state(&req_striped_baseline, &current_threat_mode, baseline_rps, score_thr, deny_thr);
             manifold.store(Arc::new(mstate));
-            info!("[MANIFOLD] Initial state published (deny_threshold={:.2})",
-                  req_striped_baseline.threshold() * 2.0);
+            info!("[MANIFOLD] Initial state published (score_threshold={:.2}, deny_threshold={:.2}, buf_len={}, buf_max={:.2})",
+                  score_thr, deny_thr, residual_buffer.len(), residual_buffer.max().unwrap_or(0.0));
         }
 
         // -------------------------------------------------------------------
@@ -713,7 +859,7 @@ pub async fn run(
                 }
             }
         } else if !req_warmup_done && req_tick_count > 0 {
-            info!("[REQ] warmup {}/{}", req_warmup_count, WARMUP_SAMPLES_REQ);
+            info!("[REQ] warmup {}/{}", req_warmup_count, warmup_samples_req);
         }
 
         // Reset per-tick max tracking
@@ -863,7 +1009,7 @@ pub async fn run(
                 s.active_rules,
                 s.engrams_tls, s.engrams_req,
                 if s.warmup_tls { format!("{}/{}", s.warmup_samples_tls, WARMUP_SAMPLES_TLS) } else { "done".into() },
-                if s.warmup_req { format!("{}/{}", s.warmup_samples_req, WARMUP_SAMPLES_REQ) } else { "done".into() },
+                if s.warmup_req { format!("{}/{}", s.warmup_samples_req, warmup_samples_req) } else { "done".into() },
                 s.enforced_pass, s.enforced_blocks, s.enforced_rate_limits, s.enforced_close_conn,
                 m_allow, m_warmup, m_rate_limit, m_deny,
             );
@@ -953,7 +1099,11 @@ fn process_req_sample(
     adaptive_counter: &mut usize,
     adaptive_learns: &mut u64,
     adaptive_since_pub: &mut usize,
+    residual_buffer: &mut ResidualBuffer,
 ) -> (Option<detectors::WindowResult>, AdaptiveResult) {
+    // Backend success = ground truth that the request was valid
+    let backend_ok = sample.response_status.map(|s| s < 400).unwrap_or(false);
+
     // Encode into N stripes via FQDN leaf hashing
     let stripe_vecs_raw = encoder.encode_walkable_striped(sample, N_STRIPES);
     let stripe_vecs: Vec<Vec<f64>> = stripe_vecs_raw.iter()
@@ -969,11 +1119,20 @@ fn process_req_sample(
     let mut adaptive = AdaptiveResult::Skip;
 
     if !warmup_done {
-        striped_baseline.update(&stripe_vecs);
-        detector.learn(&agg_f64);
-        *warmup_count += 1;
+        // Only learn from backend-approved requests during warmup
+        if backend_ok {
+            striped_baseline.update(&stripe_vecs);
+            detector.learn(&agg_f64);
+            *warmup_count += 1;
+
+            // Also feed the residual buffer during warmup (after enough samples for a residual)
+            if *warmup_count > STRIPED_K {
+                let residual = striped_baseline.residual(&stripe_vecs);
+                residual_buffer.push(residual);
+            }
+        }
     } else {
-        // Score via striped baseline (used for manifold verdicts)
+        // Score via striped baseline (used for manifold verdicts) — always score, regardless of status
         let residual = striped_baseline.residual(&stripe_vecs);
         let threshold = striped_baseline.threshold();
         // Also feed the single-vector detector for sidecar rule generation
@@ -985,8 +1144,12 @@ fn process_req_sample(
             *tick_max_sample = Some(sample.clone());
         }
 
-        // Adaptive learning: absorb sub-threshold, narrow-breadth samples
-        if residual < threshold * ADAPTIVE_RESIDUAL_GATE {
+        // Adaptive learning: absorb sub-threshold, backend-approved, narrow-breadth samples
+        // The threshold IS the gate — no separate ADAPTIVE_RESIDUAL_GATE needed
+        if residual < threshold && backend_ok {
+            // Push allowed + backend-success residual to calibration buffer
+            residual_buffer.push(residual);
+
             *adaptive_counter += 1;
             if *adaptive_counter % ADAPTIVE_LEARN_INTERVAL == 0 {
                 let conc = stripe_concentration(striped_baseline, &stripe_vecs);
@@ -1153,17 +1316,18 @@ fn broadcast_dag(tree: &ArcSwap<ExprCompiledTree>, event_tx: &broadcast::Sender<
 /// The striped baseline is trained in parallel with the sidecar's own
 /// single-vector detector. It provides the manifold enforcement layer
 /// with per-stripe residuals and crosstalk-free drilldown.
+///
+/// Both `score_threshold` (allow ceiling) and `deny_threshold` (deny floor) are
+/// caller-supplied from the rolling residual buffer's empirical observations.
 fn build_manifold_state(
     striped_baseline: &StripedSubspace,
     threat_mode: &ThreatMode,
     baseline_rps: f64,
+    score_threshold: f64,
+    deny_threshold: f64,
 ) -> ManifoldState {
-    let threshold = striped_baseline.threshold();
     let baseline = Some(striped_baseline.clone());
 
-    // Layer 0: baseline threshold check is handled directly in evaluate_manifold.
-    // Additional normal engrams would go here; an empty vec avoids cloning the
-    // baseline a second time and the redundant residual computation it caused.
     let normal_subspaces = vec![];
 
     let manifold_threat = match threat_mode {
@@ -1178,7 +1342,8 @@ fn build_manifold_state(
         normal_subspaces,
         baseline,
         threat_mode: manifold_threat,
-        deny_threshold: threshold * 1.5,
+        score_threshold,
+        deny_threshold,
         rate_limit_rps: baseline_rps.max(10.0),
     }
 }

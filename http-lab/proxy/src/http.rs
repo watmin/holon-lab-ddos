@@ -105,7 +105,7 @@ async fn handle_request(
     denial_key: Option<Arc<DenialKey>>,
     stream_requests: bool,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let sample = build_request_sample(&req, &conn_ctx);
+    let mut sample = build_request_sample(&req, &conn_ctx);
 
     // Layer 3: synchronous rule check (wait-free ArcSwap load)
     let compiled = tree.load();
@@ -312,14 +312,19 @@ async fn handle_request(
         crate::MANIFOLD_WARMUP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // Request passed all layers — send sample to sidecar and forward
+    // Request passed all layers — forward to upstream, then send sample with response status
     crate::ENFORCED_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let _ = sample_tx.try_send(SampleMessage::RequestSample(sample.clone()));
 
     match forward_to_upstream(req, upstream_addr, &sample).await {
-        Ok(resp) => Ok(resp),
+        Ok(resp) => {
+            sample.response_status = Some(resp.status().as_u16());
+            let _ = sample_tx.try_send(SampleMessage::RequestSample(sample));
+            Ok(resp)
+        }
         Err(e) => {
             warn!("upstream error: {}", e);
+            sample.response_status = None;
+            let _ = sample_tx.try_send(SampleMessage::RequestSample(sample));
             Ok(Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Full::new(Bytes::from("Bad gateway\n")))
@@ -396,6 +401,7 @@ fn build_request_sample(
         tls_vec: conn_ctx.tls_vec.clone(),
         timestamp_us: now_us(),
         traffic_source,
+        response_status: None,
     }
 }
 
