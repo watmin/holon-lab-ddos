@@ -17,7 +17,5 @@ certs/
 engrams/
 logs/
 
-# Generated scenario data
-veth-lab/scenarios/*.edn
-veth-lab/scenarios/*.json
+# veth-lab build artifacts
 veth-lab/filter-ebpf/Cargo.lock
