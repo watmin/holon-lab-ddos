@@ -351,15 +351,96 @@ traffic and then rejected everything structurally alien. The detection operates
 on the geometric shape of HTTP requests in a 1024-dimensional vector space,
 making it agnostic to the specific attack payload.
 
+## Session: March 6-7, 2026 — Multi-Tool Concurrent Attack with LLM Browser Agents
+
+First experiment with **concurrent mixed traffic**: 20 LLM-driven browser agents
+(Grok-4-fast + Playwright, 3 browser engines) generating realistic navigation
+alongside three professional vulnerability scanners (Nikto, ZAP, Nuclei) — all
+hitting the same proxy simultaneously through diverse source IPs.
+
+Full details in [EXPERIMENT-MULTI-ATTACK.md](EXPERIMENT-MULTI-ATTACK.md).
+
+### Setup
+
+- **Normal traffic:** 20 Playwright browser agents with LLM-driven navigation,
+  routed through TCP forwarders to appear from 10.99.0.1-10.99.0.20 (dummy0).
+  Distribution: 80% Chromium, 15% WebKit, 5% Firefox.
+- **Attack traffic:** Nikto, ZAP, and Nuclei running from 127.0.0.1
+- **Ground truth:** `X-Traffic-Source: browser-agent` header on all agent requests,
+  stripped by proxy before VSA encoding
+
+### Results
+
+| Verdict | browser-agent | unlabeled (attack) |
+|---------|--------------|-------------------|
+| Deny | **0** | **3,605** |
+| Rate-limit | **0** | **30** |
+
+**Zero false positives** under concurrent mixed workload. Every scanner request
+was denied or rate-limited. Every browser agent request was allowed.
+
+### Parameter Tuning Discovery
+
+The original K=32 + sigma_mult=5.0 configuration (tuned for uniform synthetic traffic)
+**completely failed** with diverse real browser training data:
+
+| Metric | Run 1 (broken) | Run 2 (tuned) |
+|--------|---------------|---------------|
+| RSS threshold | ~105 | ~43 |
+| Deny threshold | ~210 | ~83 |
+| Attack residuals | 26-43 | 26-43 |
+| Denials | **0** | **3,605** |
+| Adaptive learns | 1,374 (poisoned) | 22 (clean) |
+
+**Root cause:** Diverse training data (3 browser engines, 20 IPs, varied navigation)
+inflated residual variance, pushing thresholds far above attack scores. Combined with
+an overly permissive adaptive learning gate (0.7), attack traffic was actively absorbed
+into the baseline — the model poisoned itself.
+
+**Fix:** Three parameter changes:
+
+| Parameter | Before | After |
+|-----------|--------|-------|
+| `sigma_mult` (striped) | 5.0 | 3.0 |
+| deny multiplier | 2.0x | 1.5x |
+| `ADAPTIVE_RESIDUAL_GATE` | 0.7 | 0.5 |
+
+### Key Insight: Training Diversity vs Threshold Sensitivity
+
+This revealed a fundamental tension: diverse training creates a robust manifold but
+widens thresholds. Narrow training creates a sensitive manifold but rejects legitimate
+variants. The three parameters (`sigma_mult`, `deny_mult`, `ADAPTIVE_RESIDUAL_GATE`)
+mediate this trade-off but are currently hardcoded — they should be derived from
+observable properties of the training data.
+
+### Latency
+
+Denied requests at **microsecond inspection latency** — the full deny path
+(HTTP parse + Layer 3 rule tree + spectral encode + project + score + 403 response)
+completes in microseconds. Normal traffic latency dominated by DVWA backend
+round-trip, not spectral scoring.
+
+### Files changed
+
+- `proxy/src/types.rs` — `traffic_source` field on `RequestSample` and `DenyEventData`
+- `proxy/src/http.rs` — extract, strip, and log `X-Traffic-Source` header
+- `sidecar/src/lib.rs` — sigma_mult 5.0→3.0, deny_mult 2.0→1.5, adaptive gate 0.7→0.5
+- `sidecar/src/metrics_server.rs` — `traffic_source` in `DashboardEvent::Verdict`
+- `sidecar/static/waf_dashboard.html` — traffic source badge on verdict cards
+- `scenarios/dvwa/dvwa_browser_agent.py` — `X-Traffic-Source` header, retry logic
+- `scenarios/dvwa/source_forwarder.py` — per-forwarder error handling
+- `scenarios/dvwa/run-multi-attack.sh` — forwarder health checks, traffic breakdown summary
+
 ## What's Next
 
 - [x] Live test against DVWA with real Nikto scan — **Done. 9,788 denies, 0 vulns found.**
 - [x] Dashboard integration for real-time spectral verdict visualization — **Done. /waf dashboard with SSE streaming.**
 - [x] Parameter sweep and optimization — **Done. DIM=1024, K=32 at same compute budget.**
 - [x] Control experiment (Nikto without firewall) — **Done. 17 findings without, 0 with.**
+- [x] Multi-source-IP + concurrent mixed traffic — **Done. 20 LLM browsers + 3 scanners, 0 FP.**
+- [ ] Derive sigma_mult / deny_mult / adaptive_gate from training data (eliminate magic numbers)
 - [ ] Slow Nikto test (`-Pause 1`) — pure geometric detection without rate-limit triggers
 - [ ] Mimicry attack — real browser submitting SQLi through DVWA forms (find the boundary)
-- [ ] Multi-source-IP — baseline lab Squid proxy with 23 ipvlan addresses
 - [ ] Measure spectral scoring overhead in isolation (microbenchmark without upstream)
 - [ ] Multi-core scaling measurement (ArcSwap read path under contention)
 - [ ] Engram CI/CD pipeline: train engrams in pre-production, promote to production

@@ -820,8 +820,14 @@
             deviationHtml = `<span class="deny-deviation" style="color:${deviationColor};">${deviation}</span>`;
         }
 
+        const srcLabel = d.traffic_source || '';
+        const labelBadge = srcLabel
+            ? `<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:rgba(68,180,255,0.2);color:#4bf;margin-left:4px;">${esc(srcLabel)}</span>`
+            : '';
+
         const headHtml = `<div class="deny-card-head">` +
             `<span class="deny-verdict v-${d.verdict}">${VERDICT_LABELS[d.verdict] || d.verdict.toUpperCase()}</span>` +
+            labelBadge +
             `<span class="deny-time">${time}</span>` +
             deviationHtml +
             `</div>`;

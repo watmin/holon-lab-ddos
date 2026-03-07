@@ -207,6 +207,11 @@ fn cmd_unseal(token: &str, key_path: &str) {
                      ctx.residual, ctx.threshold, ctx.deny_threshold);
             println!("  deviation:       {:.1}x above normal",
                      ctx.residual / ctx.threshold);
+            let gini_label = if ctx.gini < 0.3 { "BROAD" }
+                else if ctx.gini < 0.6 { "moderate" }
+                else { "narrow" };
+            println!("  breadth:         concentration={:.1}  entropy={:.3}  gini={:.3} ({})",
+                     ctx.concentration, ctx.entropy, ctx.gini, gini_label);
             println!();
             println!("  request:");
             println!("    {} {} {}", ctx.method, ctx.path,

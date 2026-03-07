@@ -241,21 +241,75 @@ When streak > N, freeze learning. When streak returns to 0, resume learning
 with elevated amnesia to catch up on any drift that occurred during the
 freeze.
 
-### Recommended starting point
+### Implementation: Approach A — Gated Continuous Learning (DONE)
 
-**Approach A (gated continuous learning)** is the simplest to implement and test.
-It requires changing ~5 lines in the sidecar tick loop: after evaluating a
-request's residual, call `update()` if below threshold.
+Implemented in `process_req_sample()` with a two-gate safety mechanism:
+
+**Gate 1: Residual** — only learn if `residual < threshold * ADAPTIVE_RESIDUAL_GATE`
+(default 0.7). This ensures we only absorb requests well within the normal
+regime, with a 30% safety margin from the threshold boundary.
+
+**Gate 2: Stripe-level breadth** — only learn if `stripe_concentration() >=
+ADAPTIVE_CONCENTRATION_GATE` (default 2.0). Uses the cheap per-stripe residual
+distribution (O(N_STRIPES)) to verify the anomaly is narrow (concentrated in
+few stripes). Broad anomalies (uniform across stripes) are rejected as potential
+slow-poisoning attempts.
+
+**Rate limiting** — only every `ADAPTIVE_LEARN_INTERVAL`th (default 10) eligible
+sample is actually learned. This prevents rapid manifold drift even when all
+traffic passes both gates.
+
+**Manifold republishing** — after every `ADAPTIVE_REPUBLISH_INTERVAL` (default
+50) adaptive learns, the manifold state is republished to the proxy via ArcSwap.
+This keeps the proxy's scoring threshold in sync with the evolving baseline.
+
+Configuration constants (sidecar `lib.rs`):
+```
+ADAPTIVE_RESIDUAL_GATE     = 0.5   // safety margin from threshold (was 0.7, tightened after poisoning)
+ADAPTIVE_CONCENTRATION_GATE = 2.0  // min stripe concentration to learn
+ADAPTIVE_LEARN_INTERVAL     = 10   // learn 1 in N eligible samples
+ADAPTIVE_REPUBLISH_INTERVAL = 50   // republish manifold every N learns
+```
+
+Logging:
+- `[ADAPTIVE] Learned sample #N (residual=X, concentration=Y)` — every 100th learn
+- `[ADAPTIVE] Broad sample rejected (concentration=X, gate=Y)` — poisoning attempts
+- `[ADAPTIVE] Republished manifold (total_learns=N, threshold=X)` — state sync
+- Tick log includes `adaptive_learns=N` for continuous visibility
+
+### Validation: Multi-Attack Experiment (March 7, 2026) — DONE
+
+The gated continuous learning mechanism was exercised under real concurrent
+mixed traffic (20 LLM browser agents + 3 vulnerability scanners).
+
+**Poisoning discovered and fixed:** The original `ADAPTIVE_RESIDUAL_GATE=0.7`
+was too permissive when combined with inflated thresholds from diverse training.
+Attack residuals (26-43) fell below the absolute gate value (~74), causing
+1,374 attack samples to be learned into the baseline. The manifold was actively
+poisoned — threshold drifted upward, further admitting attack traffic.
+
+**Fix:** Tightened gate from 0.7 to 0.5. With the corrected gate, only 22
+samples were adaptively learned during the attack phase (all legitimate
+browser traffic), and the manifold was never republished — the baseline
+remained completely stable.
+
+**Key insight:** The residual gate's absolute value matters more than its
+ratio to threshold. When thresholds inflate (diverse training), a high
+gate fraction admits too much. The gate should be derived from the
+training data's residual distribution, not hardcoded. See Section 6.
+
+### Validation (remaining TODO)
 
 Test plan:
-1. Warm up with browser traffic only
-2. Introduce mobile-style traffic (different UA, different headers, no cookies)
-3. Verify the mobile traffic initially triggers rate-limits
-4. Observe whether the manifold adapts and starts allowing it
-5. Then introduce Nikto — verify it's still denied despite the adaptation
+1. ~~Warm up with browser traffic only~~  ✓ (multi-attack warmup phase)
+2. ~~Introduce diverse client traffic~~  ✓ (3 browser engines, 20 IPs)
+3. Introduce mobile-style traffic (different UA, different headers, no cookies)
+4. Verify the mobile traffic initially triggers rate-limits
+5. Observe whether the manifold adapts and starts allowing it
+6. ~~Then introduce attacks — verify still denied despite adaptation~~  ✓
+7. ~~Monitor `[ADAPTIVE]` logs to verify attack traffic is never learned~~  ✓ (22 clean learns)
 
-If approach A works, it solves 80% of the deployment problem. Approaches B-D
-are refinements for edge cases (slow poisoning, operator control, multi-tenant).
+Items 3-5 remain untested — need a dedicated client-diversity test.
 
 ### Interaction with leaf binding count
 
@@ -497,21 +551,168 @@ or Gini provides better separation if needed.
    anomalies are more likely real attacks, narrow ones more likely false
    positives from client diversity
 
-### Implementation plan
+### Implementation (DONE)
 
-1. Add concentration ratio (and optionally entropy) computation to
-   `drilldown_audit` in `manifold.rs` — computed from the full score list
-   before truncation to top-N
-2. Surface in `ManifoldVerdict` as `breadth: f64`
-3. Include in log output and `DenialContext` for inspection
-4. Wire into adaptive learning gate (Section 2) as a second condition
-   alongside residual
-5. Validate with live DVWA+Nikto: verify that Nikto probes show high breadth
-   (broad) while legitimate browser variants show low breadth (narrow)
+**Two-tier breadth computation:**
+
+#### Proxy-side: fine-grained per-field breadth (manifold.rs)
+
+`drilldown_audit` now returns a `DrilldownResult` containing:
+- `fields: Vec<DrilldownAttribution>` — sorted per-field attribution (unchanged)
+- `concentration: f64` — `max_score / mean_score` (high = narrow, near 1.0 = broad)
+- `breadth: f64` — fraction of fields scoring above mean (high = broad, low = narrow)
+
+Computed from the FULL (untruncated) score list before top-N truncation. This
+gives accurate breadth even when the result is truncated for logging/tokens.
+
+Surfaced in:
+- `DenialContext` — sealed in the X-Denial-Context token for forensics
+- `DenyEventData` — streamed to the sidecar dashboard
+- `DashboardEvent::Verdict` — visible in the live WAF dashboard SSE stream
+- `log_attribution` — console logs show `breadth=0.65 (BROAD)` with labels:
+  - `BROAD` (>0.5), `moderate` (>0.2), `narrow` (≤0.2)
+
+#### Sidecar-side: coarse-grained per-stripe breadth (lib.rs)
+
+`stripe_concentration()` computes concentration from per-stripe residual norms.
+This is O(N_STRIPES) — much cheaper than the full leaf-level drilldown — and
+leverages the striped architecture: different fields hash to different stripes,
+so a narrow anomaly concentrates in few stripes while a broad one is uniform.
+
+Used exclusively as the adaptive learning gate (Section 2).
+
+### Validation (TODO)
+
+Validate with live DVWA+Nikto:
+- Nikto probes should show high breadth / low concentration (broad — many fields off)
+- Legitimate browser variants should show low breadth / high concentration (narrow)
+- The labels (`BROAD`/`moderate`/`narrow`) should match intuition in the logs
 
 ---
 
-## 6. Centralized Engram Federation (HQ)
+## 6. Deriving Decision Boundaries from Training Data (Magic Numbers)
+
+### The problem
+
+Three hardcoded constants control the spectral firewall's sensitivity:
+
+```
+sigma_mult             = 3.0   // threshold = mean_residual + sigma_mult * stddev
+deny_mult              = 1.5   // deny_threshold = threshold * deny_mult
+ADAPTIVE_RESIDUAL_GATE = 0.5   // learn only if residual < threshold * gate
+```
+
+These were tuned by hand during the multi-attack experiment (March 7, 2026).
+The original values (5.0, 2.0, 0.7) worked for uniform synthetic traffic but
+completely failed with diverse real browser training data — threshold inflation
+made the firewall blind, and the permissive adaptive gate caused the model to
+absorb attack traffic into the baseline (1,374 poisoning learns).
+
+The values 3.0 / 1.5 / 0.5 work for "20 diverse browser agents + 3 scanners"
+but there's no reason to believe they generalize to:
+- Single-client deployments (one app, one browser type)
+- API-heavy services (many endpoints, structured JSON, no browser variance)
+- Multi-tenant environments (wide variance in client populations)
+- Different K / DIM / STRIPES configurations
+
+### Why these interact
+
+The three constants are entangled:
+
+- **sigma_mult** controls threshold height. Higher = more permissive = fewer FP
+  but also fewer TP. This interacts with training diversity — diverse warmup
+  produces higher residual variance, pushing thresholds higher at the same sigma.
+
+- **deny_mult** is a multiplier ON the threshold. Its absolute effect scales
+  with sigma_mult × variance. When thresholds are high (diverse training),
+  even 1.5x produces an unreachably high deny boundary.
+
+- **ADAPTIVE_RESIDUAL_GATE** is a fraction OF the threshold. When thresholds
+  inflate, the absolute gate value inflates too, admitting attack traffic into
+  the learning path. This caused the poisoning cascade.
+
+### Proposed approaches
+
+#### A. Variance-normalized sigma_mult
+
+Instead of `threshold = mean + sigma_mult * stddev`, use:
+
+```
+threshold = mean + sigma_mult * stddev / sqrt(N_populations)
+```
+
+Where `N_populations` is estimated from the training data (e.g., number of
+distinct TLS fingerprint clusters, or number of distinct source IP subnets).
+More populations → wider per-population variance → scale sigma down.
+
+Alternative: use the **coefficient of variation** (CV = stddev/mean) of the
+training residuals as a scaling factor. High CV (diverse training) → reduce
+sigma_mult automatically. Low CV (uniform training) → use full sigma.
+
+#### B. Separation-based deny_mult
+
+During warmup, if attack engrams are available, compute the observed separation
+ratio (attack_residual / normal_threshold). Set deny_mult as a fraction of this:
+
+```
+deny_mult = max(1.2, separation_ratio * 0.5)
+```
+
+Without attack engrams, use a conservative default (1.5) and adjust after
+first attack encounter.
+
+Better: compute the deny boundary from the **training residual distribution**
+directly. Set deny_threshold at a percentile (e.g., 99.9th percentile of
+training residuals), not as a multiplier on the mean-based threshold. This
+naturally adapts to the training distribution's shape.
+
+#### C. Attack-aware adaptive gate
+
+The adaptive gate should ensure attack traffic can never pass. Two approaches:
+
+1. **Relative to separation:** if we know the minimum expected attack residual
+   (from engram library or from the first observed attack), set the gate below
+   that. `gate = min(0.5, min_attack_residual / threshold * 0.8)`.
+
+2. **Distribution-based:** set the gate at a percentile of the training
+   residual distribution (e.g., 80th percentile). This adapts automatically
+   — diverse training with high p80 produces a high absolute gate, but the
+   percentile ensures only clearly-normal samples are learned.
+
+3. **Tighten under attack:** when the anomaly streak is active, reduce the gate
+   to zero (freeze learning entirely). Resume at normal gate level after the
+   streak breaks. This is the simplest and most robust — it decouples the gate
+   from threshold calibration entirely during active attacks.
+
+#### D. Online calibration during warmup
+
+At the end of warmup, compute:
+- Mean and variance of normal residuals → sigma_mult target
+- Distribution shape (kurtosis, tail weight) → deny_mult target
+- Percentiles (p50, p90, p99) → adaptive gate target
+
+Emit these as recommended configuration to the operator, or apply them
+automatically with a "calibrated" flag in the manifold state.
+
+### Interaction with other investigations
+
+- **Training diversity (Section 2)**: the root cause is that diverse training
+  inflates variance. Approaches A and D address this directly.
+- **Adaptive learning (Section 2)**: approach C (tighten under attack) could
+  replace the current constant gate entirely, making the gate a function of
+  system state rather than a tuned parameter.
+- **Engram federation (Section 7)**: federated engrams carry threshold
+  statistics. HQ could compute fleet-wide percentiles for calibration.
+
+### Priority
+
+High. The current hardcoded values are the most fragile part of the system.
+Every new deployment scenario will require re-tuning. This should be addressed
+before production use.
+
+---
+
+## 7. Centralized Engram Federation (HQ)
 
 ### The idea
 

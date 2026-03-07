@@ -91,6 +91,14 @@ pub enum DashboardEvent {
         request_walk: serde_json::Value,
         /// Drilldown attribution — empty for allow/warmup verdicts.
         attribution: Vec<DenyField>,
+        /// Concentration ratio: max_score / mean_score.
+        concentration: f64,
+        /// Normalized Shannon entropy [0,1]. 1 = broad, 0 = narrow.
+        entropy: f64,
+        /// Gini coefficient [0,1]. 0 = broad, 1 = narrow.
+        gini: f64,
+        /// Traffic source label (e.g. "browser-agent"). Empty for unlabeled.
+        traffic_source: String,
     },
     Heartbeat {
         ts: f64,

@@ -46,6 +46,15 @@ pub struct DenialContext {
     /// Cookie keys present (values omitted for size).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cookie_keys: Vec<String>,
+    /// Concentration ratio: max_score / mean_score. High = narrow.
+    #[serde(default)]
+    pub concentration: f64,
+    /// Normalized Shannon entropy [0,1]. 1 = broad, 0 = narrow.
+    #[serde(default)]
+    pub entropy: f64,
+    /// Gini coefficient [0,1]. 0 = broad, 1 = narrow.
+    #[serde(default)]
+    pub gini: f64,
     /// Timestamp (microseconds since epoch).
     pub timestamp_us: u64,
 }
@@ -168,6 +177,9 @@ mod tests {
             user_agent: Some("Nikto/2.1.6".to_string()),
             header_names: vec!["Host".into(), "User-Agent".into(), "Accept".into()],
             cookie_keys: vec![],
+            concentration: 2.1,
+            entropy: 0.85,
+            gini: 0.25,
             timestamp_us: 1700000000000000,
         }
     }
@@ -238,6 +250,9 @@ mod tests {
             user_agent: None,
             header_names: vec![],
             cookie_keys: vec![],
+            concentration: 0.0,
+            entropy: 0.0,
+            gini: 0.0,
             timestamp_us: 1700000000000000,
         };
         let token = seal(&ctx, &key).unwrap();

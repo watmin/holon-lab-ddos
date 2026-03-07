@@ -107,6 +107,26 @@ const STALENESS_CHECK_INTERVAL: u64 = 50;
 const DECAY_HALF_LIFE: usize = 500;
 
 // =============================================================================
+// Adaptive learning configuration
+// =============================================================================
+
+/// Residual must be below threshold * ADAPTIVE_RESIDUAL_GATE for a sample to
+/// be a candidate for continuous learning. 0.7 = only learn requests that are
+/// well within the "normal" regime (30% safety margin from threshold).
+const ADAPTIVE_RESIDUAL_GATE: f64 = 0.5;
+
+/// Per-stripe concentration ratio must exceed this for adaptive learning.
+/// High concentration = narrow anomaly (one stripe dominates) = safe to learn.
+/// Low concentration = broad anomaly (all stripes elevated) = potential poisoning.
+const ADAPTIVE_CONCENTRATION_GATE: f64 = 2.0;
+
+/// Learn at most 1 in N eligible samples to prevent rapid manifold drift.
+const ADAPTIVE_LEARN_INTERVAL: usize = 10;
+
+/// How many adaptive learns between manifold state republishes.
+const ADAPTIVE_REPUBLISH_INTERVAL: usize = 50;
+
+// =============================================================================
 // Entry point — called by proxy main.rs
 // =============================================================================
 
@@ -163,7 +183,7 @@ pub async fn run(
         VSA_DIM, STRIPED_K, N_STRIPES,
         2.0,   // amnesia
         0.01,  // ema_alpha
-        5.0,   // sigma_mult — wider gate for K=32 (tighter residual distribution)
+        3.0,   // sigma_mult — balanced for diverse multi-browser baselines
         500,   // reorth_interval
     );
     let mut req_tracker = FieldTracker::new(decay_factor(DECAY_HALF_LIFE));
@@ -189,6 +209,11 @@ pub async fn run(
 
     // Surprise history for cross-tick consistency (content-before-shape prioritization)
     let mut surprise_history = SurpriseHistory::new(5);
+
+    // Adaptive learning state
+    let mut adaptive_sample_counter = 0usize;
+    let mut adaptive_learn_count = 0u64;
+    let mut adaptive_since_republish = 0usize;
 
     // Layer 2: window-level spectrum tracking
     let mut req_window_tracker = WindowTracker::new(VSA_DIM, VSA_K, WINDOW_SIZE);
@@ -256,6 +281,10 @@ pub async fn run(
                             attribution: deny.attribution.into_iter()
                                 .map(|(field, score)| DenyField { field, score })
                                 .collect(),
+                            concentration: deny.concentration,
+                            entropy: deny.entropy,
+                            gini: deny.gini,
+                            traffic_source: deny.traffic_source,
                         });
                     }
                 }
@@ -267,7 +296,7 @@ pub async fn run(
                     if warmup_start.is_none() {
                         warmup_start = Some(Instant::now());
                     }
-                    let window_result = process_req_sample(
+                    let (window_result, adaptive_result) = process_req_sample(
                         &s, &encoder, &mut req_detector,
                         &mut req_striped_baseline,
                         &mut req_tracker,
@@ -275,7 +304,41 @@ pub async fn run(
                         &mut req_tick_max_residual, &mut req_tick_max_vec,
                         &mut req_tick_max_sample,
                         &mut req_window_tracker,
+                        &mut adaptive_sample_counter,
+                        &mut adaptive_learn_count,
+                        &mut adaptive_since_republish,
                     );
+
+                    // Republish manifold state after enough adaptive learns
+                    if adaptive_since_republish >= ADAPTIVE_REPUBLISH_INTERVAL && req_warmup_done {
+                        adaptive_since_republish = 0;
+                        manifold.store(Arc::new(build_manifold_state(
+                            &req_striped_baseline, &current_threat_mode, baseline_rps,
+                        )));
+                        info!(
+                            "[ADAPTIVE] Republished manifold (total_learns={}, threshold={:.2})",
+                            adaptive_learn_count, req_striped_baseline.threshold(),
+                        );
+                    }
+
+                    match &adaptive_result {
+                        AdaptiveResult::Learned { residual, concentration } => {
+                            if adaptive_learn_count % 100 == 1 {
+                                info!(
+                                    "[ADAPTIVE] Learned sample #{} (residual={:.2}, concentration={:.1})",
+                                    adaptive_learn_count, residual, concentration,
+                                );
+                            }
+                        }
+                        AdaptiveResult::BroadRejected { concentration } => {
+                            warn!(
+                                "[ADAPTIVE] Broad sample rejected (concentration={:.2}, gate={:.1})",
+                                concentration, ADAPTIVE_CONCENTRATION_GATE,
+                            );
+                        }
+                        _ => {}
+                    }
+
                     if let Some(wr) = window_result {
                         info!(
                             "[WINDOW] explained={:.3} candidates={} mode={:?}",
@@ -396,6 +459,7 @@ pub async fn run(
             tls = tls_tick_count,
             req = req_tick_count,
             rps = format!("{:.0}", estimated_rps),
+            adaptive_learns = adaptive_learn_count,
             "tick"
         );
 
@@ -836,6 +900,37 @@ fn process_tls_sample(
     }
 }
 
+/// Result of adaptive learning attempt for a single sample.
+#[derive(Debug)]
+enum AdaptiveResult {
+    /// Not eligible (warmup, above threshold, etc.)
+    Skip,
+    /// Eligible but skipped due to learning interval
+    Throttled,
+    /// Eligible but breadth too broad (potential poisoning)
+    BroadRejected { concentration: f64 },
+    /// Successfully learned
+    Learned { residual: f64, concentration: f64 },
+}
+
+/// Compute per-stripe concentration ratio for adaptive learning gate.
+/// High = narrow anomaly (one stripe dominates), safe to learn.
+/// Near 1.0 = broad anomaly (uniform across stripes), risky.
+fn stripe_concentration(baseline: &StripedSubspace, stripe_vecs: &[Vec<f64>]) -> f64 {
+    let n = baseline.n_stripes();
+    if n == 0 { return 0.0; }
+
+    let residuals: Vec<f64> = (0..n)
+        .map(|i| baseline.stripe_residual(stripe_vecs, i))
+        .collect();
+
+    let sum: f64 = residuals.iter().sum();
+    let mean = sum / n as f64;
+    let max = residuals.iter().cloned().fold(0.0_f64, f64::max);
+
+    if mean > 1e-10 { max / mean } else { 0.0 }
+}
+
 /// Process a single REQ sample: encode with striped FQDN hashing,
 /// train both the striped baseline (for manifold) and the single-vector
 /// detector (for sidecar-internal rule generation), track fields,
@@ -855,7 +950,10 @@ fn process_req_sample(
     tick_max_vec: &mut Option<Vec<f64>>,
     tick_max_sample: &mut Option<RequestSample>,
     window_tracker: &mut WindowTracker,
-) -> Option<detectors::WindowResult> {
+    adaptive_counter: &mut usize,
+    adaptive_learns: &mut u64,
+    adaptive_since_pub: &mut usize,
+) -> (Option<detectors::WindowResult>, AdaptiveResult) {
     // Encode into N stripes via FQDN leaf hashing
     let stripe_vecs_raw = encoder.encode_walkable_striped(sample, N_STRIPES);
     let stripe_vecs: Vec<Vec<f64>> = stripe_vecs_raw.iter()
@@ -868,6 +966,8 @@ fn process_req_sample(
     let aggregate_vec = Primitives::bundle(&refs);
     let agg_f64: Vec<f64> = aggregate_vec.data().iter().map(|&b| b as f64).collect();
 
+    let mut adaptive = AdaptiveResult::Skip;
+
     if !warmup_done {
         striped_baseline.update(&stripe_vecs);
         detector.learn(&agg_f64);
@@ -875,6 +975,7 @@ fn process_req_sample(
     } else {
         // Score via striped baseline (used for manifold verdicts)
         let residual = striped_baseline.residual(&stripe_vecs);
+        let threshold = striped_baseline.threshold();
         // Also feed the single-vector detector for sidecar rule generation
         let _ = detector.score(&agg_f64);
 
@@ -882,6 +983,24 @@ fn process_req_sample(
             *tick_max_residual = residual;
             *tick_max_vec = Some(agg_f64.clone());
             *tick_max_sample = Some(sample.clone());
+        }
+
+        // Adaptive learning: absorb sub-threshold, narrow-breadth samples
+        if residual < threshold * ADAPTIVE_RESIDUAL_GATE {
+            *adaptive_counter += 1;
+            if *adaptive_counter % ADAPTIVE_LEARN_INTERVAL == 0 {
+                let conc = stripe_concentration(striped_baseline, &stripe_vecs);
+                if conc >= ADAPTIVE_CONCENTRATION_GATE {
+                    striped_baseline.update(&stripe_vecs);
+                    *adaptive_learns += 1;
+                    *adaptive_since_pub += 1;
+                    adaptive = AdaptiveResult::Learned { residual, concentration: conc };
+                } else {
+                    adaptive = AdaptiveResult::BroadRejected { concentration: conc };
+                }
+            } else {
+                adaptive = AdaptiveResult::Throttled;
+            }
         }
     }
 
@@ -909,7 +1028,7 @@ fn process_req_sample(
     ];
     tracker.observe_with_decay(&pairs, decay_alpha);
 
-    window_result
+    (window_result, adaptive)
 }
 
 // =============================================================================
@@ -1059,7 +1178,7 @@ fn build_manifold_state(
         normal_subspaces,
         baseline,
         threat_mode: manifold_threat,
-        deny_threshold: threshold * 2.0,
+        deny_threshold: threshold * 1.5,
         rate_limit_rps: baseline_rps.max(10.0),
     }
 }

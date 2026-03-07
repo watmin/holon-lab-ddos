@@ -37,6 +37,9 @@ mkdir -p "$LOGS_DIR" "$ENGRAMS_DIR"
 cleanup() {
     echo ""
     echo "==> Cleaning up..."
+    if [[ -n "${BROWSER_PID:-}" ]]; then
+        kill "$BROWSER_PID" 2>/dev/null || true
+    fi
     if [[ -f "$LOGS_DIR/proxy.pid" ]]; then
         kill "$(cat "$LOGS_DIR/proxy.pid")" 2>/dev/null || true
         rm -f "$LOGS_DIR/proxy.pid"
@@ -185,12 +188,41 @@ RUST_LOG=info "$GENERATOR_BIN" \
 rm -f "$WARMUP_FILE"
 echo "    Warmup complete."
 
-# --- 6. Run Nikto ---
+# --- 6. Start browser agent (continuous background traffic) ---
+BROWSER_LOG="$LOGS_DIR/nikto_browser_${TIMESTAMP}.log"
+VENV_DIR="$SCRIPT_DIR/.venv"
+AGENT_SCRIPT="$SCRIPT_DIR/dvwa_browser_agent.py"
+
+BROWSER_PID=""
+if [[ -d "$VENV_DIR" && -f "$AGENT_SCRIPT" ]]; then
+    echo ""
+    echo "==> Starting LLM browser agent (continuous background traffic)"
+    echo "    Log: $BROWSER_LOG"
+    (
+        source "$VENV_DIR/bin/activate"
+        python "$AGENT_SCRIPT" \
+            --proxy-url https://127.0.0.1:8443 \
+            --dvwa-url http://127.0.0.1:8888 \
+            --session-cookie "$DVWA_SID" \
+            --pace-min 0.3 \
+            --pace-max 1.5 \
+            > "$BROWSER_LOG" 2>&1
+    ) &
+    BROWSER_PID=$!
+    echo "    Browser agent running (pid=$BROWSER_PID)"
+    sleep 3
+else
+    echo ""
+    echo "==> SKIP: browser agent (no .venv or agent script found)"
+fi
+
+# --- 7. Run Nikto ---
 NIKTO_LOG="$LOGS_DIR/nikto_scan_${TIMESTAMP}.log"
 
 echo ""
 echo "==> Running Nikto against proxy (https://127.0.0.1:8443)"
 echo "    Nikto log: $NIKTO_LOG"
+echo "    (browser agent running concurrently)"
 
 docker run --rm --net=host \
     alpine/nikto \
@@ -204,7 +236,17 @@ docker run --rm --net=host \
 echo ""
 echo "==> Nikto scan complete."
 
-# --- 7. Summary ---
+# --- 7b. Stop browser agent ---
+if [[ -n "$BROWSER_PID" ]]; then
+    echo "==> Stopping browser agent (pid=$BROWSER_PID)"
+    kill "$BROWSER_PID" 2>/dev/null || true
+    wait "$BROWSER_PID" 2>/dev/null || true
+    BROWSER_ACTIONS=$(grep -c '^\[agent\] #' "$BROWSER_LOG" 2>/dev/null || echo "0")
+    echo "    Browser agent completed $BROWSER_ACTIONS actions"
+    echo ""
+fi
+
+# --- 8. Summary ---
 echo ""
 echo "=========================================="
 echo " Spectral Firewall — Nikto Test Results"
@@ -231,8 +273,39 @@ else
 fi
 
 echo ""
+echo "--- Adaptive learning ---"
+# Strip ANSI codes before grepping — tracing wraps structured fields in escape sequences
+STRIPPED=$(sed 's/\x1b\[[0-9;]*m//g' "$PROXY_LOG")
+ADAPTIVE_TOTAL=$(echo "$STRIPPED" | grep 'adaptive_learns' | tail -1 | grep -oP 'adaptive_learns=\K\d+' || true)
+echo "  total adaptive learns: ${ADAPTIVE_TOTAL:-0}"
+REPUBLISHES=$(echo "$STRIPPED" | grep -c 'ADAPTIVE.*Republished' || true)
+echo "  manifold republishes: ${REPUBLISHES:-0}"
+BROAD_REJECTS=$(echo "$STRIPPED" | grep -c 'Broad sample rejected' || true)
+echo "  broad rejections (poisoning gate): ${BROAD_REJECTS:-0}"
+THRESHOLD_INIT=$(echo "$STRIPPED" | grep 'MANIFOLD.*Initial' | grep -oP 'deny_threshold=\K[0-9.]+' || true)
+THRESHOLD_FINAL=$(echo "$STRIPPED" | grep 'ADAPTIVE.*Republished' | tail -1 | grep -oP 'threshold=\K[0-9.]+' || true)
+echo "  threshold: warmup=${THRESHOLD_INIT:-?} → post-adaptive=${THRESHOLD_FINAL:-$THRESHOLD_INIT}"
+
+echo ""
+echo "--- Anomaly breadth (deny/rate-limit log samples) ---"
+echo "$STRIPPED" | grep 'concentration=' | grep 'entropy=' | tail -3 | grep -oP 'concentration=[0-9.]+\s+entropy=[0-9.]+\s+gini=[0-9.]+ \([^)]+\)' | sed 's/^/  /' || echo "  (none logged)"
+
+echo ""
 echo "--- Proxy deny attribution (top 5) ---"
 grep 'surprise probe\|drilldown' "$PROXY_LOG" | tail -5 || echo "  (none logged)"
+
+echo ""
+echo "--- Browser agent (concurrent legitimate traffic) ---"
+if [[ -f "${BROWSER_LOG:-/dev/null}" ]]; then
+    B_ACTIONS=$(grep -c '^\[agent\] #' "$BROWSER_LOG" 2>/dev/null || echo "0")
+    B_ERRORS=$(grep -c '\[agent\] .*failed\|Error' "$BROWSER_LOG" 2>/dev/null || echo "0")
+    echo "  actions: $B_ACTIONS"
+    echo "  errors:  $B_ERRORS"
+    echo "  last 3 actions:"
+    grep '^\[agent\] #' "$BROWSER_LOG" 2>/dev/null | tail -3 | sed 's/^/    /' || echo "    (none)"
+else
+    echo "  (browser agent was not running)"
+fi
 
 echo ""
 echo "--- Nikto findings ---"

@@ -173,7 +173,11 @@ async fn handle_request(
                         verdict: "allow".into(),
                         request_walk,
                         attribution: vec![],
+                        concentration: 0.0,
+                        entropy: 0.0,
+                        gini: 0.0,
                         timestamp_us: sample.timestamp_us,
+                        traffic_source: sample.traffic_source.clone().unwrap_or_default(),
                     }));
                 }
             }
@@ -193,15 +197,19 @@ async fn handle_request(
                         verdict: "warmup".into(),
                         request_walk,
                         attribution: vec![],
+                        concentration: 0.0,
+                        entropy: 0.0,
+                        gini: 0.0,
                         timestamp_us: sample.timestamp_us,
+                        traffic_source: sample.traffic_source.clone().unwrap_or_default(),
                     }));
                 }
             }
             ManifoldVerdict::RateLimit { rps, residual } => {
                 crate::MANIFOLD_RATE_LIMIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if !rate_limiter.allow(sample.src_ip, rps as u32) {
-                    let full_attribution = drilldown_audit(&stripe_vecs, &mstate, &encoder, &sample, n_stripes, 250);
-                    let fields: Vec<String> = full_attribution.iter().take(5)
+                    let drilldown = drilldown_audit(&stripe_vecs, &mstate, &encoder, &sample, n_stripes, 250);
+                    let fields: Vec<String> = drilldown.fields.iter().take(5)
                         .map(|a| format!("{}={:.1}", a.field, a.score))
                         .collect();
                     warn!(
@@ -209,12 +217,13 @@ async fn handle_request(
                         method = %sample.method,
                         path = %sample.path,
                         residual = format!("{:.3}", residual),
+                        gini = format!("{:.3}", drilldown.gini),
                         fields = fields.join(","),
                         "manifold rate-limit"
                     );
-                    log_attribution("RATE-LTD", &sample, residual, &mstate, &full_attribution);
+                    log_attribution("RATE-LTD", &sample, residual, &mstate, &drilldown);
                     let token = build_denial_token(
-                        "rate_limit", residual, &mstate, &full_attribution,
+                        "rate_limit", residual, &mstate, &drilldown,
                         &sample, &denial_key,
                     );
                     let baseline = mstate.baseline.as_ref();
@@ -230,8 +239,12 @@ async fn handle_request(
                         deny_threshold: mstate.deny_threshold,
                         verdict: "rate_limit".into(),
                         request_walk,
-                        attribution: full_attribution.iter().map(|a| (a.field.clone(), a.score)).collect(),
+                        attribution: drilldown.fields.iter().map(|a| (a.field.clone(), a.score)).collect(),
+                        concentration: drilldown.concentration,
+                        entropy: drilldown.entropy,
+                        gini: drilldown.gini,
                         timestamp_us: sample.timestamp_us,
+                        traffic_source: sample.traffic_source.clone().unwrap_or_default(),
                     }));
                     let _ = sample_tx.try_send(SampleMessage::RequestSample(sample));
                     let mut builder = Response::builder()
@@ -246,8 +259,8 @@ async fn handle_request(
             }
             ManifoldVerdict::Deny { residual } => {
                 crate::MANIFOLD_DENY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let full_attribution = drilldown_audit(&stripe_vecs, &mstate, &encoder, &sample, n_stripes, 250);
-                let fields: Vec<String> = full_attribution.iter().take(5)
+                let drilldown = drilldown_audit(&stripe_vecs, &mstate, &encoder, &sample, n_stripes, 250);
+                let fields: Vec<String> = drilldown.fields.iter().take(5)
                     .map(|a| format!("{}={:.1}", a.field, a.score))
                     .collect();
                 warn!(
@@ -255,12 +268,13 @@ async fn handle_request(
                     method = %sample.method,
                     path = %sample.path,
                     residual = format!("{:.3}", residual),
+                    gini = format!("{:.3}", drilldown.gini),
                     fields = fields.join(","),
                     "manifold deny"
                 );
-                log_attribution("DENY", &sample, residual, &mstate, &full_attribution);
+                log_attribution("DENY", &sample, residual, &mstate, &drilldown);
                 let token = build_denial_token(
-                    "deny", residual, &mstate, &full_attribution,
+                    "deny", residual, &mstate, &drilldown,
                     &sample, &denial_key,
                 );
                 let baseline = mstate.baseline.as_ref();
@@ -276,8 +290,12 @@ async fn handle_request(
                     deny_threshold: mstate.deny_threshold,
                     verdict: "deny".into(),
                     request_walk,
-                    attribution: full_attribution.iter().map(|a| (a.field.clone(), a.score)).collect(),
+                    attribution: drilldown.fields.iter().map(|a| (a.field.clone(), a.score)).collect(),
+                    concentration: drilldown.concentration,
+                    entropy: drilldown.entropy,
+                    gini: drilldown.gini,
                     timestamp_us: sample.timestamp_us,
+                    traffic_source: sample.traffic_source.clone().unwrap_or_default(),
                 }));
                 let _ = sample_tx.try_send(SampleMessage::RequestSample(sample));
                 let mut builder = Response::builder()
@@ -327,8 +345,14 @@ fn build_request_sample(
         _ => HttpVersion::Http11,
     };
 
-    // Collect headers in wire order, duplicates preserved
+    // Extract and strip out-of-band traffic label before VSA sees it
+    let traffic_source = req.headers().get("x-traffic-source")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Collect headers in wire order, duplicates preserved (label stripped)
     let headers: Vec<(String, String)> = req.headers().iter()
+        .filter(|(k, _)| k.as_str() != "x-traffic-source")
         .map(|(k, v)| {
             (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())
         })
@@ -371,6 +395,7 @@ fn build_request_sample(
         tls_ctx: conn_ctx.tls_ctx.clone(),
         tls_vec: conn_ctx.tls_vec.clone(),
         timestamp_us: now_us(),
+        traffic_source,
     }
 }
 
@@ -378,7 +403,7 @@ fn build_denial_token(
     verdict: &str,
     residual: f64,
     mstate: &ManifoldState,
-    attribution: &[crate::manifold::DrilldownAttribution],
+    drilldown: &crate::manifold::DrilldownResult,
     sample: &RequestSample,
     denial_key: &Option<Arc<DenialKey>>,
 ) -> Option<String> {
@@ -389,7 +414,7 @@ fn build_denial_token(
         residual,
         threshold: baseline.threshold(),
         deny_threshold: mstate.deny_threshold,
-        top_fields: attribution.iter().take(30).map(|a| a.into()).collect(),
+        top_fields: drilldown.fields.iter().take(30).map(|a| a.into()).collect(),
         src_ip: sample.src_ip.to_string(),
         method: sample.method.clone(),
         path: sample.path.clone(),
@@ -397,6 +422,9 @@ fn build_denial_token(
         user_agent: sample.user_agent.clone(),
         header_names: sample.headers.iter().map(|(k, _)| k.clone()).collect(),
         cookie_keys: sample.cookies.iter().map(|(k, _)| k.clone()).collect(),
+        concentration: drilldown.concentration,
+        entropy: drilldown.entropy,
+        gini: drilldown.gini,
         timestamp_us: sample.timestamp_us,
     };
     match denial_token::seal(&ctx, key) {
@@ -413,23 +441,29 @@ fn log_attribution(
     sample: &RequestSample,
     residual: f64,
     mstate: &ManifoldState,
-    attribution: &[crate::manifold::DrilldownAttribution],
+    drilldown: &crate::manifold::DrilldownResult,
 ) {
     let threshold = mstate.baseline.as_ref().map(|b| b.threshold()).unwrap_or(0.0);
     let deviation = if threshold > 0.0 { residual / threshold } else { 0.0 };
     let ua = sample.user_agent.as_deref().unwrap_or("-");
-    let top: Vec<String> = attribution.iter().take(15)
+    let top: Vec<String> = drilldown.fields.iter().take(15)
         .map(|a| format!("  {:>6.1}  {}", a.score, a.field))
         .collect();
+    let gini_label = if drilldown.gini < 0.3 { "BROAD" }
+        else if drilldown.gini < 0.6 { "moderate" }
+        else { "narrow" };
     let sep = "═".repeat(60);
+    let src_label = sample.traffic_source.as_deref().unwrap_or("unknown");
     info!(
-        "\n╔══ {} ══ {} {} ══ src={} ua={}\n\
+        "\n╔══ {} ══ {} {} ══ src={} label={} ua={}\n\
          ║  residual={:.2}  threshold={:.2}  deny_thr={:.2}  deviation={:.1}x\n\
+         ║  concentration={:.1}  entropy={:.3}  gini={:.3} ({})\n\
          ║  top fields:\n{}\n\
          ╚{}",
         verdict, sample.method, sample.path,
-        sample.src_ip, ua,
+        sample.src_ip, src_label, ua,
         residual, threshold, mstate.deny_threshold, deviation,
+        drilldown.concentration, drilldown.entropy, drilldown.gini, gini_label,
         top.join("\n"),
         sep,
     );

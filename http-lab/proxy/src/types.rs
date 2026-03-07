@@ -489,6 +489,10 @@ pub struct RequestSample {
     pub tls_vec: Vector,
 
     pub timestamp_us: u64,
+
+    /// Out-of-band traffic label from `X-Traffic-Source` header.
+    /// Stripped before VSA encoding. Used for experiment attribution only.
+    pub traffic_source: Option<String>,
 }
 
 impl RequestSample {
@@ -801,7 +805,16 @@ pub struct DenyEventData {
     /// Full drilldown attribution: (walkable_field_name, anomaly_score).
     /// All probed fields included, sorted by score descending.
     pub attribution: Vec<(String, f64)>,
+    /// Concentration ratio: max_score / mean_score.
+    /// High = narrow (one field dominates), near 1.0 = broad (uniform).
+    pub concentration: f64,
+    /// Normalized Shannon entropy [0,1]. 1 = broad, 0 = narrow.
+    pub entropy: f64,
+    /// Gini coefficient [0,1]. 0 = broad (uniform), 1 = narrow (concentrated).
+    pub gini: f64,
     pub timestamp_us: u64,
+    /// Out-of-band traffic label (from `X-Traffic-Source`). Empty for unlabeled traffic.
+    pub traffic_source: String,
 }
 
 /// Message sent on the bounded sample channel to the sidecar.
@@ -1817,6 +1830,13 @@ mod tests {
                     .map(|i| render_walkable_value(i, 0))
                     .collect();
                 format!("#{{{}}}", vals.join(", "))
+            }
+            WalkableValue::Spread(items) => {
+                if items.is_empty() { return "<<>>".to_string(); }
+                let entries: Vec<String> = items.iter()
+                    .map(|v| format!("{}{}", pad1, render_walkable_value(v, indent + 1)))
+                    .collect();
+                format!("<<\n{}\n{}>>", entries.join(",\n"), pad)
             }
         }
     }

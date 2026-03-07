@@ -244,8 +244,8 @@ every dimension simultaneously — fixing one (e.g. UA) still leaves four others
 
 ## Next Experiments
 
+- [x] Multi-source-IP + concurrent traffic — **Done.** See [EXPERIMENT-MULTI-ATTACK.md](EXPERIMENT-MULTI-ATTACK.md)
 - [ ] Slow Nikto (`-Pause 1`) — 1 req/sec, test pure geometric detection without rate-limit triggers
 - [ ] Mimicry attack — real browser through proxy, submit SQLi via DVWA forms (find the boundary)
-- [ ] Multi-source-IP — baseline lab has Squid on ports 40001-40023 with 23 ipvlan addresses
 - [ ] Fix WindowTracker mode classification, re-run
 - [ ] Measure spectral scoring overhead in isolation (microbenchmark)

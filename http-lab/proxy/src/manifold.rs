@@ -148,6 +148,30 @@ pub struct DrilldownAttribution {
     pub score: f64,
 }
 
+/// Full drilldown result: per-field attributions + anomaly breadth metrics.
+///
+/// Three complementary metrics quantify how spread the anomaly is across fields:
+///
+/// - **concentration** (max/mean): simplest, one number. High = narrow.
+/// - **entropy** (Shannon): information-theoretic. High = broad (uniform).
+///   Normalized to [0, 1] by dividing by log(n).
+/// - **gini** (Gini coefficient): inequality measure. 0 = perfectly uniform
+///   (broadest). 1 = all energy in one field (narrowest).
+#[derive(Debug, Clone)]
+pub struct DrilldownResult {
+    pub fields: Vec<DrilldownAttribution>,
+    /// Concentration ratio: `max_score / mean_score`.
+    /// High = narrow anomaly (few fields dominate).
+    /// Near 1.0 = broad anomaly (scores spread evenly).
+    pub concentration: f64,
+    /// Normalized Shannon entropy of score distribution [0, 1].
+    /// 0 = all energy in one field (narrowest). 1 = perfectly uniform (broadest).
+    pub entropy: f64,
+    /// Gini coefficient of score distribution [0, 1].
+    /// 0 = perfectly uniform (broadest). 1 = all energy in one field (narrowest).
+    pub gini: f64,
+}
+
 /// Flat drilldown: walk the Walkable to find every leaf path, unbind each
 /// from its stripe's anomalous component, and score.
 ///
@@ -161,7 +185,9 @@ pub struct DrilldownAttribution {
 /// if it was reconstructed by the subspace, the cosine is ≈ 0.
 ///
 /// Runs after the verdict is decided — not on the critical path.
-/// Returns all attributions sorted by score descending, truncated to `limit`.
+/// Returns a `DrilldownResult` with all attributions (sorted, truncated to
+/// `limit`) plus anomaly breadth metrics computed over the FULL score set
+/// before truncation.
 pub fn drilldown_audit(
     stripe_vecs: &[Vec<f64>],
     state: &ManifoldState,
@@ -169,10 +195,10 @@ pub fn drilldown_audit(
     walkable: &dyn Walkable,
     n_stripes: usize,
     limit: usize,
-) -> Vec<DrilldownAttribution> {
+) -> DrilldownResult {
     let baseline = match &state.baseline {
         Some(b) => b,
-        None => return vec![],
+        None => return DrilldownResult { fields: vec![], concentration: 0.0, entropy: 0.0, gini: 0.0 },
     };
 
     // Real-valued anomalous components per stripe (x - reconstruct(x))
@@ -192,13 +218,63 @@ pub fn drilldown_audit(
         collect_leaf_scores(value, key, n_stripes, encoder, &anomalies, &anomaly_norms, &mut scores);
     }
 
+    // Compute breadth metrics over the FULL score set before truncation
+    let (concentration, entropy, gini) = compute_breadth_metrics(&scores);
+
     scores.sort_by(|a, b| {
         b.score.partial_cmp(&a.score).unwrap_or_else(|| {
             if a.score.is_nan() { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less }
         })
     });
     scores.truncate(limit);
-    scores
+    DrilldownResult { fields: scores, concentration, entropy, gini }
+}
+
+/// Compute three anomaly breadth metrics from the full (untruncated) score list.
+///
+/// Returns (concentration, entropy, gini).
+fn compute_breadth_metrics(scores: &[DrilldownAttribution]) -> (f64, f64, f64) {
+    if scores.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let n = scores.len();
+    let nf = n as f64;
+    let sum: f64 = scores.iter().map(|s| s.score).sum();
+    let mean = sum / nf;
+    let max = scores.iter().map(|s| s.score).fold(0.0_f64, f64::max);
+
+    // Concentration ratio: max / mean. High = narrow, near 1 = broad.
+    let concentration = if mean > 1e-10 { max / mean } else { 0.0 };
+
+    // Shannon entropy: normalize scores into a probability distribution,
+    // compute -Σ pᵢ·log(pᵢ), then divide by log(n) to get [0, 1].
+    // 1 = perfectly uniform (broadest), 0 = all in one field (narrowest).
+    let entropy = if sum > 1e-10 && n > 1 {
+        let raw: f64 = scores.iter()
+            .map(|s| {
+                let p = s.score / sum;
+                if p > 1e-15 { -p * p.ln() } else { 0.0 }
+            })
+            .sum();
+        raw / (nf.ln())
+    } else {
+        0.0
+    };
+
+    // Gini coefficient: mean absolute difference / (2 * mean).
+    // 0 = perfectly uniform (broadest), 1 = maximally unequal (narrowest).
+    let gini = if mean > 1e-10 && n > 1 {
+        let mut sorted: Vec<f64> = scores.iter().map(|s| s.score).collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let sum_weighted: f64 = sorted.iter().enumerate()
+            .map(|(i, &x)| (2.0 * (i as f64) + 1.0 - nf) * x)
+            .sum();
+        sum_weighted / (nf * nf * mean)
+    } else {
+        0.0
+    };
+
+    (concentration, entropy, gini)
 }
 
 /// Recursively walk the Walkable structure, scoring each leaf via cosine
@@ -415,5 +491,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn breadth_empty_scores() {
+        let (conc, entropy, gini) = compute_breadth_metrics(&[]);
+        assert_eq!(conc, 0.0);
+        assert_eq!(entropy, 0.0);
+        assert_eq!(gini, 0.0);
+    }
+
+    #[test]
+    fn breadth_narrow_anomaly() {
+        // One field dominates — classic single-field exploit
+        let scores = vec![
+            DrilldownAttribution { field: "path".into(), score: 10.0 },
+            DrilldownAttribution { field: "method".into(), score: 0.1 },
+            DrilldownAttribution { field: "src_ip".into(), score: 0.1 },
+            DrilldownAttribution { field: "ua".into(), score: 0.1 },
+            DrilldownAttribution { field: "host".into(), score: 0.1 },
+        ];
+        let (conc, entropy, gini) = compute_breadth_metrics(&scores);
+        assert!(conc > 4.0, "narrow: concentration should be high, got {}", conc);
+        assert!(entropy < 0.5, "narrow: entropy should be low, got {}", entropy);
+        assert!(gini > 0.7, "narrow: gini should be high, got {}", gini);
+    }
+
+    #[test]
+    fn breadth_broad_anomaly() {
+        // All fields similarly anomalous — scanner/tool
+        let scores = vec![
+            DrilldownAttribution { field: "path".into(), score: 5.0 },
+            DrilldownAttribution { field: "method".into(), score: 4.5 },
+            DrilldownAttribution { field: "src_ip".into(), score: 4.8 },
+            DrilldownAttribution { field: "ua".into(), score: 5.2 },
+            DrilldownAttribution { field: "host".into(), score: 4.9 },
+        ];
+        let (conc, entropy, gini) = compute_breadth_metrics(&scores);
+        assert!(conc < 1.5, "broad: concentration should be low, got {}", conc);
+        assert!(entropy > 0.95, "broad: entropy should be near 1.0, got {}", entropy);
+        assert!(gini < 0.1, "broad: gini should be near 0, got {}", gini);
+    }
+
+    #[test]
+    fn breadth_moderate_anomaly() {
+        // Mix: a few elevated, rest low — Nikto-like
+        let scores = vec![
+            DrilldownAttribution { field: "tls.padding".into(), score: 0.67 },
+            DrilldownAttribution { field: "tls.cipher_order".into(), score: 0.51 },
+            DrilldownAttribution { field: "tls.sni".into(), score: 0.46 },
+            DrilldownAttribution { field: "header_order".into(), score: 0.34 },
+            DrilldownAttribution { field: "path".into(), score: 0.17 },
+            DrilldownAttribution { field: "version".into(), score: 0.15 },
+            DrilldownAttribution { field: "tls.version".into(), score: 0.04 },
+            DrilldownAttribution { field: "tls.record_ver".into(), score: 0.07 },
+        ];
+        let (conc, entropy, gini) = compute_breadth_metrics(&scores);
+        // Should be between narrow and broad
+        assert!(conc > 1.5 && conc < 4.0, "moderate: concentration={}", conc);
+        assert!(entropy > 0.7 && entropy < 0.95, "moderate: entropy={}", entropy);
+        assert!(gini > 0.2 && gini < 0.5, "moderate: gini={}", gini);
     }
 }
