@@ -722,31 +722,102 @@ entries. Each collection cycle, HQ gathers engrams and builds a stacked
 set. Nodes boot with the full stack. Graduate to C or D when the stack
 grows too large for per-request compute budget.
 
-### Collection protocol
+### Collection protocol: fully async, host-initiated
+
+The protocol is host-driven. HQ is passive — it accepts reports and serves
+the current merged engram. It never pushes, never polls, never needs to
+know the fleet topology. Hosts call home on their own schedule.
 
 ```
-  ┌──────┐       engram            ┌──────┐
-  │Node A├────────────────────────►│      │
-  └──────┘                         │      │
-  ┌──────┐       engram            │  HQ  │──── merge ──► merged.engram
-  │Node B├────────────────────────►│      │
-  └──────┘                         │      │
-  ┌──────┐       engram            │      │
-  │Node C├────────────────────────►│      │
-  └──────┘                         └──┬───┘
-                                      │
-                    ┌─────────────────┼─────────────────┐
-                    ▼                 ▼                  ▼
-               ┌──────┐         ┌──────┐          ┌──────┐
-               │Node A│         │Node B│          │Node D│ (new/restarted)
-               └──────┘         └──────┘          └──────┘
+  ┌──────┐  jittered call-home     ┌──────────────────────────────┐
+  │Node A├─────────────────────────►  POST /report                │
+  └──────┘  (push local engram)    │  • accept node engram        │
+                                   │  • merge into current norm   │
+  ┌──────┐  jittered call-home     │  • version the result        │
+  │Node B├─────────────────────────►                              │
+  └──────┘                         │         HQ                   │
+                                   │                              │
+  ┌──────┐  jittered call-home     │  GET /engram?since=v17       │
+  │Node C├─────────────────────────►  • return current merged     │
+  └──────┘  (fetch latest norm)    │    engram if newer than v17  │
+                                   │  • 304 Not Modified if same  │
+  ┌──────┐  boot / restart         │                              │
+  │Node D├─────────────────────────►  GET /engram                 │
+  └──────┘  (cold start)           │  • return current merged     │
+                                   └──────────────────────────────┘
 ```
 
-- **Pull model**: HQ polls nodes on a schedule (e.g., every 5 minutes)
-- **Push model**: nodes push to HQ after significant manifold changes
-  (threshold shift > N%, warmup complete)
-- **Distribution**: nodes fetch merged engram on boot, or HQ pushes after
-  each merge cycle
+**Host behavior:**
+- Each host runs a background timer with jittered interval (e.g., 1-5 min)
+- On tick: POST local engram to HQ, then GET latest merged engram
+- If the fetched engram is newer than the local one, adopt it as the new
+  baseline and republish to the proxy via ArcSwap
+- If HQ is unreachable, continue operating on local engram — fully
+  autonomous. Retry on next tick. No degradation.
+- On boot: GET engram from HQ. If HQ unreachable, fall back to local
+  disk engram. If neither exists, cold-start from warmup.
+
+**HQ behavior:**
+- Stateless merge service. Receives engrams, incorporates into the
+  current norm, serves the result.
+- Every merge produces a new **version** (monotonic counter or content
+  hash). Hosts report which version they're running. HQ can track
+  fleet convergence (how many hosts are on the current version vs
+  lagging).
+- Merge is incremental: each incoming engram is folded into the
+  current merged state, not recomputed from scratch.
+
+### Versioned engrams and rollback
+
+Every merged engram gets a version tag. HQ retains a history of versions.
+This enables:
+
+**Urgent rollback:** If a bad merge poisons the fleet norm (compromised
+node, application deploy that changed traffic patterns), an operator
+issues a rollback command to HQ:
+
+```
+PUT /engram/active?version=v15    ← revert to known-good version
+PUT /engram/freeze                ← disable auto-merging
+```
+
+HQ pins the active engram to v15 and stops accepting new merges. Hosts
+continue their normal jittered call-home cycle. On their next GET, they
+receive v15. Fleet converges to the rolled-back state organically — no
+push, no coordination, no urgency. The jitter spread means the fleet
+updates over seconds to minutes, not all at once.
+
+**Resume:** Once the issue is resolved:
+
+```
+DELETE /engram/freeze             ← resume auto-merging
+```
+
+HQ begins accepting and merging incoming host engrams again. The fleet
+resumes its normal adaptive cycle.
+
+**Version history uses:**
+- **Audit trail**: which nodes contributed to each version, when
+- **Diffing**: compare v15 and v16 to understand what changed (which
+  node's engram shifted the norm, by how much)
+- **Canary deployments**: pin a subset of hosts to a new version, monitor
+  FP rates, promote to fleet-wide if clean
+- **Correlation with deploys**: if a code deploy changes traffic patterns,
+  the version history shows exactly when the norm shifted and by how much
+
+### Resilience properties
+
+The async host-initiated model provides resilience at every failure mode:
+
+| Failure | Behavior |
+|---------|----------|
+| HQ down | Hosts operate autonomously on local engrams. No degradation. |
+| Network partition | Same as HQ down — local autonomy. Rejoin and sync on reconnect. |
+| Host crash | Restarts, loads disk engram, calls home for latest. |
+| Bad merge at HQ | Operator rolls back to prior version. Fleet converges on next call-home. |
+| Compromised node | HQ validates incoming engrams (threshold bounds, eigenvector norms). Reject outliers. |
+| Stale host | HQ tracks version per host. Alert on hosts that haven't called home in N intervals. |
+| Clock skew | Irrelevant — versioning is sequential (monotonic), not timestamp-based. |
 
 ### Interaction with other investigations
 
@@ -763,64 +834,93 @@ grows too large for per-request compute budget.
 
 ### Deployment model: Passive → Federated → Enforcement
 
-The self-calibrating thresholds (Section 6) enable a zero-tuning deployment:
+The self-calibrating thresholds (Section 6) and async call-home protocol
+enable a zero-tuning deployment lifecycle:
 
 **Phase 1: Passive observation (1-2 weeks per fleet)**
 - Deploy spectral firewall in **monitor-only mode** across all app nodes
 - Each node learns its normal baseline from live traffic
 - Thresholds self-calibrate from the residual buffer — no human tuning
 - Log verdicts but don't enforce — build confidence in the model
+- Hosts begin calling home to HQ immediately — engrams accumulate,
+  HQ merges continuously, version history begins building
 - Validates: false positive rate, coverage of client diversity, threshold
   stability under real traffic patterns
 
 **Phase 2: Federated convergence (HQ merge cycle)**
-- HQ collects engrams from all nodes (pull or push model)
-- Merges via subspace union (start simple) or eigenvector averaging
-- Redistributes the merged engram as the fleet-wide cold-boot baseline
-- Every node now carries the collective intelligence of the fleet:
-  - Node A saw mobile traffic → all nodes know mobile patterns
-  - Node B saw API consumers → all nodes recognize API structure
-  - Node C saw browser diversity → all nodes handle browser variance
-- The merged engram's residual distribution reflects fleet-wide diversity,
-  so the geometric-mean deny threshold is naturally calibrated for the
-  full population
+- HQ has been merging incoming engrams throughout Phase 1
+- Operator reviews convergence metrics: version churn rate, threshold
+  variance across hosts, FP rates in monitor logs
+- When stable: the merged engram represents the fleet's collective
+  understanding of normal traffic
+- Every node already has a recent version from their call-home cycle —
+  no "big bang" distribution event needed
 
 **Phase 3: Confident enforcement**
-- Flip nodes to enforcement mode — deny/rate-limit anomalous traffic
+- Flip nodes to enforcement mode (env var, config push, or HQ flag
+  in the engram response)
+- Nodes that haven't called home yet stay in monitor mode until they
+  do — fleet transitions gradually via the existing jitter cycle
 - New/restarting nodes boot from the merged engram, enforce immediately
 - No warmup vulnerability, no cold-start false positives
 - Adaptive learning continues refining per-node baselines
-- HQ continues merging and redistributing periodically
+- HQ continues merging and versioning — the norm evolves with the fleet
+
+**Phase 4: Steady state**
+- Hosts and HQ update each other fully async, reliably, with resilience
+- Traffic pattern changes (deploys, new client types, seasonal drift)
+  are absorbed locally by adaptive learning, then federated to HQ,
+  then distributed to the fleet on their next call-home
+- If something goes wrong: operator pins HQ to a prior version and
+  freezes merging. Fleet converges to the safe version organically.
+  No emergency push. No coordination. Just the normal call-home cycle.
 
 **Why this works:** The spectral firewall learns "what normal looks like"
 from pure geometry — no attack signatures, no rules, no CVE databases.
 The fleet collectively observes the full diversity of legitimate traffic.
-Federation shares that collective observation. Self-calibrating thresholds
-mean no per-deployment tuning. The result is a firewall that's never been
-told about any attack but denies 99%+ of vulnerability scanners by
-recognizing that attack traffic is geometrically alien to the learned
-normal subspace.
+Federation shares that collective observation via async jittered call-home
+— no central push infrastructure, no fleet coordination, no real-time
+dependency on HQ. Self-calibrating thresholds mean no per-deployment
+tuning. Versioned engrams mean instant rollback. The result is a firewall
+that's never been told about any attack but denies 99%+ of vulnerability
+scanners, tunes itself, and self-reproduces across a fleet of any size.
 
 ### Open questions
 
 1. **Staleness**: how old can a merged engram be before it hurts more than
    it helps? Traffic patterns change — a 24-hour-old engram may encode
-   yesterday's deployment, not today's.
+   yesterday's deployment, not today's. Mitigated by continuous merging:
+   if hosts call home every 1-5 minutes, the norm is never more than
+   a few minutes stale relative to the fleet.
 2. **Poisoning at scale**: if one compromised node sends a corrupted engram
    to HQ, it could poison the entire fleet. Mitigation: HQ validates
-   incoming engrams (e.g., reject if threshold is anomalously low/high,
-   or if eigenvectors are near-zero).
+   incoming engrams (threshold bounds, eigenvector norms, sample count).
+   Reject statistical outliers. Versioned history means a poisoned merge
+   can be rolled back instantly.
 3. **Heterogeneous services**: if different nodes serve different
    applications (API vs web vs mobile), merging their engrams may produce
-   an overly permissive baseline. May need per-service-class federation
-   rather than fleet-wide.
+   an overly permissive baseline. Solution: per-service-class federation.
+   HQ runs independent merge tracks per service tag. Hosts report their
+   service class on call-home.
 4. **Transport**: engram serialization format and size. Current engram
    files are compact (eigenvectors + metadata). Fits comfortably in an
-   HTTP POST body.
+   HTTP POST/GET body. At fleet scale (millions of hosts), HQ can serve
+   the merged engram from CDN/S3 — it's a static blob that changes on
+   merge, not per-request.
 5. **Monitor-only mode**: needs implementation — log verdicts without
-   applying deny/rate-limit actions. Could be a simple CLI flag or
-   env var on the proxy.
+   applying deny/rate-limit actions. Could be a simple CLI flag, env var,
+   or a field in the HQ engram response (`"enforce": false`).
 6. **Convergence metrics**: how does HQ know when the fleet has converged
-   enough to recommend enforcement? Possible signals: threshold stability
-   (variance of deny_threshold across nodes), false positive rate in
-   monitor logs, engram similarity between merge cycles.
+   enough to recommend enforcement? Signals: version adoption rate (% of
+   fleet on current version), threshold variance across hosts, FP rate
+   in monitor logs, engram similarity between merge cycles, churn rate
+   (how much the norm changes per merge).
+7. **Call-home jitter tuning**: optimal interval range for different fleet
+   sizes. 1-5 minutes for thousands of hosts. May need wider jitter
+   (5-15 min) for millions to avoid HQ thundering herd at scale.
+8. **Partial rollback**: can HQ roll back a specific service class while
+   others continue updating? Useful when one application deploys but
+   others are stable.
+9. **Engram diffing**: tooling to compare two engram versions — which
+   eigenvectors shifted, by how much, which stripes changed. Useful for
+   understanding what a deploy or traffic change did to the norm.

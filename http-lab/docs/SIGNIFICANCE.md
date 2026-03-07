@@ -145,18 +145,27 @@ logic* that tunes the constructor's sensitivity. No human sets parameters.
 
 ### Fleet-level self-reproduction
 
-The HQ federation model completes the von Neumann analogy at fleet scale:
+The HQ federation model completes the von Neumann analogy at fleet scale.
+
+Hosts and HQ update each other fully async. There is no push, no poll, no
+coordination. Each host runs a jittered timer and periodically calls home:
+report its local engram, fetch the latest merged norm. HQ merges incoming
+engrams continuously, versions the result, and serves it on request.
 
 ```
-Node A observes → compresses into engram → sends to HQ
-Node B observes → compresses into engram → sends to HQ
-                                            ↓
-                                    HQ merges engrams
-                                            ↓
-                              merged engram distributed to fleet
-                                            ↓
-Node C (new) boots from merged engram → enforces immediately
-                    → continues observing → refines → feeds back to HQ
+Node A ──(jittered call-home)──► HQ
+  POST local engram                 │ merge into current norm
+  GET  latest merged engram    ◄────┘ return versioned result
+
+Node B ──(jittered call-home)──► HQ
+  POST local engram                 │ merge
+  GET  latest merged engram    ◄────┘
+
+Node C ──(boot / restart)──────► HQ
+  GET  latest merged engram    ◄──── return current norm
+  → enforce immediately
+  → begin observing
+  → call home on next jitter tick
 ```
 
 Each node is a self-reproducing automaton: it observes its environment,
@@ -164,18 +173,39 @@ constructs a description of that environment (the engram), and that
 description can be copied to other nodes where it functions as a complete
 enforcement program. The fleet collectively self-reproduces its security
 posture. A node that crashes and restarts loads its saved engram (local
-self-reproduction). A new node joining the fleet loads the merged engram
-(federated reproduction). In both cases, the engram is simultaneously
-the knowledge being transferred and the program that acts on it.
+self-reproduction). A new node joining the fleet fetches the merged engram
+from HQ (federated reproduction). In both cases, the engram is
+simultaneously the knowledge being transferred and the program that acts
+on it.
+
+Every merge at HQ produces a new version. This gives version control over
+the fleet's security posture:
+
+- **Rollback**: pin HQ to a prior known-good version, freeze merging.
+  Hosts converge to the safe version on their next call-home — no
+  emergency push, no coordination, just the normal jitter cycle.
+- **Resume**: unfreeze merging. Hosts resume reporting. The norm begins
+  evolving again.
+- **Audit**: version history shows exactly when the norm shifted, which
+  nodes contributed, and by how much. Correlate with deploys, incidents,
+  traffic changes.
 
 Von Neumann proved that self-reproducing systems require a description
 that serves as both interpreted program and uninterpreted data. The engram
 satisfies this: it is interpreted (matrix multiplication against request
 vectors produces verdicts) and copied uninterpreted (serialized to disk,
-sent over the network to HQ, distributed to peers — the bytes are preserved
+sent over the network to HQ, fetched by peers — the bytes are preserved
 verbatim). This is the structural reason the system works without a warmup
 vulnerability: the description carries everything needed to enforce, and
 copying it is lossless.
+
+The async, host-initiated protocol means HQ is never a bottleneck and
+never a single point of failure. If HQ is down, hosts continue enforcing
+on their local engrams with zero degradation. When HQ recovers, the next
+call-home cycle resynchronizes the fleet. At scale — tens of millions of
+hosts — HQ serves the merged engram as a static blob (CDN, S3, whatever
+serves files). No per-request dependency. No real-time path. Just a
+file that changes when the norm evolves.
 
 ## The Inversion
 
