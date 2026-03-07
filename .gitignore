@@ -8,3 +8,16 @@ agent_logs/
 
 # Target build artifacts
 target/
+
+# Rust lock files (generated, not library crates)
+Cargo.lock
+
+# Runtime artifacts
+certs/
+engrams/
+logs/
+
+# Generated scenario data
+veth-lab/scenarios/*.edn
+veth-lab/scenarios/*.json
+veth-lab/filter-ebpf/Cargo.lock
