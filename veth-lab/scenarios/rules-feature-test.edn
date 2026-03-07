@@ -1,0 +1,19 @@
+{:constraints [(= proto 17)] :actions [(count :name ["monitor", "udp-total"])] :priority 50 :comment "Count all UDP packets (non-terminating)"}
+{:constraints [(= proto 17) (= dst-port 53)] :actions [(count :name ["monitor", "dns-queries"])] :priority 60 :comment "Count DNS queries (non-terminating)"}
+{:constraints [(= proto 17) (= dst-port 123)] :actions [(count :name ["monitor", "ntp-packets"])] :priority 60 :comment "Count NTP packets (non-terminating)"}
+{:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.100")] :actions [(rate-limit 1000 :name ["attack", "dns-amp"])] :priority 200 :comment "DNS amp from 10.0.0.100 - shared bucket"}
+{:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.101")] :actions [(rate-limit 1000 :name ["attack", "dns-amp"])] :priority 200 :comment "DNS amp from 10.0.0.101 - shared bucket"}
+{:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.102")] :actions [(rate-limit 1000 :name ["attack", "dns-amp"])] :priority 200 :comment "DNS amp from 10.0.0.102 - shared bucket"}
+{:constraints [(= proto 17) (= dst-port 123) (= src-addr "10.0.0.110")] :actions [(rate-limit 500 :name ["attack", "ntp-amp"])] :priority 200 :comment "NTP amp from 10.0.0.110 - shared bucket"}
+{:constraints [(= proto 17) (= dst-port 123) (= src-addr "10.0.0.111")] :actions [(rate-limit 500 :name ["attack", "ntp-amp"])] :priority 200 :comment "NTP amp from 10.0.0.111 - shared bucket"}
+{:constraints [(= proto 17) (= src-addr "10.0.0.120")] :actions [(rate-limit 100)] :priority 150 :comment "Per-rule limiter for 10.0.0.120"}
+{:constraints [(= proto 17) (= src-addr "10.0.0.121")] :actions [(rate-limit 100)] :priority 150 :comment "Per-rule limiter for 10.0.0.121"}
+{:constraints [(= proto 17) (= src-addr "10.0.0.122")] :actions [(rate-limit 100)] :priority 150 :comment "Per-rule limiter for 10.0.0.122"}
+{:constraints [(= proto 17) (= dst-port 9999)] :actions [(count :name ["monitor", "port-9999"])] :comment "Count traffic to 9999 (non-terminating)"}
+{:constraints [(= proto 17) (= dst-port 9999) (= src-addr "10.0.0.200")] :actions [(rate-limit 50 :name ["attack", "flood-9999"])] :priority 250 :comment "Rate-limit 10.0.0.200 to port 9999 - shared bucket"}
+{:constraints [(= proto 17) (= dst-port 9999) (= src-addr "10.0.0.201")] :actions [(rate-limit 50 :name ["attack", "flood-9999"])] :priority 250 :comment "Rate-limit 10.0.0.201 to port 9999 - shared bucket"}
+{:constraints [(= proto 6) (= src-addr "10.0.0.220")] :actions [(pass)] :priority 50}
+{:constraints [(= proto 6) (= src-addr "10.0.0.221")] :actions [(pass)] :priority 50}
+{:constraints [(= proto 6) (= src-addr "10.0.0.222")] :actions [(pass)] :priority 50}
+{:constraints [(= proto 6) (= src-addr "10.0.0.223")] :actions [(pass)] :priority 50}
+{:constraints [(= proto 6) (= src-addr "10.0.0.224")] :actions [(pass)] :priority 50}

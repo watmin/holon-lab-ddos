@@ -9,13 +9,10 @@ agent_logs/
 # Target build artifacts
 target/
 
-# Rust lock files (generated, not library crates)
-Cargo.lock
-
 # Runtime artifacts
 certs/
 engrams/
 logs/
 
-# veth-lab build artifacts
-veth-lab/filter-ebpf/Cargo.lock
+# Generated large rule sets (exceed GitHub 100MB limit)
+veth-lab/scenarios/rules-1m.*

@@ -1,0 +1,19 @@
+{:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.100")] :actions [(rate-limit 1000 :name ["attack", "dns-amp"])] :priority 90 :comment "DNS amp from 10.0.0.100 - shared bucket"}
+{:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.101")] :actions [(rate-limit 1000 :name ["attack", "dns-amp"])] :priority 90 :comment "DNS amp from 10.0.0.101 - shared bucket"}
+{:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.102")] :actions [(rate-limit 1000 :name ["attack", "dns-amp"])] :priority 90 :comment "DNS amp from 10.0.0.102 - shared bucket"}
+{:constraints [(= proto 17) (= dst-port 123) (= src-addr "10.0.0.110")] :actions [(rate-limit 500 :name ["attack", "ntp-amp"])] :priority 90 :comment "NTP amp from 10.0.0.110 - shared bucket"}
+{:constraints [(= proto 17) (= dst-port 123) (= src-addr "10.0.0.111")] :actions [(rate-limit 500 :name ["attack", "ntp-amp"])] :priority 90 :comment "NTP amp from 10.0.0.111 - shared bucket"}
+{:constraints [(= proto 17) (= dst-port 53) (= src-addr "10.0.0.103")] :actions [(rate-limit 2000 :name ["attack", "dns-amp"])] :priority 90 :comment "DNS amp with different PPS - should warn"}
+{:constraints [(= proto 17) (= src-addr "10.0.0.120")] :actions [(rate-limit 100)] :priority 80 :comment "Unnamed limiter - per-rule bucket"}
+{:constraints [(= proto 17) (= src-addr "10.0.0.121")] :actions [(rate-limit 100)] :priority 80 :comment "Unnamed limiter - per-rule bucket"}
+{:constraints [(= proto 17) (= src-addr "10.0.0.122")] :actions [(rate-limit 100)] :priority 80 :comment "Unnamed limiter - per-rule bucket"}
+{:constraints [(= proto 6) (= src-addr "10.0.0.200")] :actions [(pass)] :priority 50}
+{:constraints [(= proto 6) (= src-addr "10.0.0.201")] :actions [(pass)] :priority 50}
+{:constraints [(= proto 6) (= src-addr "10.0.0.202")] :actions [(pass)] :priority 50}
+{:constraints [(= proto 6) (= src-addr "10.0.0.203")] :actions [(pass)] :priority 50}
+{:constraints [(= proto 6) (= src-addr "10.0.0.204")] :actions [(pass)] :priority 50}
+{:constraints [(= proto 6) (= src-addr "10.0.0.205")] :actions [(pass)] :priority 50}
+{:constraints [(= proto 6) (= src-addr "10.0.0.206")] :actions [(pass)] :priority 50}
+{:constraints [(= proto 6) (= src-addr "10.0.0.207")] :actions [(pass)] :priority 50}
+{:constraints [(= proto 6) (= src-addr "10.0.0.208")] :actions [(pass)] :priority 50}
+{:constraints [(= proto 6) (= src-addr "10.0.0.209")] :actions [(pass)] :priority 50}
