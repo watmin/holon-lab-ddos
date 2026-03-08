@@ -267,3 +267,32 @@ system can operate without human calibration:
 - **Concurrent mixed workload**: real browser agents with LLM-driven
   navigation alongside professional vulnerability scanners, all hitting
   the same proxy through diverse source IPs
+
+### Threshold strategy validation (March 8)
+
+The geometric mean deny_threshold was selected pragmatically during the
+March 7 death spiral fix. To validate this choice rigorously:
+
+1. **Enumerated** 21 threshold strategies from the literature and design
+   discussion (geometric, harmonic, arithmetic, power means, Lehmer,
+   heronian, contraharmonic, log mean, quantile, MAD, Chebyshev, EWMA,
+   CUSUM, Kalman, etc.)
+2. **Simulated** 28 variants across 20,000-step streams in two parameter
+   regimes — eliminated 16 based on FPR collapse, recall failure, known
+   death spiral, or reintroduction of magic numbers
+3. **Live-tested** 5 survivors against DVWA + 3 scanners + 20 LLM browsers
+   — eliminated `mean_3std` (28.8% FPR, death spiral)
+4. **Multi-round validation** (5-7 rounds) of the 4 finalists for
+   statistical confidence — in progress
+
+Key finding: **temporal FP distribution** is more informative than total FP
+count. A strategy with 20 FPs in the first 60s but zero after settling is
+superior to one with 5 FPs scattered through the run.
+
+**Result (7-round validation):** `log_mean` selected as default — 1.9% avg
+FPR (vs 3.3% geometric), 43% fewer FPs, 45% fewer late FPs. The logarithmic
+mean `(c - m) / ln(c/m)` provides the optimal balance between headroom for
+legitimate traffic diversity and tightness against attacks.
+
+Final isolation funnel: 21 → 5 (simulation) → 4 (round 1 live) → 1 (7-round
+statistical validation). Zero magic numbers in the final formula.

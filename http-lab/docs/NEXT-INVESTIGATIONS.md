@@ -610,16 +610,22 @@ tracks confirmed-normal traffic.
 ```
 ResidualBuffer (VecDeque<f64>, capacity=500)
 ├── Admission gate: residual < CCIPCA_threshold AND backend_ok (2xx/3xx)
-├── score_threshold = buf_max                    (empirical allow ceiling)
-└── deny_threshold  = sqrt(buf_max × CCIPCA_thr) (geometric mean, no multiplier)
+├── score_threshold = buf_max                              (empirical allow ceiling)
+└── deny_threshold  = (c - m) / ln(c / m)                 (logarithmic mean, no multiplier)
 ```
 
-**Why the geometric mean works:**
+**Why the logarithmic mean works:**
 
 The two data-derived boundaries — `buf_max` (tight, empirical) and
 `CCIPCA_threshold` (loose, statistical) — bracket the true anomaly boundary.
-Their geometric mean places the deny line proportionally between them without
-a hardcoded multiplier:
+The logarithmic mean places the deny line between them without a hardcoded
+multiplier. It sits between the geometric and arithmetic means for any two
+positive values (`geometric < log_mean < arithmetic`), providing more
+headroom than geometric for post-warmup browser variation while staying
+tight enough to deny attacks.
+
+Selected via a 7-round live sweep of 21 strategies (see below):
+1.9% avg FPR, 43% fewer FPs than geometric, 45% fewer late FPs.
 
 - Early (sparse buffer): buf_max is small, CCIPCA is large → generous deny
   threshold, prevents death spiral where denied traffic can't feed learning
@@ -635,10 +641,12 @@ during warmup), causing:
 1. Hard deny → no backend forwarding → no learning → buffer frozen
 2. Threshold stays tight → more denies → repeat
 
-The geometric mean (`sqrt(8.39 × 121) = 31.9`) broke this cycle — browsers
-at 22 pass through as rate-limited (not denied), while attacks at 90 are
-firmly denied. Rate-limited traffic still gets forwarded, feeding adaptive
-learning and growing the buffer.
+The geometric mean (`sqrt(8.39 × 121) = 31.9`) initially broke this cycle.
+Later replaced by the logarithmic mean (`(121 - 8.39) / ln(121/8.39) = 42.0`)
+after a 7-round sweep showed it settles faster with fewer false positives.
+Both place the deny line between buf_max and CCIPCA without magic numbers.
+Browsers at 22 pass through as rate-limited (not denied), while attacks at
+90 are firmly denied.
 
 **Remaining operational constants** (not decision boundaries):
 - `RESIDUAL_BUFFER_CAPACITY=500`, `RESIDUAL_BUFFER_MIN_SAMPLES=50` — buffer sizing
@@ -649,6 +657,109 @@ learning and growing the buffer.
 **Validation:** 20 LLM browsers + 3 scanners, WARMUP_SAMPLES=100. 5,118 attack
 denies, 48 browser FPs (27 early settling + 18 Firefox minority + 3 POSTs),
 manual Chrome browsing had ~3 initial FPs then zero. 99.1% precision.
+
+### Threshold strategy sweep (March 8, 2026)
+
+The geometric mean was selected pragmatically during the death spiral fix.
+To validate this choice rigorously, a systematic sweep of 21 threshold
+strategies was conducted.
+
+#### Phase 1: Simulation sweep
+
+`scripts/threshold_sweep.py` — 28 strategy variants evaluated over 20,000-step
+simulated traffic streams, 2 buffer sizes (256, 512), 3 poisoning rates
+(0%, 1%, 5%). Two parameter regimes:
+
+- **Generic**: normal ~N(0.4, 0.3), attack ~N(3.5, 1.2), CCIPCA 2.5→0.85
+- **Calibrated** (actual spectral firewall regime): normal ~N(5.0, 2.0),
+  attack ~N(95, 15), poison ~N(15, 3), CCIPCA 120→100
+
+#### Phase 2: Elimination (16 of 21 strategies cut)
+
+Calibrated sweep at buf=512, poison=5%:
+
+| Eliminated | Strategies | Reason |
+|------------|-----------|--------|
+| FPR=100% | harmonic, minimum, power_p-1, geometric*, entropy_mod | Threshold collapses to ~0 during cold start |
+| FPR > 20% | buf_max_only, quantile_95/99/999, median_blend, mean_2std | Thresholds too low, excessive false positives |
+| Recall < 80% | ccipca_only, max_only, weighted_30_70, power_p5, lehmer_p2, contraharmonic, chebyshev, power_p2 | Threshold too high, misses attacks |
+| Death spiral | buf_max_2x | Proven failure in prior live run (threshold=16.78, browsers at 17-22 denied) |
+| Magic numbers | weighted_70_30 | Hardcoded 0.7/0.3 weights — reintroduces the problem we solved |
+
+*geometric showed FPR=100% due to cold-start collapse in simulation
+(sqrt(0 * 110) → 0). Real code has cold-start fallback to infinity when
+buffer < 50 samples. Simulation overstates weakness but relative ranking
+between strategies at steady state remains informative.
+
+#### Phase 3: Live validation candidates (5 survivors)
+
+All parameter-free. Span a range of deny thresholds at buf_max=8, CCIPCA=120:
+
+| Strategy | Formula | Threshold | Family |
+|----------|---------|-----------|--------|
+| geometric (current) | `sqrt(m × c)` | 31 | Mean of two values |
+| log_mean | `(c - m) / ln(c/m)` | 41 | Logarithmic mean |
+| heronian | `(m + c + sqrt(m×c)) / 3` | 53 | Classical geometry |
+| arithmetic | `(m + c) / 2` | 64 | Simple average |
+| mean_3std | `mean(buf) + 3σ` | ~11 | Buffer statistics only |
+
+Live validation: run each strategy against DVWA + Nikto/ZAP/Nuclei with
+20 LLM browser agents. Compare attack denies, browser FPs, and adaptive
+learning behavior under identical conditions.
+
+#### Round 1 results
+
+| Strategy | Attack denies | Browser FP | FP rate | deny_thr | FP_WHEN |
+|----------|--------------|-----------|---------|----------|---------|
+| geometric | 4,455 | 18 | 1.6% | 29.75 | early+mid |
+| log_mean | 4,255 | 14 | 1.2% | 37.36 | early+mid |
+| heronian | 5,846 | 17 | 1.5% | 46.12 | **LATE(2)** |
+| arithmetic | 4,857 | 16 | 1.4% | 57.00 | early+mid |
+| mean_3std | 4,237 | **329** | **28.8%** | 7.96 | **LATE(87)** |
+
+`score_threshold` ≈ 7-8 across all strategies (buffer-max, strategy-independent).
+
+**`mean_3std` eliminated** — 28.8% FPR, 87 late FPs, deny_threshold of 7.96
+is below normal browser traffic. Death spiral: only 20 adaptive learns vs.
+42-47 for others. Buffer-only statistics without CCIPCA anchoring cannot
+produce a viable deny boundary in this regime.
+
+**Temporal FP analysis (key insight)**:
+
+The *when* of false positives matters more than the count. A strategy with
+10 FPs in the first 30s but zero after settling is superior to one with 2
+FPs scattered through the run.
+
+- **log_mean**: fastest settling (last FP at +85s), fewest total FPs (14),
+  zero late. All 12 early FPs are warmup settling.
+- **geometric**: last FP at +126s, 10 early + 8 during attacks, zero late.
+- **arithmetic**: last FP at +127s, 14 early + 2 during, zero late.
+- **heronian**: 2 **late** FPs at +128s and +145s (after attacks ended).
+  Highest attack deny count (5,846) but post-attack FPs are disqualifying.
+
+4 survivors carried forward to multi-round validation.
+
+#### Multi-round results (7 rounds × 4 strategies = 28 runs)
+
+| Strategy | Avg ATK deny | Avg FP | Avg FPR | Avg deny_thr | Late=0 | Avg late | Max late | FP range |
+|----------|-------------|--------|---------|-------------|--------|---------|---------|----------|
+| **log_mean** | **4,613** | **21.7** | **1.9%** | **37.3** | 1/7 | **2.7** | 8 | 6-43 |
+| arithmetic | 4,750 | 24.6 | 2.2% | 54.9 | 2/7 | 4.4 | 8 | 14-37 |
+| geometric | 4,898 | 38.1 | 3.3% | 26.6 | 1/7 | 4.9 | 8 | 19-57 |
+| heronian | 5,613 | 37.4 | 3.3% | 45.0 | 2/7 | 7.3 | **24** | 3-88 |
+
+**`heronian` eliminated** — max_late=24 and max_fp=88 in a single round.
+Highest attack deny count (5,613 avg) doesn't justify the instability.
+
+**Winner: `log_mean`** — lowest avg FPR (1.9%), lowest avg late FPs (2.7),
+fastest settling. Outperforms geometric on every FP dimension while
+maintaining comparable attack coverage. Default changed from `geometric`
+to `log_mean`.
+
+The logarithmic mean `(c - m) / ln(c/m)` sits between the geometric and
+arithmetic means for any two positive values. It provides more headroom
+than geometric for post-warmup browser variation (threshold ~37 vs ~27)
+while staying tighter than arithmetic (~55), keeping attacks firmly denied.
 
 ---
 

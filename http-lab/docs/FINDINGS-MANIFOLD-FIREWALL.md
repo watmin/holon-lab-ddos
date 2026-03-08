@@ -469,13 +469,13 @@ Layer 0 allow gate. The CCIPCA threshold was ~103-121 (12-15x the actual max
 normal residual of ~8), letting attack traffic with residuals of 90 pass
 through as "normal."
 
-#### 4. Geometric mean deny_threshold (deny floor)
+#### 4. Data-derived deny_threshold (deny floor)
 
-`deny_threshold = sqrt(buf_max × CCIPCA_threshold)` — the geometric mean of
-the tight empirical ceiling and the loose statistical ceiling. No hardcoded
-multiplier.
+Initially `deny_threshold = sqrt(buf_max × CCIPCA_threshold)` — the geometric
+mean. Later replaced by `log_mean` after a 7-round sweep of 21 strategies
+(see March 8 session). No hardcoded multiplier in either formula.
 
-This replaced the previous `buf_max * 2.0` multiplier which was:
+The geometric mean replaced the previous `buf_max * 2.0` multiplier which was:
 - Too tight during early convergence (buf_max=8.39 → deny=16.78, but normal
   post-warmup browser residuals reached 17-22, causing a death spiral where
   denied traffic couldn't feed adaptive learning)
@@ -589,6 +589,117 @@ This eliminates the "warmup window" vulnerability entirely — new nodes boot
 from the fleet-wide engram and enforce immediately. The self-calibrating
 thresholds mean no human needs to tune parameters per deployment.
 
+## Session: March 8, 2026 — Threshold Strategy Sweep
+
+Systematic evaluation of the deny_threshold formula. The geometric mean
+was selected pragmatically during the death spiral fix (March 7). This
+session validates that choice against all reasonable alternatives.
+
+### Methodology: 3-phase isolation funnel
+
+#### Phase 1: Enumerate (21 strategies)
+
+Every threshold strategy discussed across the design process: geometric,
+harmonic, arithmetic, weighted blends, power means (p=-1 through p=5),
+Lehmer, heronian, contraharmonic, log mean, quantile-based (95/99/99.9),
+mean+Nσ (2σ, 3σ), MAD, Chebyshev/Cantelli, median blend, entropy-modified,
+CUSUM, Kalman, EWMA, dynamic feedback, buf_max multiples, ccipca-only.
+
+#### Phase 2: Simulate (21 → 5)
+
+`scripts/threshold_sweep.py` — 28 variants across 20,000-step streams,
+two parameter regimes (generic + calibrated to actual spectral firewall
+numbers: normal ~N(5,2), attack ~N(95,15), CCIPCA ~100-120), 2 buffer
+sizes, 3 poisoning rates.
+
+16 eliminated:
+- **FPR=100%**: harmonic, minimum, power_p-1, entropy_mod (cold-start collapse)
+- **FPR > 20%**: buf_max_only, quantile_95/99/999, median_blend, mean_2std
+- **Recall < 80%**: ccipca_only, max_only, weighted_30_70, power_p5, lehmer_p2,
+  contraharmonic, chebyshev, power_p2
+- **Known failure**: buf_max_2x (death spiral proven in live run)
+- **Magic numbers**: weighted_70_30 (hardcoded weights)
+
+#### Phase 3: Live validation (5 → 4, then multi-round)
+
+Each survivor tested against DVWA + Nikto/ZAP/Nuclei with 20 LLM browser
+agents, WARMUP_SAMPLES=100, shortened timeouts.
+
+**Round 1 results:**
+
+```
+STRATEGY       ATTACK_DENY BROWSER_FP  FP_RATE   DENY_THR      FP_WHEN
+geometric             4455         18     1.6%      29.75    early+mid
+log_mean              4255         14     1.2%      37.36    early+mid
+heronian              5846         17     1.5%      46.12      LATE(2)
+arithmetic            4857         16     1.4%      57.00    early+mid
+mean_3std             4237        329    28.8%       7.96     LATE(87)
+```
+
+**`mean_3std` eliminated** — deny_threshold of 7.96 is below normal browser
+residuals (~8-22). 329 FPs, 87 late, death spiral with only 20 adaptive
+learns (vs. 42-47 for others). Buffer-only statistics without CCIPCA
+anchoring fail in this regime.
+
+### Key insight: temporal FP distribution
+
+The *when* matters more than the count. Early-settling FPs (first 60s after
+warmup) are expected — the manifold hasn't seen all pages yet. Late FPs
+(after scanners stop) indicate the strategy can't converge.
+
+| Strategy | Last FP | Early | During | Late | Assessment |
+|----------|---------|-------|--------|------|------------|
+| log_mean | +85s | 12 | 2 | **0** | Fastest settling |
+| geometric | +126s | 10 | 8 | 0 | Good but slower |
+| arithmetic | +127s | 14 | 2 | 0 | Comparable |
+| heronian | +145s | 14 | 1 | **2** | Late FPs concerning |
+
+### Implementation
+
+Single change point: `ResidualBuffer::deny_threshold()` in `sidecar/src/lib.rs`.
+`DENY_STRATEGY` env var selects the formula. Five strategies implemented:
+
+```rust
+match self.strategy.as_str() {
+    "log_mean"   => (c - m) / (c.ln() - m.ln()),
+    "heronian"   => (m + c + (m * c).sqrt()) / 3.0,
+    "arithmetic" => (m + c) / 2.0,
+    "mean_3std"  => self.buf_mean() + 3.0 * self.buf_std(),
+    _            => (m * c).sqrt(),  // "geometric" (default)
+}
+```
+
+### Multi-round validation (7 rounds × 4 strategies = 28 runs)
+
+```
+STRATEGY     AVG_ATK  AVG_FP AVG_FPR AVG_DTH  LATE=0 AVG_LAT MAX_LAT  FP_RANGE
+geometric       4898    38.1    3.3%    26.6     1/7     4.9       8     19-57
+log_mean        4613    21.7    1.9%    37.3     1/7     2.7       8      6-43
+heronian        5613    37.4    3.3%    45.0     2/7     7.3      24      3-88
+arithmetic      4750    24.6    2.2%    54.9     2/7     4.4       8     14-37
+```
+
+**`heronian` eliminated** — max_late=24 and max_fp=88 in a single round.
+Too unstable despite having the highest attack deny count.
+
+**Winner: `log_mean`**
+
+The logarithmic mean `(c - m) / ln(c/m)` outperformed geometric on every
+FP metric across 7 rounds:
+
+- 1.9% avg FPR vs 3.3% (42% reduction)
+- 21.7 avg FPs vs 38.1 (43% fewer)
+- 2.7 avg late FPs vs 4.9 (45% fewer)
+- Comparable attack coverage (4,613 vs 4,898 — the delta are rate-limited,
+  not allowed)
+
+The log mean sits between geometric and arithmetic for any two positive
+values: `geometric < log_mean < arithmetic`. This gives more headroom
+than geometric for post-warmup browser variation (threshold ~37 vs ~27)
+while staying tight enough to deny attacks (residuals ~90+).
+
+Default changed from `geometric` to `log_mean` in `sidecar/src/lib.rs`.
+
 ## What's Next
 
 - [x] Live test against DVWA with real Nikto scan — **Done. 9,788 denies, 0 vulns found.**
@@ -597,6 +708,7 @@ thresholds mean no human needs to tune parameters per deployment.
 - [x] Control experiment (Nikto without firewall) — **Done. 17 findings without, 0 with.**
 - [x] Multi-source-IP + concurrent mixed traffic — **Done. 20 LLM browsers + 3 scanners, 0 FP.**
 - [x] Derive sigma_mult / deny_mult / adaptive_gate from training data — **Done. Geometric mean + residual buffer.**
+- [x] Threshold strategy sweep — **Done. 21→5→4→1. log_mean selected via 7-round validation.**
 - [ ] Slow Nikto test (`-Pause 1`) — pure geometric detection without rate-limit triggers
 - [ ] Mimicry attack — real browser submitting SQLi through DVWA forms (find the boundary)
 - [ ] Measure spectral scoring overhead in isolation (microbenchmark without upstream)

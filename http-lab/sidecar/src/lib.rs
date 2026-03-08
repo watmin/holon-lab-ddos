@@ -138,16 +138,28 @@ use std::collections::VecDeque;
 
 /// Tracks the last N allowed+backend-success residuals for deriving the deny
 /// threshold from observed traffic. Replaces the hardcoded `threshold * 1.5`.
+///
+/// The deny threshold strategy is selectable via the `DENY_STRATEGY` env var:
+///   log_mean   — (ccipca - buf_max) / ln(ccipca / buf_max)  [default]
+///   geometric  — sqrt(buf_max × ccipca)
+///   heronian   — (buf_max + ccipca + sqrt(buf_max × ccipca)) / 3
+///   arithmetic — (buf_max + ccipca) / 2
+///   mean_3std  — mean(buf) + 3 × std(buf)           [buffer-only]
+///
+/// Selected via 7-round live sweep against DVWA + 3 scanners + 20 LLM browsers.
+/// log_mean: lowest avg FPR (1.9%), lowest avg late FPs (2.7), fastest settling.
 struct ResidualBuffer {
     buf: VecDeque<f64>,
     capacity: usize,
+    strategy: String,
 }
 
 impl ResidualBuffer {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, strategy: String) -> Self {
         Self {
             buf: VecDeque::with_capacity(capacity),
             capacity,
+            strategy,
         }
     }
 
@@ -166,6 +178,20 @@ impl ResidualBuffer {
         self.buf.len()
     }
 
+    fn buf_mean(&self) -> f64 {
+        if self.buf.is_empty() { return 0.0; }
+        self.buf.iter().sum::<f64>() / self.buf.len() as f64
+    }
+
+    fn buf_std(&self) -> f64 {
+        if self.buf.len() < 2 { return 0.0; }
+        let mean = self.buf_mean();
+        let variance = self.buf.iter()
+            .map(|x| (x - mean).powi(2))
+            .sum::<f64>() / (self.buf.len() - 1) as f64;
+        variance.sqrt()
+    }
+
     /// Allow ceiling: max observed residual from confirmed-normal traffic.
     /// Falls back to `fallback` (typically baseline.threshold()) when
     /// insufficient data.
@@ -176,17 +202,24 @@ impl ResidualBuffer {
         self.max().unwrap_or(fallback)
     }
 
-    /// Deny threshold: geometric mean of empirical max and CCIPCA threshold.
-    /// Places the deny boundary between the tight empirical ceiling and the
-    /// loose statistical ceiling — no hardcoded multiplier needed.
+    /// Deny threshold derived from the selected strategy.
     /// Returns infinity when insufficient data (< RESIDUAL_BUFFER_MIN_SAMPLES).
     fn deny_threshold(&self, baseline_threshold: f64) -> f64 {
         if self.buf.len() < RESIDUAL_BUFFER_MIN_SAMPLES {
             return f64::INFINITY;
         }
-        self.max()
-            .map(|m| (m * baseline_threshold).sqrt())
-            .unwrap_or(f64::INFINITY)
+        let m = self.max().unwrap_or(0.0);
+        let c = baseline_threshold;
+        match self.strategy.as_str() {
+            "geometric" => (m * c).sqrt(),
+            "heronian" => (m + c + (m * c).sqrt()) / 3.0,
+            "arithmetic" => (m + c) / 2.0,
+            "mean_3std" => self.buf_mean() + 3.0 * self.buf_std(),
+            _ => { // "log_mean" (default)
+                if (m - c).abs() < 1e-10 { m }
+                else { (c - m) / (c.ln() - m.ln()) }
+            }
+        }
     }
 }
 
@@ -210,7 +243,10 @@ pub async fn run(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(WARMUP_SAMPLES_REQ_DEFAULT);
-    info!("Sidecar starting (rule_ttl={}s, warmup_req={})", ttl, warmup_samples_req);
+    let deny_strategy: String = std::env::var("DENY_STRATEGY")
+        .unwrap_or_else(|_| "log_mean".to_string());
+    info!("Sidecar starting (rule_ttl={}s, warmup_req={}, deny_strategy={})",
+          ttl, warmup_samples_req, deny_strategy);
 
     let encoder = Arc::new(Encoder::new(VectorManager::new(VSA_DIM)));
     let stats = new_shared_stats();
@@ -284,7 +320,7 @@ pub async fn run(
     let mut adaptive_since_republish = 0usize;
 
     // Rolling residual buffer for continuous deny threshold calibration
-    let mut residual_buffer = ResidualBuffer::new(RESIDUAL_BUFFER_CAPACITY);
+    let mut residual_buffer = ResidualBuffer::new(RESIDUAL_BUFFER_CAPACITY, deny_strategy);
 
     // Layer 2: window-level spectrum tracking
     let mut req_window_tracker = WindowTracker::new(VSA_DIM, VSA_K, WINDOW_SIZE);
@@ -629,8 +665,8 @@ pub async fn run(
             let deny_thr = residual_buffer.deny_threshold(req_striped_baseline.threshold());
             let mstate = build_manifold_state(&req_striped_baseline, &current_threat_mode, baseline_rps, score_thr, deny_thr);
             manifold.store(Arc::new(mstate));
-            info!("[MANIFOLD] Initial state published (score_threshold={:.2}, deny_threshold={:.2}, buf_len={}, buf_max={:.2})",
-                  score_thr, deny_thr, residual_buffer.len(), residual_buffer.max().unwrap_or(0.0));
+            info!("[MANIFOLD] Initial state published (strategy={}, score_threshold={:.2}, deny_threshold={:.2}, buf_len={}, buf_max={:.2})",
+                  residual_buffer.strategy, score_thr, deny_thr, residual_buffer.len(), residual_buffer.max().unwrap_or(0.0));
         }
 
         // -------------------------------------------------------------------
