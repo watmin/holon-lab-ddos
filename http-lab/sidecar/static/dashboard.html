@@ -534,9 +534,15 @@
 
         if (state.lastMetrics) {
             const dt = Math.max(d.ts - state.lastMetrics.ts, 0.01);
-            passR = Math.max(0, (d.enforced_pass - state.lastMetrics.enforced_pass) / dt);
-            rlR   = Math.max(0, (d.enforced_rate_limits - state.lastMetrics.enforced_rate_limits) / dt);
-            blkR  = Math.max(0, (d.enforced_blocks - state.lastMetrics.enforced_blocks) / dt);
+            const prevPass = (state.lastMetrics.enforced_pass || 0) + (state.lastMetrics.manifold_allow || 0);
+            const prevRL   = (state.lastMetrics.enforced_rate_limits || 0) + (state.lastMetrics.manifold_rate_limit || 0);
+            const prevBlk  = (state.lastMetrics.enforced_blocks || 0) + (state.lastMetrics.manifold_deny || 0);
+            const curPass  = (d.enforced_pass || 0) + (d.manifold_allow || 0);
+            const curRL    = (d.enforced_rate_limits || 0) + (d.manifold_rate_limit || 0);
+            const curBlk   = (d.enforced_blocks || 0) + (d.manifold_deny || 0);
+            passR = Math.max(0, (curPass - prevPass) / dt);
+            rlR   = Math.max(0, (curRL - prevRL) / dt);
+            blkR  = Math.max(0, (curBlk - prevBlk) / dt);
         }
         state.lastMetrics = d;
         state.latestDetection = d;
@@ -637,11 +643,14 @@
     // Header
     // =========================================================================
     function updateHeader(d, totalRate) {
-        const total = d.enforced_pass + d.enforced_rate_limits + d.enforced_blocks + d.enforced_close_conn;
+        const pass = (d.enforced_pass || 0) + (d.manifold_allow || 0);
+        const rl   = (d.enforced_rate_limits || 0) + (d.manifold_rate_limit || 0);
+        const blk  = (d.enforced_blocks || 0) + (d.manifold_deny || 0);
+        const total = pass + rl + blk + (d.enforced_close_conn || 0) + (d.manifold_warmup || 0);
         el('s-total').textContent = fmt(total);
-        el('s-pass').textContent = fmt(d.enforced_pass);
-        el('s-rate-ltd').textContent = fmt(d.enforced_rate_limits);
-        el('s-blocked').textContent = fmt(d.enforced_blocks);
+        el('s-pass').textContent = fmt(pass);
+        el('s-rate-ltd').textContent = fmt(rl);
+        el('s-blocked').textContent = fmt(blk);
         el('s-rps').textContent = fmt(Math.round(d.estimated_rps));
     }
 

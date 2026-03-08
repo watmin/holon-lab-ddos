@@ -939,6 +939,10 @@ pub async fn run(
             s.enforced_blocks = blocks;
             s.enforced_rate_limits = rate_limits;
             s.enforced_close_conn = close_conn;
+            s.manifold_allow = m_allow;
+            s.manifold_warmup = m_warmup;
+            s.manifold_rate_limit = m_rate_limit;
+            s.manifold_deny = m_deny;
         }
 
         // Emit SSE event from local values (no extra lock acquisition)

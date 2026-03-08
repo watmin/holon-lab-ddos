@@ -516,10 +516,10 @@
 
         if (state.lastMetrics) {
             const dt = Math.max(d.ts - state.lastMetrics.ts, 0.01);
-            allowR  = Math.max(0, (d.manifold_allow - state.lastMetrics.manifold_allow) / dt);
+            allowR  = Math.max(0, ((d.manifold_allow + d.enforced_pass) - (state.lastMetrics.manifold_allow + state.lastMetrics.enforced_pass)) / dt);
             warmupR = Math.max(0, (d.manifold_warmup - state.lastMetrics.manifold_warmup) / dt);
-            rlR     = Math.max(0, (d.manifold_rate_limit - state.lastMetrics.manifold_rate_limit) / dt);
-            denyR   = Math.max(0, (d.manifold_deny - state.lastMetrics.manifold_deny) / dt);
+            rlR     = Math.max(0, ((d.manifold_rate_limit + d.enforced_rate_limits) - (state.lastMetrics.manifold_rate_limit + state.lastMetrics.enforced_rate_limits)) / dt);
+            denyR   = Math.max(0, ((d.manifold_deny + d.enforced_blocks) - (state.lastMetrics.manifold_deny + state.lastMetrics.enforced_blocks)) / dt);
         }
         state.lastMetrics = d;
 
@@ -596,12 +596,12 @@
     // Counters + status
     // =========================================================================
     function updateCounters(d) {
-        el('c-allow').textContent = fmt(d.manifold_allow);
+        el('c-allow').textContent = fmt(d.manifold_allow + (d.enforced_pass || 0));
         el('c-warmup').textContent = fmt(d.manifold_warmup);
-        el('c-ratelimit').textContent = fmt(d.manifold_rate_limit);
-        el('c-deny').textContent = fmt(d.manifold_deny);
+        el('c-ratelimit').textContent = fmt(d.manifold_rate_limit + (d.enforced_rate_limits || 0));
+        el('c-deny').textContent = fmt(d.manifold_deny + (d.enforced_blocks || 0));
         el('c-rps').textContent = fmt(Math.round(d.estimated_rps));
-        el('deny-count').textContent = fmt(d.manifold_deny + d.manifold_rate_limit);
+        el('deny-count').textContent = fmt(d.manifold_deny + d.manifold_rate_limit + (d.enforced_blocks || 0) + (d.enforced_rate_limits || 0));
     }
 
     function updateStatus() {

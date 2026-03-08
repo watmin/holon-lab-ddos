@@ -152,6 +152,10 @@ pub struct SidecarStats {
     pub enforced_blocks: u64,
     pub enforced_rate_limits: u64,
     pub enforced_close_conn: u64,
+    pub manifold_allow: u64,
+    pub manifold_warmup: u64,
+    pub manifold_rate_limit: u64,
+    pub manifold_deny: u64,
 }
 
 pub type SharedStats = Arc<RwLock<SidecarStats>>;

@@ -1,0 +1,8 @@
+{
+  "phases": [
+    { "name": "warmup", "duration_s": 20, "rps": 80, "pattern": "dvwa_browse", "tls_profiles": ["chrome_120", "firefox_121"] },
+    { "name": "steady-normal", "duration_s": 15, "rps": 80, "pattern": "dvwa_browse", "tls_profiles": ["chrome_120", "firefox_121"] },
+    { "name": "scanner-flood", "duration_s": 30, "rps": 1500, "pattern": "scanner", "tls_profiles": ["python_requests"] },
+    { "name": "cooldown", "duration_s": 10, "rps": 50, "pattern": "dvwa_browse", "tls_profiles": ["chrome_120", "firefox_121"] }
+  ]
+}

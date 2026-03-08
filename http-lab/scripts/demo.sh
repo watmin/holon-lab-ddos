@@ -109,14 +109,19 @@ echo ""
 grep 'FINAL_SUMMARY' "$GENERATOR_LOG" || true
 echo ""
 
-echo "--- Spectral verdict counts ---"
+echo "--- Verdict counts ---"
 curl -sf http://127.0.0.1:9090/metrics 2>/dev/null | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
+    print('  Layer 3 (rule tree):')
+    for k in ['enforced_pass','enforced_blocks','enforced_rate_limits']:
+        v = data.get(k, 'N/A')
+        print(f'    {k}: {v}')
+    print('  Manifold (spectral):')
     for k in ['manifold_allow','manifold_warmup','manifold_rate_limit','manifold_deny']:
         v = data.get(k, 'N/A')
-        print(f'  {k}: {v}')
+        print(f'    {k}: {v}')
 except:
     print('  (could not parse metrics)')
 " || echo "  (metrics endpoint not available)"
