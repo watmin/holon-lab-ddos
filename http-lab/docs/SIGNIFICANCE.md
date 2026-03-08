@@ -1,7 +1,7 @@
 # Significance: What the Spectral Firewall Actually Is
 
 **Date:** March 3, 2026
-**Updated:** March 7, 2026 — self-calibrating thresholds, federated deployment model
+**Updated:** March 2, 2026 — residual profile dual signal (magnitude+direction deny gate)
 
 ## The Result
 
@@ -296,3 +296,46 @@ legitimate traffic diversity and tightness against attacks.
 
 Final isolation funnel: 21 → 5 (simulation) → 4 (round 1 live) → 1 (7-round
 statistical validation). Zero magic numbers in the final formula.
+
+### Structural deny downgrade — failed experiment (March 8)
+
+Attempted to reduce late FPs by classifying drilldown anomaly fields as
+**structural** (browser fingerprint: header_order, TLS, header_shapes) vs
+**content** (potentially malicious: path, query, headers, cookies), then
+downgrading structural-dominant denies in a soft zone to rate-limits.
+
+Live testing revealed the hypothesis was **inverted**: scanners have higher
+structural ratios (0.72–0.77) than minority browsers (0.50–0.52), because
+scanner HTTP stacks are so alien that structural anomaly dwarfs content anomaly.
+With `structural_ratio > 0.5`, 118 scanner requests leaked and poisoned the
+adaptive learning loop.
+
+**Methodological value**: The implementation, testing, and data collection were
+rigorous — field classifier, downgrade counter, log parser columns, comparative
+runs. The failure produced actionable data: the structural ratio distribution
+is inverted, so ratio-based discrimination is ruled out. Alternative approaches
+(content score floor, JA3/JA4 fingerprinting, residual proximity gating) are
+documented for future investigation.
+
+Default reverted to `strict`. Code retained behind `DENY_MODE=lenient`.
+
+### Residual profile dual signal — the correction (March 2)
+
+The structural ratio failure was a symptom of a deeper regression: using only
+one signal (magnitude) when both magnitude AND direction are needed. This is
+the central lesson of batch 018 — every successful discrimination in the holon
+project used both signals; every failure used only one.
+
+The fix: each request already produces 32 per-stripe residuals. The RSS
+aggregate is the magnitude (already used). The *pattern* of which stripes
+light up — the 32-dim residual profile — is the direction (previously
+discarded). A tiny `OnlineSubspace(dim=32, k=1)` learns the normal profile
+during warmup. At deny time, `profile_alignment` measures how well the denied
+request's profile matches known normal patterns.
+
+Dual gate: downgrade requires BOTH soft-zone magnitude AND familiar direction.
+Neither alone triggers a downgrade. This adds a 32-element dot product to the
+deny path (~3000x cheaper than one stripe operation). Zero interference with
+existing learning. No new magic numbers.
+
+See `FINDINGS-RESIDUAL-PROFILE.md` for the full reasoning arc.

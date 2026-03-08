@@ -700,6 +700,69 @@ while staying tight enough to deny attacks (residuals ~90+).
 
 Default changed from `geometric` to `log_mean` in `sidecar/src/lib.rs`.
 
+### Session: March 8, 2026 — Structural Deny Downgrade (Failed Experiment)
+
+**Hypothesis**: Late false positives are minority browsers (Firefox, 5% population)
+whose anomaly is structural (header order, TLS fingerprint, UA shape), not content
+(path traversal, SQLi). A "lenient" deny mode could downgrade structural-dominant
+denies to rate-limits, forwarding them to the backend for adaptive learning.
+
+**Implementation**:
+- Classified drilldown fields as **structural** (`header_order`, `tls.*`,
+  `header_shapes.*`, `header_count`, `version`, `src_ip`) vs **content**
+  (`method`, `path*`, `query*`, `headers.*`, `cookies.*`).
+- Added `structural_ratio()` — fraction of total drilldown score from structural fields.
+- Added `DENY_MODE` env var (`strict`/`lenient`, default `strict`).
+- In lenient mode, denies in the "soft zone" (deny_threshold to CCIPCA_threshold)
+  with `structural_ratio > 0.5` are downgraded: forwarded to backend with
+  `X-Spectral-Downgrade: structural` header, counted separately.
+
+**Result — lenient mode actively harmful**:
+
+| Metric | Lenient | Strict |
+|--------|---------|--------|
+| Attack denies | 139 | 6,072 |
+| Browser FPs | 1 | 13 |
+| DG_Browser (rescued) | 3 | 0 |
+| DG_Attack (leaked!) | 118 | 0 |
+| Adaptive learns | 97 | 44 |
+| Allows | 4,530 | 351 |
+
+118 scanner requests were downgraded (leaked through to backend). The forwarded
+attack traffic received 200s from DVWA, fed adaptive learning, and poisoned the
+manifold — hence 4,530 allows in lenient vs 351 in strict.
+
+**Why it failed — structural ratio distribution**:
+
+| Structural ratio | Count | Who |
+|-----------------|-------|-----|
+| 0.50–0.55 | 5 | 3 browsers + 2 attacks |
+| 0.55–0.60 | 2 | attacks |
+| 0.60–0.70 | 20 | attacks |
+| 0.70–0.80 | 94 | attacks |
+
+Scanners (Nikto, ZAP, Nuclei) have **higher** structural ratios (0.72–0.77) than
+minority browsers (0.50–0.52). The scanners' HTTP stacks are so alien (different TLS,
+header order, header shapes) that structural anomaly dwarfs content anomaly. Meanwhile,
+minority browsers are still browsers — their structural difference is moderate, and
+when visiting unusual pages (POST /vulnerabilities/exec/), content and structural
+anomaly are roughly equal.
+
+**Key insight**: Structural vs content *ratio* is the wrong discriminator. There is no
+threshold on `structural_ratio` that cleanly separates browsers from scanners — the
+populations are **inversely** distributed from our hypothesis.
+
+**Code status**: Implementation retained for future experimentation (`DENY_MODE=lenient`),
+but default reverted to `strict`. The field classifier, downgrade counter, log parser
+columns, and `X-Spectral-Downgrade` header remain available.
+
+**Alternative approaches to explore**:
+1. **Content score floor** — if absolute content anomaly is very low (data-derived),
+   the request is benign regardless of structural weirdness
+2. **Known-good TLS fingerprint** — JA3/JA4 matching against browser families
+3. **Residual proximity** — browser downgrades had lower residuals (81–87) vs
+   attacks (95–103); a tighter soft zone might help
+
 ## What's Next
 
 - [x] Live test against DVWA with real Nikto scan — **Done. 9,788 denies, 0 vulns found.**
@@ -709,6 +772,8 @@ Default changed from `geometric` to `log_mean` in `sidecar/src/lib.rs`.
 - [x] Multi-source-IP + concurrent mixed traffic — **Done. 20 LLM browsers + 3 scanners, 0 FP.**
 - [x] Derive sigma_mult / deny_mult / adaptive_gate from training data — **Done. Geometric mean + residual buffer.**
 - [x] Threshold strategy sweep — **Done. 21→5→4→1. log_mean selected via 7-round validation.**
+- [x] Structural deny downgrade — **Failed. Structural ratio inverted: scanners 0.72–0.77 vs browsers 0.50–0.52. Reverted to strict.**
+- [x] Residual profile dual signal — **Done. 32-dim profile subspace learns cross-stripe direction. Live: 4351 attacks denied, 1 early FP (0.1%), 0 late FPs, 44 adaptive learns (17 during attacks). All denies had profile_alignment < 0.155, cleanly below 0.5 gate. Continuous learning uninterrupted under adversarial conditions.**
 - [ ] Slow Nikto test (`-Pause 1`) — pure geometric detection without rate-limit triggers
 - [ ] Mimicry attack — real browser submitting SQLi through DVWA forms (find the boundary)
 - [ ] Measure spectral scoring overhead in isolation (microbenchmark without upstream)

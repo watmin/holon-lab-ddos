@@ -29,6 +29,7 @@ use anyhow::Result;
 use arc_swap::ArcSwap;
 use holon::kernel::{Encoder, Primitives, VectorManager};
 use holon::memory::StripedSubspace;
+use holon::OnlineSubspace;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{info, warn};
 
@@ -245,8 +246,10 @@ pub async fn run(
         .unwrap_or(WARMUP_SAMPLES_REQ_DEFAULT);
     let deny_strategy: String = std::env::var("DENY_STRATEGY")
         .unwrap_or_else(|_| "log_mean".to_string());
-    info!("Sidecar starting (rule_ttl={}s, warmup_req={}, deny_strategy={})",
-          ttl, warmup_samples_req, deny_strategy);
+    let deny_mode: String = std::env::var("DENY_MODE")
+        .unwrap_or_else(|_| "strict".to_string());
+    info!("Sidecar starting (rule_ttl={}s, warmup_req={}, deny_strategy={}, deny_mode={})",
+          ttl, warmup_samples_req, deny_strategy, deny_mode);
 
     let encoder = Arc::new(Encoder::new(VectorManager::new(VSA_DIM)));
     let stats = new_shared_stats();
@@ -322,6 +325,11 @@ pub async fn run(
     // Rolling residual buffer for continuous deny threshold calibration
     let mut residual_buffer = ResidualBuffer::new(RESIDUAL_BUFFER_CAPACITY, deny_strategy);
 
+    // Residual profile subspace: learns the cross-stripe residual pattern
+    // from normal traffic so the proxy can measure directional alignment
+    // alongside magnitude for dual-signal deny decisions.
+    let mut profile_subspace = OnlineSubspace::new(N_STRIPES, 1);
+
     // Layer 2: window-level spectrum tracking
     let mut req_window_tracker = WindowTracker::new(VSA_DIM, VSA_K, WINDOW_SIZE);
     let mut current_threat_mode = ThreatMode::Normal;
@@ -357,10 +365,20 @@ pub async fn run(
                     req_warmup_done = true;
                     req_warmup_count = warmup_samples_req;
 
+                    // Try loading persisted profile subspace
+                    let profile_path = format!("{}.profile.json", path);
+                    if let Ok(pjson) = std::fs::read_to_string(&profile_path) {
+                        if let Ok(psnap) = serde_json::from_str::<holon::memory::SubspaceSnapshot>(&pjson) {
+                            profile_subspace = OnlineSubspace::from_snapshot(psnap);
+                            info!("[PROFILE] Loaded from {} (n={})", profile_path, profile_subspace.n());
+                        }
+                    }
+
                     let score_thr = residual_buffer.score_threshold(req_striped_baseline.threshold());
                     let deny_thr = residual_buffer.deny_threshold(req_striped_baseline.threshold());
+                    let hard_thr = req_striped_baseline.threshold();
                     let mstate = build_manifold_state(
-                        &req_striped_baseline, &current_threat_mode, 50.0, score_thr, deny_thr,
+                        &req_striped_baseline, &current_threat_mode, 50.0, score_thr, deny_thr, hard_thr, &deny_mode, Some(&profile_subspace),
                     );
                     manifold.store(Arc::new(mstate));
 
@@ -448,6 +466,7 @@ pub async fn run(
                         &mut adaptive_learn_count,
                         &mut adaptive_since_republish,
                         &mut residual_buffer,
+                        &mut profile_subspace,
                     );
 
                     // Republish manifold state after enough adaptive learns
@@ -455,8 +474,9 @@ pub async fn run(
                         adaptive_since_republish = 0;
                         let score_thr = residual_buffer.score_threshold(req_striped_baseline.threshold());
                         let deny_thr = residual_buffer.deny_threshold(req_striped_baseline.threshold());
+                        let hard_thr = req_striped_baseline.threshold();
                         manifold.store(Arc::new(build_manifold_state(
-                            &req_striped_baseline, &current_threat_mode, baseline_rps, score_thr, deny_thr,
+                            &req_striped_baseline, &current_threat_mode, baseline_rps, score_thr, deny_thr, hard_thr, &deny_mode, Some(&profile_subspace),
                         )));
                         info!(
                             "[ADAPTIVE] Republished manifold (total_learns={}, score_thr={:.2}, deny_thr={:.2}, buf_len={}, buf_max={:.2})",
@@ -465,13 +485,19 @@ pub async fn run(
                             residual_buffer.max().unwrap_or(0.0),
                         );
 
-                        // Periodic baseline save (piggyback on republish interval)
+                        // Periodic baseline + profile save (piggyback on republish interval)
                         if let Some(ref path) = engram_path {
                             if req_detector.anomaly_streak == 0 {
                                 let baseline_path = format!("{}.baseline.striped.json", path);
                                 if let Ok(json) = serde_json::to_string(&req_striped_baseline.snapshot()) {
                                     if let Err(e) = std::fs::write(&baseline_path, &json) {
                                         warn!("[BASELINE] Periodic save failed: {}", e);
+                                    }
+                                }
+                                let profile_path = format!("{}.profile.json", path);
+                                if let Ok(json) = serde_json::to_string(&profile_subspace.snapshot()) {
+                                    if let Err(e) = std::fs::write(&profile_path, &json) {
+                                        warn!("[PROFILE] Periodic save failed: {}", e);
                                     }
                                 }
                             }
@@ -526,6 +552,7 @@ pub async fn run(
                                         &req_striped_baseline, &current_threat_mode, baseline_rps,
                                         residual_buffer.score_threshold(req_striped_baseline.threshold()),
                                         residual_buffer.deny_threshold(req_striped_baseline.threshold()),
+                                        req_striped_baseline.threshold(), &deny_mode, Some(&profile_subspace),
                                     )));
                                 }
                             }
@@ -543,6 +570,7 @@ pub async fn run(
                                         &req_striped_baseline, &current_threat_mode, baseline_rps,
                                         residual_buffer.score_threshold(req_striped_baseline.threshold()),
                                         residual_buffer.deny_threshold(req_striped_baseline.threshold()),
+                                        req_striped_baseline.threshold(), &deny_mode, Some(&profile_subspace),
                                     )));
                                 }
                             }
@@ -556,6 +584,7 @@ pub async fn run(
                                             &req_striped_baseline, &current_threat_mode, baseline_rps,
                                             residual_buffer.score_threshold(req_striped_baseline.threshold()),
                                             residual_buffer.deny_threshold(req_striped_baseline.threshold()),
+                                            req_striped_baseline.threshold(), &deny_mode, Some(&profile_subspace),
                                         )));
                                     }
                                 }
@@ -570,7 +599,7 @@ pub async fn run(
                         tls_detector.save_library(&format!("{}.tls", path));
                         req_detector.save_library(&format!("{}.req", path));
 
-                        // Persist baseline engram (only if not under active attack)
+                        // Persist baseline + profile subspace (only if not under active attack)
                         if req_detector.anomaly_streak == 0 && req_warmup_done {
                             let baseline_path = format!("{}.baseline.striped.json", path);
                             match serde_json::to_string(&req_striped_baseline.snapshot()) {
@@ -582,6 +611,17 @@ pub async fn run(
                                     }
                                 }
                                 Err(e) => warn!("[BASELINE] Serialization failed: {}", e),
+                            }
+                            let profile_path = format!("{}.profile.json", path);
+                            match serde_json::to_string(&profile_subspace.snapshot()) {
+                                Ok(json) => {
+                                    if let Err(e) = std::fs::write(&profile_path, &json) {
+                                        warn!("[PROFILE] Failed to save to {}: {}", profile_path, e);
+                                    } else {
+                                        info!("[PROFILE] Saved to {} ({} bytes)", profile_path, json.len());
+                                    }
+                                }
+                                Err(e) => warn!("[PROFILE] Serialization failed: {}", e),
                             }
                         } else if req_detector.anomaly_streak > 0 {
                             warn!("[BASELINE] Skipping save — anomaly streak active ({})", req_detector.anomaly_streak);
@@ -663,10 +703,11 @@ pub async fn run(
 
             let score_thr = residual_buffer.score_threshold(req_striped_baseline.threshold());
             let deny_thr = residual_buffer.deny_threshold(req_striped_baseline.threshold());
-            let mstate = build_manifold_state(&req_striped_baseline, &current_threat_mode, baseline_rps, score_thr, deny_thr);
+            let hard_thr = req_striped_baseline.threshold();
+            let mstate = build_manifold_state(&req_striped_baseline, &current_threat_mode, baseline_rps, score_thr, deny_thr, hard_thr, &deny_mode, Some(&profile_subspace));
             manifold.store(Arc::new(mstate));
-            info!("[MANIFOLD] Initial state published (strategy={}, score_threshold={:.2}, deny_threshold={:.2}, buf_len={}, buf_max={:.2})",
-                  residual_buffer.strategy, score_thr, deny_thr, residual_buffer.len(), residual_buffer.max().unwrap_or(0.0));
+            info!("[MANIFOLD] Initial state published (strategy={}, deny_mode={}, score_threshold={:.2}, deny_threshold={:.2}, hard_deny={:.2}, buf_len={}, buf_max={:.2})",
+                  residual_buffer.strategy, deny_mode, score_thr, deny_thr, hard_thr, residual_buffer.len(), residual_buffer.max().unwrap_or(0.0));
         }
 
         // -------------------------------------------------------------------
@@ -937,7 +978,7 @@ pub async fn run(
         // Update metrics + emit SSE
         let rules_count;
         let (pass, blocks, rate_limits, close_conn) = http_proxy::enforcement_counts();
-        let (m_allow, m_warmup, m_rate_limit, m_deny) = http_proxy::manifold_counts();
+        let (m_allow, m_warmup, m_rate_limit, m_deny, m_downgrade) = http_proxy::manifold_counts();
         {
             let mgr = rule_mgr.lock().await;
             rules_count = mgr.rule_count();
@@ -979,6 +1020,7 @@ pub async fn run(
             s.manifold_warmup = m_warmup;
             s.manifold_rate_limit = m_rate_limit;
             s.manifold_deny = m_deny;
+            s.manifold_downgrade = m_downgrade;
         }
 
         // Emit SSE event from local values (no extra lock acquisition)
@@ -1005,6 +1047,7 @@ pub async fn run(
             manifold_warmup: m_warmup,
             manifold_rate_limit: m_rate_limit,
             manifold_deny: m_deny,
+            manifold_downgrade: m_downgrade,
         });
 
         // Emit per-rule counters
@@ -1040,7 +1083,7 @@ pub async fn run(
                  req[score={:.2},thr={:.2},streak={}] \
                  rules={} engrams(tls={},req={}) warmup(tls={},req={}) \
                  enforced(pass={},block={},rate_limit={},close={}) \
-                 manifold(allow={},warmup={},rate_limit={},deny={})",
+                 manifold(allow={},warmup={},rate_limit={},deny={},downgrade={})",
                 s.tick_count,
                 s.tls_samples_received, s.req_samples_received,
                 s.estimated_rps,
@@ -1051,7 +1094,7 @@ pub async fn run(
                 if s.warmup_tls { format!("{}/{}", s.warmup_samples_tls, WARMUP_SAMPLES_TLS) } else { "done".into() },
                 if s.warmup_req { format!("{}/{}", s.warmup_samples_req, warmup_samples_req) } else { "done".into() },
                 s.enforced_pass, s.enforced_blocks, s.enforced_rate_limits, s.enforced_close_conn,
-                m_allow, m_warmup, m_rate_limit, m_deny,
+                m_allow, m_warmup, m_rate_limit, m_deny, m_downgrade,
             );
         }
     }
@@ -1140,6 +1183,7 @@ fn process_req_sample(
     adaptive_learns: &mut u64,
     adaptive_since_pub: &mut usize,
     residual_buffer: &mut ResidualBuffer,
+    profile_subspace: &mut OnlineSubspace,
 ) -> (Option<detectors::WindowResult>, AdaptiveResult) {
     // Backend success = ground truth that the request was valid
     let backend_ok = sample.response_status.map(|s| s < 400).unwrap_or(false);
@@ -1165,10 +1209,12 @@ fn process_req_sample(
             detector.learn(&agg_f64);
             *warmup_count += 1;
 
-            // Also feed the residual buffer during warmup (after enough samples for a residual)
+            // Also feed the residual buffer and profile subspace during warmup
             if *warmup_count > STRIPED_K {
-                let residual = striped_baseline.residual(&stripe_vecs);
+                let profile = striped_baseline.residual_profile(&stripe_vecs);
+                let residual = profile.iter().map(|r| r * r).sum::<f64>().sqrt();
                 residual_buffer.push(residual);
+                profile_subspace.update(&profile);
             }
         }
     } else {
@@ -1189,6 +1235,10 @@ fn process_req_sample(
         if residual < threshold && backend_ok {
             // Push allowed + backend-success residual to calibration buffer
             residual_buffer.push(residual);
+
+            // Feed the profile subspace with every allowed+backend_ok residual profile
+            let profile = striped_baseline.residual_profile(&stripe_vecs);
+            profile_subspace.update(&profile);
 
             *adaptive_counter += 1;
             if *adaptive_counter % ADAPTIVE_LEARN_INTERVAL == 0 {
@@ -1365,6 +1415,9 @@ fn build_manifold_state(
     baseline_rps: f64,
     score_threshold: f64,
     deny_threshold: f64,
+    hard_deny_threshold: f64,
+    deny_mode: &str,
+    profile_subspace: Option<&OnlineSubspace>,
 ) -> ManifoldState {
     let baseline = Some(striped_baseline.clone());
 
@@ -1384,7 +1437,10 @@ fn build_manifold_state(
         threat_mode: manifold_threat,
         score_threshold,
         deny_threshold,
+        hard_deny_threshold,
         rate_limit_rps: baseline_rps.max(10.0),
+        deny_mode: deny_mode.to_string(),
+        profile_subspace: profile_subspace.cloned(),
     }
 }
 

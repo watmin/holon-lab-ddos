@@ -17,6 +17,7 @@
 use holon::kernel::Encoder;
 use holon::{Walkable, WalkableValue};
 use holon::memory::StripedSubspace;
+use holon::OnlineSubspace;
 
 /// Strategic threat classification from Layer 2 (window spectrum analysis).
 #[derive(Debug, Clone)]
@@ -54,8 +55,18 @@ pub struct ManifoldState {
     pub score_threshold: f64,
     /// Deny floor: residual above this → deny (exploit/scan).
     pub deny_threshold: f64,
+    /// Hard deny ceiling: CCIPCA statistical threshold. Denies above this are
+    /// never downgraded, even in lenient mode.
+    pub hard_deny_threshold: f64,
     /// Rate-limit RPS cap for traffic in the suspicious band.
     pub rate_limit_rps: f64,
+    /// "strict" = pure algebraic deny, "lenient" = downgrade structural denies
+    /// in the soft zone (deny_threshold..hard_deny_threshold) to rate-limits.
+    pub deny_mode: String,
+    /// Residual profile subspace (dim = n_stripes, k = 1). Learns the normal
+    /// cross-stripe residual pattern so the deny handler can measure directional
+    /// alignment alongside magnitude.
+    pub profile_subspace: Option<OnlineSubspace>,
 }
 
 impl ManifoldState {
@@ -67,7 +78,10 @@ impl ManifoldState {
             threat_mode: ThreatMode::Normal,
             score_threshold: f64::INFINITY,
             deny_threshold: f64::INFINITY,
+            hard_deny_threshold: f64::INFINITY,
             rate_limit_rps: 100.0,
+            deny_mode: "strict".into(),
+            profile_subspace: None,
         }
     }
 
@@ -87,7 +101,9 @@ pub enum ManifoldVerdict {
     /// Layer 1: moderate residual — rate-limit (DDoS variant).
     RateLimit { rps: f64, residual: f64 },
     /// Layer 1: high residual — deny (exploit/scan).
-    Deny { residual: f64 },
+    /// `profile_alignment` ∈ [0, 1]: how well the cross-stripe residual
+    /// pattern matches known normal profiles (1.0 = familiar, 0.0 = novel).
+    Deny { residual: f64, profile_alignment: f64 },
 }
 
 /// Score a striped request vector against the manifold state.
@@ -103,10 +119,11 @@ pub fn evaluate_manifold(stripe_vecs: &[Vec<f64>], state: &ManifoldState) -> Man
     }
 
     let baseline = state.baseline.as_ref().unwrap();
-    let residual = baseline.residual(stripe_vecs);
+    let profile = baseline.residual_profile(stripe_vecs);
+    let residual = profile.iter().map(|r| r * r).sum::<f64>().sqrt();
 
     if residual.is_nan() {
-        return ManifoldVerdict::Deny { residual: f64::INFINITY };
+        return ManifoldVerdict::Deny { residual: f64::INFINITY, profile_alignment: 0.0 };
     }
 
     // Layer 0: allow if within empirically observed normal range
@@ -129,7 +146,8 @@ pub fn evaluate_manifold(stripe_vecs: &[Vec<f64>], state: &ManifoldState) -> Man
     };
 
     if residual > deny_threshold {
-        ManifoldVerdict::Deny { residual }
+        let profile_alignment = compute_profile_alignment(&profile, state);
+        ManifoldVerdict::Deny { residual, profile_alignment }
     } else {
         let rps = match &state.threat_mode {
             ThreatMode::Volumetric { .. } => state.rate_limit_rps * 0.5,
@@ -137,6 +155,27 @@ pub fn evaluate_manifold(stripe_vecs: &[Vec<f64>], state: &ManifoldState) -> Man
         };
         ManifoldVerdict::RateLimit { rps, residual }
     }
+}
+
+/// Measure how well a residual profile aligns with learned normal profiles.
+///
+/// Returns a value in [0, 1]: 1.0 = the profile direction is fully explained
+/// by the normal profile subspace (familiar browser variant), 0.0 = completely
+/// novel direction (scanner/tool).
+///
+/// Uses the fraction of the profile's energy captured by the profile subspace
+/// projection: `1.0 - (profile_residual / profile_norm)`.
+fn compute_profile_alignment(profile: &[f64], state: &ManifoldState) -> f64 {
+    let psub = match &state.profile_subspace {
+        Some(ps) => ps,
+        None => return 0.0,
+    };
+    let profile_norm: f64 = profile.iter().map(|r| r * r).sum::<f64>().sqrt();
+    if profile_norm < 1e-10 {
+        return 1.0;
+    }
+    let profile_residual = psub.residual(profile);
+    (1.0 - profile_residual / profile_norm).max(0.0)
 }
 
 // =============================================================================
@@ -279,6 +318,35 @@ fn compute_breadth_metrics(scores: &[DrilldownAttribution]) -> (f64, f64, f64) {
     (concentration, entropy, gini)
 }
 
+/// Whether a drilldown field name represents structural (browser fingerprint)
+/// rather than content (potentially malicious) anomaly.
+///
+/// Structural fields: header ordering, TLS fingerprint, header shapes/count,
+/// HTTP version, source IP — differences here indicate a different client
+/// type, not malicious intent.
+fn is_structural_field(field: &str) -> bool {
+    field.starts_with("header_order")
+        || field.starts_with("tls")
+        || field.starts_with("header_shapes")
+        || field.starts_with("header_count")
+        || field.starts_with("version")
+        || field.starts_with("src_ip")
+}
+
+/// Fraction of total drilldown anomaly score attributable to structural fields.
+/// Returns 0.0 if no fields or total score is negligible.
+pub fn structural_ratio(drilldown: &DrilldownResult) -> f64 {
+    let total: f64 = drilldown.fields.iter().map(|f| f.score.abs()).sum();
+    if total < 1e-10 {
+        return 0.0;
+    }
+    let structural: f64 = drilldown.fields.iter()
+        .filter(|f| is_structural_field(&f.field))
+        .map(|f| f.score.abs())
+        .sum();
+    structural / total
+}
+
 /// Recursively walk the Walkable structure, scoring each leaf via cosine
 /// similarity between the stripe's anomalous component and the leaf binding.
 fn collect_leaf_scores(
@@ -389,7 +457,10 @@ mod tests {
             threat_mode: ThreatMode::Normal,
             score_threshold: threshold,
             deny_threshold: threshold * 2.0,
+            hard_deny_threshold: f64::INFINITY,
             rate_limit_rps: 100.0,
+            deny_mode: "strict".into(),
+            profile_subspace: None,
         };
 
         let mut rng = 999u64;
@@ -420,7 +491,10 @@ mod tests {
             threat_mode: ThreatMode::Normal,
             score_threshold: threshold * 0.5,
             deny_threshold: threshold * 1.5,
+            hard_deny_threshold: f64::INFINITY,
             rate_limit_rps: 100.0,
+            deny_mode: "strict".into(),
+            profile_subspace: None,
         };
 
         let mut rng = 777u64;
@@ -457,7 +531,10 @@ mod tests {
             threat_mode: ThreatMode::Normal,
             score_threshold: threshold,
             deny_threshold: threshold * 3.0,
+            hard_deny_threshold: f64::INFINITY,
             rate_limit_rps: 100.0,
+            deny_mode: "strict".into(),
+            profile_subspace: None,
         };
         let targeted_state = ManifoldState {
             normal_subspaces: vec![],
@@ -465,7 +542,10 @@ mod tests {
             threat_mode: ThreatMode::Targeted,
             score_threshold: threshold,
             deny_threshold: threshold * 3.0,
+            hard_deny_threshold: f64::INFINITY,
             rate_limit_rps: 100.0,
+            deny_mode: "strict".into(),
+            profile_subspace: None,
         };
 
         let mut rng = 555u64;

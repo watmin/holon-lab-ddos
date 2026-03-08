@@ -1035,3 +1035,92 @@ scanners, tunes itself, and self-reproduces across a fleet of any size.
 9. **Engram diffing**: tooling to compare two engram versions — which
    eigenvectors shifted, by how much, which stripes changed. Useful for
    understanding what a deploy or traffic change did to the norm.
+
+## 8. Structural vs Content Anomaly Discrimination (OPEN)
+
+### The problem
+
+Late false positives appear to be minority browsers (Firefox at 5% population,
+WebKit at 15%) visiting uncommon pages. The manifold's algebraic deny treats all
+anomalous fields equally, but from a WAF perspective, "browser fingerprint
+anomaly" (different header order, TLS extensions) is qualitatively different from
+"malicious content anomaly" (path traversal, SQLi, exotic headers).
+
+### Attempted approach: Structural ratio (March 8, 2026)
+
+Classified drilldown fields into two categories:
+
+**Structural** (browser fingerprint, not concerning):
+`header_order.*`, `tls.*`, `header_shapes.*`, `header_count`, `version`, `src_ip.*`
+
+**Content** (potentially malicious):
+`method`, `path.*`, `path_parts.*`, `query.*`, `query_parts.*`, `path_shape.*`,
+`query_shape.*`, `headers.*`, `cookies.*`
+
+Computed `structural_ratio = sum(structural scores) / sum(all scores)`. The plan:
+if a deny falls in a "soft zone" (between deny_threshold and CCIPCA_threshold)
+and `structural_ratio > 0.5`, downgrade it to a rate-limit instead of a hard deny.
+
+### Result: Inverse population distribution
+
+Live testing revealed the populations are **inversely distributed** from the
+hypothesis:
+
+| Structural ratio | Count | Source |
+|-----------------|-------|--------|
+| 0.50–0.55 | 5 | 3 browsers + 2 attacks |
+| 0.55–0.60 | 2 | attacks |
+| 0.60–0.70 | 20 | attacks |
+| 0.70–0.80 | 94 | attacks |
+
+**Scanners have HIGHER structural ratios (0.72–0.77) than minority browsers
+(0.50–0.52).** Nikto/ZAP/Nuclei have completely alien HTTP stacks — different
+TLS fingerprints, header ordering, header shapes — so structural anomaly dwarfs
+content anomaly. Meanwhile, minority browsers are still browsers; their
+structural difference is moderate, and when visiting unusual pages like
+POST /vulnerabilities/exec/, content and structural anomaly are roughly equal.
+
+With `structural_ratio > 0.5`, 118 scanner requests leaked through, fed DVWA
+200s back to adaptive learning, and poisoned the manifold (4,530 allows in
+lenient mode vs 351 in strict). No threshold on `structural_ratio` cleanly
+separates the populations.
+
+### Why the ratio metric fails
+
+The ratio measures *relative* contribution. Scanners have overwhelming structural
+anomaly AND moderate content anomaly → high ratio. Browsers have moderate structural
+anomaly AND moderate content anomaly → ratio near 0.5. The metric can't distinguish
+"structurally alien tool" from "slightly different browser" because both can have
+high structural ratios.
+
+### Code status
+
+The implementation is retained behind `DENY_MODE=lenient` (default: `strict`) for
+future experimentation. Infrastructure available:
+- `is_structural_field()` and `structural_ratio()` in `proxy/src/manifold.rs`
+- `MANIFOLD_DOWNGRADE` counter and `X-Spectral-Downgrade` response header
+- `DG_BROWSER` / `DG_ATTACK` columns in `parse_sweep_log.sh` and `run-threshold-sweep.sh`
+
+### Previous approach candidates (superseded)
+
+1–5 were previously listed here (content score floor, JA3/JA4, residual
+proximity gating, combined discriminator, adaptive content baseline). All
+operate on scalar metrics — they add more magnitude signals but no
+directional signal. The batch 018 lesson is that both magnitude AND direction
+are required, and single-signal approaches consistently fail.
+
+### Implemented approach: Residual Profile Dual Signal (March 2, 2026)
+
+The per-stripe residual pattern — which stripes light up and in what
+proportions — IS the directional signal. A `OnlineSubspace(dim=32, k=1)`
+learns the normal cross-stripe pattern during warmup. At deny time:
+
+- **Magnitude**: aggregate residual (RSS of per-stripe residuals) — already used
+- **Direction**: `profile_alignment` — how well the 32-dim residual profile
+  aligns with learned normal profiles (1.0 = familiar, 0.0 = novel)
+
+Both signals must agree for a downgrade. This replaces `structural_ratio`
+in the deny handler. Code is behind `DENY_MODE=lenient` (default: strict).
+
+See `FINDINGS-RESIDUAL-PROFILE.md` for full rationale, pressure test, and
+design principles.

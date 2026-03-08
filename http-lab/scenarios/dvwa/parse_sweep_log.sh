@@ -22,6 +22,8 @@ STRIPPED=$(sed 's/\x1b\[[0-9;]*m//g' "$LOG")
 
 DENY_BROWSER=$(echo "$STRIPPED" | grep -cE '═ DENY ═.*label=browser-agent' || true)
 DENY_UNKNOWN=$(echo "$STRIPPED" | grep -cE '═ DENY ═.*label=unknown' || true)
+DG_BROWSER=$(echo "$STRIPPED" | grep -cE '═ DOWNGRADE ═.*label=browser-agent' || true)
+DG_UNKNOWN=$(echo "$STRIPPED" | grep -cE '═ DOWNGRADE ═.*label=unknown' || true)
 
 # --- Temporal FP analysis ---
 # Extract epoch seconds for proxy start, all browser denies, first/last attack deny
@@ -102,7 +104,7 @@ else
     FP_WHEN="early-only"
 fi
 
-printf "%-14s %11s %10s %8s %10s %10s %8s %12s\n" \
+printf "%-14s %11s %10s %8s %10s %10s %8s %12s %10s %10s\n" \
     "$STRATEGY" \
     "${DENY_UNKNOWN:-0}" \
     "${DENY_BROWSER:-0}" \
@@ -110,7 +112,9 @@ printf "%-14s %11s %10s %8s %10s %10s %8s %12s\n" \
     "${SCORE_THR:-?}" \
     "${DENY_THR:-?}" \
     "${ADAPTIVE_TOTAL:-0}" \
-    "$FP_WHEN"
+    "$FP_WHEN" \
+    "${DG_BROWSER:-0}" \
+    "${DG_UNKNOWN:-0}"
 
 # --- Detailed temporal breakdown ---
 if [[ "$DETAIL" == "--detail" ]]; then
@@ -120,6 +124,7 @@ if [[ "$DETAIL" == "--detail" ]]; then
     echo "    during (attacks):    $FP_DURING"
     echo "    late (post-attack):  $FP_LATE"
     echo "    last FP at:          $LAST_FP_OFFSET from proxy start"
+    echo "    downgrades:          browser=${DG_BROWSER:-0}  attack=${DG_UNKNOWN:-0}"
     echo ""
     echo "  Attack window: ${FIRST_ATTACK_TS:-?} → ${LAST_ATTACK_TS:-?}"
     echo "  Proxy start:   ${PROXY_START_TS:-?}"

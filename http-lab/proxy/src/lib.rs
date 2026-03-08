@@ -35,6 +35,7 @@ pub static MANIFOLD_ALLOW: AtomicU64 = AtomicU64::new(0);
 pub static MANIFOLD_WARMUP: AtomicU64 = AtomicU64::new(0);
 pub static MANIFOLD_RATE_LIMIT: AtomicU64 = AtomicU64::new(0);
 pub static MANIFOLD_DENY: AtomicU64 = AtomicU64::new(0);
+pub static MANIFOLD_DOWNGRADE: AtomicU64 = AtomicU64::new(0);
 
 static RULE_COUNTERS: Mutex<Option<HashMap<u32, u64>>> = Mutex::new(None);
 
@@ -61,11 +62,12 @@ pub fn enforcement_counts() -> (u64, u64, u64, u64) {
 }
 
 /// Snapshot of manifold enforcement counters.
-pub fn manifold_counts() -> (u64, u64, u64, u64) {
+pub fn manifold_counts() -> (u64, u64, u64, u64, u64) {
     (
         MANIFOLD_ALLOW.load(Ordering::Relaxed),
         MANIFOLD_WARMUP.load(Ordering::Relaxed),
         MANIFOLD_RATE_LIMIT.load(Ordering::Relaxed),
         MANIFOLD_DENY.load(Ordering::Relaxed),
+        MANIFOLD_DOWNGRADE.load(Ordering::Relaxed),
     )
 }

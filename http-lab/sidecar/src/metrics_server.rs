@@ -54,6 +54,7 @@ pub enum DashboardEvent {
         manifold_warmup: u64,
         manifold_rate_limit: u64,
         manifold_deny: u64,
+        manifold_downgrade: u64,
     },
     RuleEvent {
         ts: f64,
@@ -156,6 +157,7 @@ pub struct SidecarStats {
     pub manifold_warmup: u64,
     pub manifold_rate_limit: u64,
     pub manifold_deny: u64,
+    pub manifold_downgrade: u64,
 }
 
 pub type SharedStats = Arc<RwLock<SidecarStats>>;

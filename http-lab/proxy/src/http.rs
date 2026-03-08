@@ -148,6 +148,7 @@ async fn handle_request(
     // Layers 0+1: manifold scoring (only when manifold is trained)
     let mstate = manifold.load();
     let n_stripes = crate::N_STRIPES;
+    let mut spectral_downgrade = false;
     if mstate.is_ready() {
         let stripe_vecs_raw = encoder.encode_walkable_striped(&sample, n_stripes);
         let stripe_vecs: Vec<Vec<f64>> = stripe_vecs_raw.iter()
@@ -257,55 +258,104 @@ async fn handle_request(
                         .unwrap());
                 }
             }
-            ManifoldVerdict::Deny { residual } => {
-                crate::MANIFOLD_DENY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ManifoldVerdict::Deny { residual, profile_alignment } => {
                 let drilldown = drilldown_audit(&stripe_vecs, &mstate, &encoder, &sample, n_stripes, 250);
-                let fields: Vec<String> = drilldown.fields.iter().take(5)
-                    .map(|a| format!("{}={:.1}", a.field, a.score))
-                    .collect();
-                warn!(
-                    src = %sample.src_ip,
-                    method = %sample.method,
-                    path = %sample.path,
-                    residual = format!("{:.3}", residual),
-                    gini = format!("{:.3}", drilldown.gini),
-                    fields = fields.join(","),
-                    "manifold deny"
-                );
-                log_attribution("DENY", &sample, residual, &mstate, &drilldown);
-                let token = build_denial_token(
-                    "deny", residual, &mstate, &drilldown,
-                    &sample, &denial_key,
-                );
-                let baseline = mstate.baseline.as_ref();
-                let request_walk = request_walk_full_json(&sample);
-                let _ = sample_tx.try_send(SampleMessage::DenyEvent(DenyEventData {
-                    src_ip: sample.src_ip.to_string(),
-                    method: sample.method.clone(),
-                    path: sample.path.clone(),
-                    query: sample.query.clone(),
-                    user_agent: sample.user_agent.clone(),
-                    residual,
-                    threshold: baseline.map(|b| b.threshold()).unwrap_or(0.0),
-                    deny_threshold: mstate.deny_threshold,
-                    verdict: "deny".into(),
-                    request_walk,
-                    attribution: drilldown.fields.iter().map(|a| (a.field.clone(), a.score)).collect(),
-                    concentration: drilldown.concentration,
-                    entropy: drilldown.entropy,
-                    gini: drilldown.gini,
-                    timestamp_us: sample.timestamp_us,
-                    traffic_source: sample.traffic_source.clone().unwrap_or_default(),
-                }));
-                let _ = sample_tx.try_send(SampleMessage::RequestSample(sample));
-                let mut builder = Response::builder()
-                    .status(StatusCode::FORBIDDEN);
-                if let Some(t) = &token {
-                    builder = builder.header("X-Denial-Context", t.as_str());
+
+                // Dual-signal downgrade gate (lenient mode only):
+                //   Magnitude: residual in soft zone (deny_threshold..hard_deny_threshold)
+                //   Direction: profile alignment > 0.5 (cross-stripe residual pattern
+                //              is more than half explained by learned normal profiles)
+                // Both must agree for a downgrade; either alone → hard deny.
+                let downgrade = mstate.deny_mode == "lenient"
+                    && residual < mstate.hard_deny_threshold
+                    && profile_alignment > 0.5;
+
+                if downgrade {
+                    crate::MANIFOLD_DOWNGRADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let fields: Vec<String> = drilldown.fields.iter().take(5)
+                        .map(|a| format!("{}={:.1}", a.field, a.score))
+                        .collect();
+                    warn!(
+                        src = %sample.src_ip,
+                        method = %sample.method,
+                        path = %sample.path,
+                        residual = format!("{:.3}", residual),
+                        profile_alignment = format!("{:.3}", profile_alignment),
+                        fields = fields.join(","),
+                        "manifold downgrade (dual-signal: magnitude+direction)"
+                    );
+                    log_attribution("DOWNGRADE", &sample, residual, &mstate, &drilldown);
+                    let baseline = mstate.baseline.as_ref();
+                    let request_walk = request_walk_full_json(&sample);
+                    let _ = sample_tx.try_send(SampleMessage::DenyEvent(DenyEventData {
+                        src_ip: sample.src_ip.to_string(),
+                        method: sample.method.clone(),
+                        path: sample.path.clone(),
+                        query: sample.query.clone(),
+                        user_agent: sample.user_agent.clone(),
+                        residual,
+                        threshold: baseline.map(|b| b.threshold()).unwrap_or(0.0),
+                        deny_threshold: mstate.deny_threshold,
+                        verdict: "downgrade".into(),
+                        request_walk,
+                        attribution: drilldown.fields.iter().map(|a| (a.field.clone(), a.score)).collect(),
+                        concentration: drilldown.concentration,
+                        entropy: drilldown.entropy,
+                        gini: drilldown.gini,
+                        timestamp_us: sample.timestamp_us,
+                        traffic_source: sample.traffic_source.clone().unwrap_or_default(),
+                    }));
+                    spectral_downgrade = true;
+                } else {
+                    crate::MANIFOLD_DENY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let fields: Vec<String> = drilldown.fields.iter().take(5)
+                        .map(|a| format!("{}={:.1}", a.field, a.score))
+                        .collect();
+                    warn!(
+                        src = %sample.src_ip,
+                        method = %sample.method,
+                        path = %sample.path,
+                        residual = format!("{:.3}", residual),
+                        profile_alignment = format!("{:.3}", profile_alignment),
+                        gini = format!("{:.3}", drilldown.gini),
+                        fields = fields.join(","),
+                        "manifold deny"
+                    );
+                    log_attribution("DENY", &sample, residual, &mstate, &drilldown);
+                    let token = build_denial_token(
+                        "deny", residual, &mstate, &drilldown,
+                        &sample, &denial_key,
+                    );
+                    let baseline = mstate.baseline.as_ref();
+                    let request_walk = request_walk_full_json(&sample);
+                    let _ = sample_tx.try_send(SampleMessage::DenyEvent(DenyEventData {
+                        src_ip: sample.src_ip.to_string(),
+                        method: sample.method.clone(),
+                        path: sample.path.clone(),
+                        query: sample.query.clone(),
+                        user_agent: sample.user_agent.clone(),
+                        residual,
+                        threshold: baseline.map(|b| b.threshold()).unwrap_or(0.0),
+                        deny_threshold: mstate.deny_threshold,
+                        verdict: "deny".into(),
+                        request_walk,
+                        attribution: drilldown.fields.iter().map(|a| (a.field.clone(), a.score)).collect(),
+                        concentration: drilldown.concentration,
+                        entropy: drilldown.entropy,
+                        gini: drilldown.gini,
+                        timestamp_us: sample.timestamp_us,
+                        traffic_source: sample.traffic_source.clone().unwrap_or_default(),
+                    }));
+                    let _ = sample_tx.try_send(SampleMessage::RequestSample(sample));
+                    let mut builder = Response::builder()
+                        .status(StatusCode::FORBIDDEN);
+                    if let Some(t) = &token {
+                        builder = builder.header("X-Denial-Context", t.as_str());
+                    }
+                    return Ok(builder
+                        .body(Full::new(Bytes::from("Denied by manifold\n")))
+                        .unwrap());
                 }
-                return Ok(builder
-                    .body(Full::new(Bytes::from("Denied by manifold\n")))
-                    .unwrap());
             }
         }
     } else {
@@ -319,7 +369,16 @@ async fn handle_request(
         Ok(resp) => {
             sample.response_status = Some(resp.status().as_u16());
             let _ = sample_tx.try_send(SampleMessage::RequestSample(sample));
-            Ok(resp)
+            if spectral_downgrade {
+                let (mut parts, body) = resp.into_parts();
+                parts.headers.insert(
+                    hyper::header::HeaderName::from_static("x-spectral-downgrade"),
+                    hyper::header::HeaderValue::from_static("structural"),
+                );
+                Ok(Response::from_parts(parts, body))
+            } else {
+                Ok(resp)
+            }
         }
         Err(e) => {
             warn!("upstream error: {}", e);

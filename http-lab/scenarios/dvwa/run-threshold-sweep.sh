@@ -120,10 +120,10 @@ echo "============================================================"
 echo " Sweep Complete — All Rounds"
 echo "============================================================"
 echo ""
-printf "%-18s %11s %10s %8s %10s %10s %8s %12s\n" \
-    "STRATEGY" "ATTACK_DENY" "BROWSER_FP" "FP_RATE" "SCORE_THR" "DENY_THR" "ADAPTIVE" "FP_WHEN"
-printf "%-18s %11s %10s %8s %10s %10s %8s %12s\n" \
-    "----------------" "-----------" "----------" "--------" "----------" "----------" "--------" "------------"
+printf "%-18s %11s %10s %8s %10s %10s %8s %12s %10s %10s\n" \
+    "STRATEGY" "ATTACK_DENY" "BROWSER_FP" "FP_RATE" "SCORE_THR" "DENY_THR" "ADAPTIVE" "FP_WHEN" "DG_BROWSER" "DG_ATTACK"
+printf "%-18s %11s %10s %8s %10s %10s %8s %12s %10s %10s\n" \
+    "----------------" "-----------" "----------" "--------" "----------" "----------" "--------" "------------" "----------" "----------"
 cat "$SUMMARY_FILE"
 
 # --- Aggregate stats per strategy ---
@@ -132,10 +132,10 @@ echo "============================================================"
 echo " Aggregate (mean across $ROUNDS rounds)"
 echo "============================================================"
 echo ""
-printf "%-14s %11s %10s %8s %10s %10s %8s %6s\n" \
-    "STRATEGY" "ATTACK_DENY" "BROWSER_FP" "FP_RATE" "SCORE_THR" "DENY_THR" "ADAPTIVE" "LATE"
-printf "%-14s %11s %10s %8s %10s %10s %8s %6s\n" \
-    "-----------" "-----------" "----------" "--------" "----------" "----------" "--------" "------"
+printf "%-14s %11s %10s %8s %10s %10s %8s %6s %10s %10s\n" \
+    "STRATEGY" "ATTACK_DENY" "BROWSER_FP" "FP_RATE" "SCORE_THR" "DENY_THR" "ADAPTIVE" "LATE" "DG_BROWSER" "DG_ATTACK"
+printf "%-14s %11s %10s %8s %10s %10s %8s %6s %10s %10s\n" \
+    "-----------" "-----------" "----------" "--------" "----------" "----------" "--------" "------" "----------" "----------"
 
 for strategy in "${STRATEGIES[@]}"; do
     # Collect per-round values from the detail files
@@ -145,6 +145,8 @@ for strategy in "${STRATEGIES[@]}"; do
     ADAPTIVE_VALS=()
     SCORE_VALS=()
     DENY_VALS=()
+    DG_B_VALS=()
+    DG_A_VALS=()
 
     for ((r=1; r<=ROUNDS; r++)); do
         detail_file="$SWEEP_DIR/detail_${strategy}_r${r}.txt"
@@ -157,6 +159,8 @@ for strategy in "${STRATEGIES[@]}"; do
         stripped=$(sed 's/\x1b\[[0-9;]*m//g' "$proxy_log")
         atk=$(echo "$stripped" | grep -cE '═ DENY ═.*label=unknown' || true)
         fps=$(echo "$stripped" | grep -cE '═ DENY ═.*label=browser-agent' || true)
+        dg_b=$(echo "$stripped" | grep -cE '═ DOWNGRADE ═.*label=browser-agent' || true)
+        dg_a=$(echo "$stripped" | grep -cE '═ DOWNGRADE ═.*label=unknown' || true)
         late=$(grep 'late (post-attack)' "$detail_file" | grep -oP '\d+' || echo "0")
         adaptive=$(echo "$stripped" | grep 'adaptive_learns' | tail -1 | grep -oP 'adaptive_learns=\K\d+' || echo "0")
         score_t=$(echo "$stripped" | grep -oP 'score_threshold=\K[0-9.]+' | tail -1 || echo "0")
@@ -168,11 +172,13 @@ for strategy in "${STRATEGIES[@]}"; do
         ADAPTIVE_VALS+=("${adaptive:-0}")
         SCORE_VALS+=("${score_t:-0}")
         DENY_VALS+=("${deny_t:-0}")
+        DG_B_VALS+=("${dg_b:-0}")
+        DG_A_VALS+=("${dg_a:-0}")
     done
 
     N=${#ATK_VALS[@]}
     if [[ "$N" -eq 0 ]]; then
-        printf "%-14s %11s %10s %8s %10s %10s %8s %6s\n" "$strategy" "-" "-" "-" "-" "-" "-" "-"
+        printf "%-14s %11s %10s %8s %10s %10s %8s %6s %10s %10s\n" "$strategy" "-" "-" "-" "-" "-" "-" "-" "-" "-"
         continue
     fi
 
@@ -183,6 +189,8 @@ for strategy in "${STRATEGIES[@]}"; do
     avg_adaptive=$(printf '%s\n' "${ADAPTIVE_VALS[@]}" | awk '{s+=$1} END {printf "%.0f", s/NR}')
     avg_score=$(printf '%s\n' "${SCORE_VALS[@]}" | awk '{s+=$1} END {printf "%.2f", s/NR}')
     avg_deny=$(printf '%s\n' "${DENY_VALS[@]}" | awk '{s+=$1} END {printf "%.2f", s/NR}')
+    avg_dg_b=$(printf '%s\n' "${DG_B_VALS[@]}" | awk '{s+=$1} END {printf "%.1f", s/NR}')
+    avg_dg_a=$(printf '%s\n' "${DG_A_VALS[@]}" | awk '{s+=$1} END {printf "%.1f", s/NR}')
 
     # FP rate from averages
     total_browser=0
@@ -200,8 +208,8 @@ for strategy in "${STRATEGIES[@]}"; do
         avg_fpr="-"
     fi
 
-    printf "%-14s %11s %10s %8s %10s %10s %8s %6s\n" \
-        "$strategy" "$avg_atk" "$avg_fp" "$avg_fpr" "$avg_score" "$avg_deny" "$avg_adaptive" "$avg_late"
+    printf "%-14s %11s %10s %8s %10s %10s %8s %6s %10s %10s\n" \
+        "$strategy" "$avg_atk" "$avg_fp" "$avg_fpr" "$avg_score" "$avg_deny" "$avg_adaptive" "$avg_late" "$avg_dg_b" "$avg_dg_a"
 done
 
 echo ""
